@@ -122,6 +122,15 @@ class SchedulerConfig:
     ngram_size: int = 3
     ngram_min_matches: int = 1
 
+    # Small draft-model speculative decoding. The draft model must share the
+    # target tokenizer. It is loaded by the engine and attached here.
+    draft_model_path: str | None = None
+    draft_model: Any | None = None
+    draft_num_draft_tokens: int = 8
+    draft_min_draft_tokens: int = 1
+    draft_p_min: float = 0.0
+    draft_adaptive: bool = True
+
 
 @dataclass
 class SchedulerOutput:
@@ -1033,6 +1042,779 @@ def _install_mtp(
     )
 
 
+@dataclass
+class _DraftModelState:
+    cache: list[Any]
+    token_len: int
+    prefix: list[int] = field(default_factory=list)
+
+
+def _new_draft_model_stats(mode: str = "draft-model") -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": mode,
+        "attempts": 0,
+        "drafts": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "rejected_tokens": 0,
+        "fallback_steps": 0,
+        "disabled_steps": 0,
+        "cooldown_steps": 0,
+        "p_min_stops": 0,
+        "errors": 0,
+        "acceptance_rate": 0.0,
+        "draft_proposed_tokens": 0,
+        "draft_accepted_tokens": 0,
+        "ngram_proposed_tokens": 0,
+        "ngram_accepted_tokens": 0,
+        "tool_guard_steps": 0,
+        "tool_limited_steps": 0,
+        "hybrid_ngram_steps": 0,
+    }
+
+
+def _install_draft_model_speculator(
+    batch_gen: "BatchGenerator",
+    draft_model: Any,
+    *,
+    num_draft_tokens: int = 8,
+    min_draft_tokens: int = 1,
+    draft_p_min: float = 0.0,
+    adaptive: bool = True,
+    hybrid_ngram: bool = False,
+    ngram_num_draft_tokens: int | None = None,
+    ngram_size: int = 3,
+    ngram_min_matches: int = 1,
+    stats: dict[str, Any] | None = None,
+    tokenizer: Any | None = None,
+) -> dict[str, Any]:
+    """Install target-verified draft-model speculation on BatchGenerator.
+
+    The implementation mirrors ``ngram-mod`` constraints: single active row
+    gets speculative acceleration; prompt admission and multi-row batches fall
+    back to stock BatchGenerator. The draft model keeps its own cache per UID.
+    """
+
+    from mlx_lm.models import cache as _cache_mod
+
+    _inner_next = batch_gen._next
+    _orig_remove = batch_gen.remove
+    mode = "draft-ngram-hybrid" if hybrid_ngram else "draft-model"
+    _stats = stats or _new_draft_model_stats(mode)
+    _stats.update({"enabled": True, "mode": mode})
+    _draft_states: dict[int, _DraftModelState] = {}
+    _ngram_decoders: dict[int, PromptLookupDecoder] = {}
+    _miss_streaks: dict[int, int] = {}
+    _cooldowns: dict[int, int] = {}
+    _ngram_num_draft_tokens = (
+        ngram_num_draft_tokens
+        if ngram_num_draft_tokens is not None
+        else num_draft_tokens
+    )
+
+    def _new_batch_api(self=batch_gen) -> bool:
+        return hasattr(self, "_generation_batch")
+
+    def _generation_batch(self=batch_gen):
+        return getattr(self, "active_batch", None) or getattr(
+            self, "_generation_batch", None
+        )
+
+    def _format_return(self, responses, prompt_responses=None):
+        if _new_batch_api(self):
+            return prompt_responses or [], responses
+        return responses
+
+    def _responses_from_raw(raw):
+        if isinstance(raw, tuple):
+            return raw[1]
+        return raw
+
+    def _token_list(tokens) -> list[int]:
+        return tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+
+    def _token_array(tokens) -> mx.array:
+        return tokens if hasattr(tokens, "shape") else mx.array(tokens, mx.uint32)
+
+    def _decode_probe(tokens: list[int]) -> str:
+        if tokenizer is None:
+            return ""
+        try:
+            return tokenizer.decode(tokens)
+        except TypeError:
+            return tokenizer.decode(tokens, skip_special_tokens=False)
+        except Exception:
+            return ""
+
+    def _last_index(text: str, *needles: str) -> int:
+        return max((text.rfind(needle) for needle in needles), default=-1)
+
+    def _tool_context(context_text: str) -> tuple[bool, bool]:
+        tool_open = _last_index(context_text, "<tool_call")
+        tool_close = _last_index(context_text, "</tool_call")
+        in_tool = tool_open > tool_close
+        if not in_tool:
+            return False, False
+        param_open = _last_index(context_text, "<parameter=")
+        param_close = _last_index(context_text, "</parameter>")
+        return True, param_open > max(param_close, tool_close)
+
+    def _adapt_ngram_tool_draft(
+        decoder, pending_token: int, draft_tokens: list[int]
+    ) -> tuple[list[int], bool]:
+        if tokenizer is None or not draft_tokens:
+            return draft_tokens, False
+        history = list(getattr(decoder, "_token_history", []))
+        context_text = _decode_probe(history[-128:])
+        draft_text = _decode_probe([pending_token] + draft_tokens)
+        structural_markers = (
+            "<tool_call",
+            "</tool_call",
+            "<function=",
+            "</function>",
+            "<parameter=",
+            "</parameter>",
+        )
+        if any(marker in draft_text for marker in structural_markers):
+            return [], True
+        in_tool, in_parameter = _tool_context(context_text)
+        if not in_tool:
+            return draft_tokens, False
+        limit = 2 if in_parameter else 1
+        if len(draft_tokens) > limit:
+            _stats["tool_limited_steps"] += 1
+            return draft_tokens[:limit], False
+        return draft_tokens, False
+
+    def _pending_token(batch) -> int:
+        if hasattr(batch, "y"):
+            return batch.y[0].item()
+        return batch._next_tokens[0].item()
+
+    def _pending_logprobs(batch):
+        if hasattr(batch, "logprobs"):
+            return batch.logprobs[0]
+        return batch._next_logprobs[0]
+
+    def _num_tokens(batch) -> int:
+        if hasattr(batch, "num_tokens"):
+            return batch.num_tokens[0]
+        return batch._num_tokens[0]
+
+    def _set_num_tokens(batch, value: int) -> None:
+        if hasattr(batch, "num_tokens"):
+            batch.num_tokens[0] = value
+        else:
+            batch._num_tokens[0] = value
+
+    def _cache(batch):
+        return getattr(batch, "cache", None) or batch.prompt_cache
+
+    def _sampler(self, batch):
+        if hasattr(batch, "samplers"):
+            return batch.samplers[0] or getattr(self, "sampler", None)
+        return getattr(self, "sampler", None)
+
+    def _logits_processors(batch):
+        processors = batch.logits_processors[0] if batch.logits_processors else []
+        return processors or []
+
+    def _append_tokens(batch, tokens: list[int]) -> None:
+        if hasattr(batch.tokens[0], "shape"):
+            batch.tokens[0] = mx.concatenate(
+                (batch.tokens[0], mx.array(tokens, mx.uint32))
+            )
+        else:
+            batch.tokens[0].extend(tokens)
+
+    def _set_next(batch, token: int, logprobs) -> None:
+        if hasattr(batch, "y"):
+            batch.y = mx.array([token], mx.uint32)
+            batch.logprobs = [logprobs]
+            mx.async_eval(batch.y, batch.logprobs, batch.tokens)
+        else:
+            batch._next_tokens = mx.array([token], mx.uint32)
+            batch._next_logprobs = [logprobs]
+            mx.async_eval(batch._next_tokens, batch._next_logprobs)
+
+    def _is_terminal_pending(self, batch, token: int, num_tokens: int) -> bool:
+        if _new_batch_api():
+            return False
+        return token in batch_gen.stop_tokens or num_tokens + 1 >= batch.max_tokens[0]
+
+    def _make_response(
+        self,
+        batch,
+        uid: int,
+        token: int,
+        logprobs,
+        finish_reason: str | None,
+        current_state=None,
+        match_sequence=None,
+    ):
+        prompt_cache = batch.extract_cache(0) if finish_reason else None
+        response_cls = getattr(self, "Response", None) or batch.Response
+        fields = getattr(response_cls, "__dataclass_fields__", {})
+        kwargs = {
+            "uid": uid,
+            "token": token,
+            "logprobs": logprobs,
+            "finish_reason": finish_reason,
+            "prompt_cache": prompt_cache,
+        }
+        if "current_state" in fields:
+            kwargs["current_state"] = current_state
+        if "match_sequence" in fields:
+            kwargs["match_sequence"] = match_sequence
+        if "all_tokens" in fields:
+            kwargs["all_tokens"] = list(batch.tokens[0]) if finish_reason else None
+        return response_cls(**kwargs)
+
+    def _finish_batch(batch, uid: int) -> None:
+        if getattr(batch_gen, "active_batch", None) is batch:
+            batch_gen.active_batch = None
+        elif getattr(batch_gen, "_generation_batch", None) is batch:
+            batch_gen._generation_batch = None
+        elif hasattr(batch, "filter"):
+            batch.filter([])
+        _draft_states.pop(uid, None)
+        _ngram_decoders.pop(uid, None)
+
+    def _cache_trimmable(prompt_cache) -> bool:
+        return all(
+            hasattr(c, "is_trimmable")
+            and c.is_trimmable()
+            and hasattr(c, "trim")
+            for c in prompt_cache
+        )
+
+    def _snapshot_value(value):
+        if isinstance(value, list):
+            return [_snapshot_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_snapshot_value(v) for v in value)
+        if isinstance(value, dict):
+            return {k: _snapshot_value(v) for k, v in value.items()}
+        if hasattr(value, "copy"):
+            return value.copy()
+        return value
+
+    def _snapshot_cache(prompt_cache):
+        snapshot = []
+        for c in prompt_cache:
+            if hasattr(c, "is_trimmable") and c.is_trimmable():
+                continue
+            attrs = {}
+            for name in ("lengths", "left_padding", "_right_padding"):
+                if hasattr(c, name):
+                    attrs[name] = _snapshot_value(getattr(c, name))
+            snapshot.append(
+                (
+                    c,
+                    _snapshot_value(c.state),
+                    _snapshot_value(getattr(c, "meta_state", "")),
+                    attrs,
+                )
+            )
+        return snapshot
+
+    def _restore_cache(snapshot) -> None:
+        for c, state, meta_state, attrs in snapshot:
+            c.state = _snapshot_value(state)
+            try:
+                c.meta_state = _snapshot_value(meta_state)
+            except Exception:
+                pass
+            for name, value in attrs.items():
+                setattr(c, name, _snapshot_value(value))
+
+    def _trim_cache(prompt_cache, num_tokens: int) -> bool:
+        if num_tokens <= 0:
+            return True
+        if not _cache_trimmable(prompt_cache):
+            return False
+        trimmed = [c.trim(num_tokens) for c in prompt_cache]
+        return all(t == num_tokens for t in trimmed)
+
+    def _trim_trimmable_layers(prompt_cache, num_tokens: int) -> bool:
+        if num_tokens <= 0:
+            return True
+        for c in prompt_cache:
+            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
+                if c.trim(num_tokens) != num_tokens:
+                    return False
+        return True
+
+    def _rewind_or_restore(prompt_cache, processed: int, snapshot) -> None:
+        if processed <= 0:
+            return
+        if _cache_trimmable(prompt_cache):
+            if not _trim_cache(prompt_cache, processed):
+                raise RuntimeError(
+                    f"[draft-model] failed to trim {processed} draft-cache tokens"
+                )
+        else:
+            if not _trim_trimmable_layers(prompt_cache, processed):
+                raise RuntimeError("[draft-model] failed to trim draft-cache layers")
+            _restore_cache(snapshot)
+
+    def _replay_cache(model, prompt_cache, tokens: list[int]) -> None:
+        if not tokens:
+            return
+        replay_logits = model(mx.array([tokens], mx.uint32), cache=prompt_cache)
+        cache_states = [c.state for c in prompt_cache if hasattr(c, "state")]
+        mx.eval(replay_logits, cache_states)
+
+    def _prefill_draft_state(token_array: mx.array) -> _DraftModelState:
+        token_ids = _token_list(token_array)
+        draft_cache = _cache_mod.make_prompt_cache(draft_model)
+        if token_ids:
+            step = 2048
+            for start in range(0, len(token_ids), step):
+                chunk = token_ids[start : start + step]
+                logits = draft_model(mx.array([chunk], mx.uint32), cache=draft_cache)
+                cache_states = [c.state for c in draft_cache if hasattr(c, "state")]
+                mx.eval(logits, cache_states)
+                if start + step < len(token_ids):
+                    mx.clear_cache()
+        return _DraftModelState(cache=draft_cache, token_len=len(token_ids))
+
+    def _ensure_draft_state(uid: int, token_array: mx.array) -> _DraftModelState:
+        token_len = len(_token_list(token_array))
+        state = _draft_states.get(uid)
+        if state is None or state.token_len != token_len:
+            state = _prefill_draft_state(token_array)
+            _draft_states[uid] = state
+        return state
+
+    def _advance_draft_state(uid: int, tokens: list[int]) -> None:
+        state = _draft_states.get(uid)
+        if state is None or not tokens:
+            return
+        inputs = list(state.prefix) + tokens
+        state.prefix = []
+        if inputs:
+            logits = draft_model(mx.array([inputs], mx.uint32), cache=state.cache)
+            cache_states = [c.state for c in state.cache if hasattr(c, "state")]
+            mx.eval(logits, cache_states)
+        state.token_len += len(tokens)
+
+    def _ensure_ngram_decoder(uid: int, token_array: mx.array) -> PromptLookupDecoder:
+        decoder = _ngram_decoders.get(uid)
+        if decoder is None:
+            decoder = PromptLookupDecoder(
+                num_draft_tokens=_ngram_num_draft_tokens,
+                ngram_size=ngram_size,
+                min_matches=ngram_min_matches,
+            )
+            decoder.add_prompt_tokens(_token_list(token_array))
+            _ngram_decoders[uid] = decoder
+        return decoder
+
+    def _sync_states_from_active(self=batch_gen) -> None:
+        batch = _generation_batch(self)
+        if batch is None or len(batch) == 0:
+            return
+        active_uids = set(batch.uids)
+        for uid in list(_draft_states):
+            if uid not in active_uids:
+                _draft_states.pop(uid, None)
+        for uid in list(_ngram_decoders):
+            if uid not in active_uids:
+                _ngram_decoders.pop(uid, None)
+        for e, uid in enumerate(batch.uids):
+            _ensure_draft_state(uid, batch.tokens[e])
+            if hybrid_ngram:
+                _ensure_ngram_decoder(uid, batch.tokens[e])
+
+    def _record_inner_responses(responses) -> None:
+        for response in responses:
+            _advance_draft_state(response.uid, [response.token])
+            decoder = _ngram_decoders.get(response.uid)
+            if decoder is not None:
+                decoder.add_generated_token(response.token)
+            if response.finish_reason is not None:
+                _draft_states.pop(response.uid, None)
+                _ngram_decoders.pop(response.uid, None)
+                _miss_streaks.pop(response.uid, None)
+                _cooldowns.pop(response.uid, None)
+
+    def _sample_verify_positions(
+        self,
+        verify_logits: mx.array,
+        context_tokens: mx.array,
+        pending_token: int,
+        draft_tokens: list[int],
+        sampler,
+        logits_processors,
+    ) -> tuple[list[int], list[mx.array]]:
+        sampled_arrays = []
+        logprobs = []
+        context = mx.concatenate(
+            (context_tokens, mx.array([pending_token], mx.uint32))
+        )
+
+        for pos in range(len(draft_tokens) + 1):
+            sample_logits = verify_logits[:, pos, :]
+            if logits_processors:
+                for processor in logits_processors:
+                    sample_logits = processor(context, sample_logits)
+            sample_logprobs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
+            sampled = sampler(sample_logprobs)
+            sampled_arrays.append(sampled)
+            logprobs.append(sample_logprobs[0])
+
+            if pos < len(draft_tokens):
+                context = mx.concatenate(
+                    (context, mx.array([draft_tokens[pos]], mx.uint32))
+                )
+
+        sampled_tokens = mx.concatenate(sampled_arrays, axis=0)
+        mx.eval(sampled_tokens, *logprobs)
+        return sampled_tokens.tolist(), logprobs
+
+    def _adaptive_max(uid: int) -> int:
+        if not adaptive:
+            return num_draft_tokens
+        proposed = _stats.get("draft_proposed_tokens", 0)
+        accepted = _stats.get("draft_accepted_tokens", 0)
+        if proposed < 64:
+            return num_draft_tokens
+        ratio = accepted / proposed if proposed else 0.0
+        if ratio >= 0.75:
+            return num_draft_tokens
+        if ratio >= 0.45:
+            return max(min_draft_tokens, min(num_draft_tokens, 4))
+        _cooldowns[uid] = max(_cooldowns.get(uid, 0), 16)
+        return max(min_draft_tokens, min(num_draft_tokens, 2))
+
+    def _draft_model_tokens(
+        uid: int,
+        state: _DraftModelState,
+        pending_token: int,
+        max_drafts: int,
+    ) -> tuple[list[int], int, Any, list[int]]:
+        cache_snapshot = _snapshot_cache(state.cache)
+        prefix_before = list(state.prefix)
+        if max_drafts <= 0:
+            return [], 0, cache_snapshot, prefix_before
+        inputs = prefix_before + [pending_token]
+        state.prefix = []
+        current = mx.array(inputs, mx.uint32)
+        draft_tokens: list[int] = []
+        processed = len(inputs)
+
+        for idx in range(max_drafts):
+            logits = draft_model(current[None], cache=state.cache)
+            logits = logits[:, -1, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            sampled = mx.argmax(logprobs, axis=-1)
+            prob = mx.exp(logprobs[0, sampled.item()])
+            mx.eval(sampled, prob)
+            confidence = prob.item()
+            if idx >= min_draft_tokens and draft_p_min > 0 and confidence < draft_p_min:
+                _stats["p_min_stops"] += 1
+                break
+            token = sampled.item()
+            draft_tokens.append(token)
+            current = sampled
+            if idx < max_drafts - 1:
+                processed += 1
+
+        if not draft_tokens:
+            _rewind_or_restore(state.cache, processed, cache_snapshot)
+            state.prefix = prefix_before
+        return draft_tokens, processed, cache_snapshot, prefix_before
+
+    def _ngram_tokens(uid: int, batch, pending_token: int, remaining: int) -> list[int]:
+        decoder = _ensure_ngram_decoder(uid, batch.tokens[0])
+        draft_tokens = decoder.get_draft_tokens_for_token(pending_token)
+        if remaining < len(draft_tokens):
+            draft_tokens = draft_tokens[:remaining]
+        draft_tokens, tool_guarded = _adapt_ngram_tool_draft(
+            decoder, pending_token, draft_tokens
+        )
+        if tool_guarded:
+            _stats["tool_guard_steps"] += 1
+            return []
+        return draft_tokens
+
+    def _verify_and_emit(
+        self,
+        *,
+        source: str,
+        batch,
+        uid: int,
+        pending_token: int,
+        pending_logprobs,
+        num_tokens: int,
+        draft_tokens: list[int],
+        remaining_after_pending: int,
+        draft_state: _DraftModelState | None = None,
+        draft_processed: int = 0,
+        draft_snapshot=None,
+        draft_prefix_before: list[int] | None = None,
+    ):
+        import time as _time
+
+        prompt_cache = _cache(batch)
+        cache_is_trimmable = _cache_trimmable(prompt_cache)
+        cache_snapshot = None if cache_is_trimmable else _snapshot_cache(prompt_cache)
+
+        tic = _time.perf_counter()
+        _stats["attempts"] += 1
+        _stats["drafts"] += 1
+        _stats["proposed_tokens"] += len(draft_tokens)
+        if source == "draft":
+            _stats["draft_proposed_tokens"] += len(draft_tokens)
+        else:
+            _stats["ngram_proposed_tokens"] += len(draft_tokens)
+            _stats["hybrid_ngram_steps"] += 1
+
+        verify_input = mx.array([[pending_token] + draft_tokens], mx.uint32)
+        verify_logits = self.model(verify_input, cache=prompt_cache)
+        verify_logits = verify_logits[:, -len(draft_tokens) - 1 :, :]
+
+        sampler = _sampler(self, batch)
+        logits_processors = _logits_processors(batch)
+        sampled_tokens, verify_logprobs = _sample_verify_positions(
+            self,
+            verify_logits,
+            _token_array(batch.tokens[0]),
+            pending_token,
+            draft_tokens,
+            sampler,
+            logits_processors,
+        )
+
+        accepted = 0
+        for draft_token, sampled_token in zip(draft_tokens, sampled_tokens[:-1]):
+            if draft_token != sampled_token:
+                break
+            accepted += 1
+
+        finish_reason = None
+        current_state = None
+        match_sequence = None
+        if _new_batch_api(self):
+            state = batch._matcher_states[0]
+            for idx, token in enumerate([pending_token] + draft_tokens[:accepted]):
+                state, seq, current = batch.state_machines[0].match(state, token)
+                if seq is not None and current is None:
+                    accepted = idx
+                    finish_reason = "stop"
+                    current_state = current
+                    match_sequence = seq
+                    break
+        else:
+            for idx, token in enumerate(draft_tokens[:accepted]):
+                if token not in self.stop_tokens:
+                    continue
+                accepted = idx + 1
+                finish_reason = "stop"
+                break
+
+        if accepted >= remaining_after_pending:
+            accepted = remaining_after_pending
+            finish_reason = finish_reason or "length"
+
+        emitted_tokens = [pending_token] + draft_tokens[:accepted]
+        rejected = len(draft_tokens) - accepted
+        if rejected:
+            if cache_is_trimmable:
+                if not _trim_cache(prompt_cache, rejected):
+                    raise RuntimeError(
+                        f"[draft-model] failed to trim {rejected} rejected target tokens"
+                    )
+            else:
+                if not _trim_trimmable_layers(prompt_cache, 1 + len(draft_tokens)):
+                    raise RuntimeError(
+                        "[draft-model] failed to rewind trimmable target layers"
+                    )
+                _restore_cache(cache_snapshot)
+                _replay_cache(self.model, prompt_cache, emitted_tokens)
+
+        if source == "draft" and draft_state is not None:
+            if accepted == len(draft_tokens):
+                draft_state.prefix = [draft_tokens[-1]]
+            else:
+                rewind = max(len(draft_tokens) - accepted - 1, 0)
+                if rewind:
+                    _rewind_or_restore(draft_state.cache, rewind, draft_snapshot)
+                draft_state.prefix = []
+            draft_state.token_len += len(emitted_tokens)
+        elif source == "ngram":
+            _advance_draft_state(uid, emitted_tokens)
+
+        _stats["accepted_tokens"] += accepted
+        _stats["rejected_tokens"] += rejected
+        if source == "draft":
+            _stats["draft_accepted_tokens"] += accepted
+        else:
+            _stats["ngram_accepted_tokens"] += accepted
+        if _stats["proposed_tokens"] > 0:
+            _stats["acceptance_rate"] = (
+                _stats["accepted_tokens"] / _stats["proposed_tokens"]
+            )
+
+        emitted_logprobs = [pending_logprobs] + verify_logprobs[:accepted]
+        _append_tokens(batch, emitted_tokens)
+        _set_num_tokens(batch, num_tokens + len(emitted_tokens))
+
+        if _new_batch_api(self):
+            for token in emitted_tokens:
+                batch._matcher_states[0], _, _ = batch.state_machines[0].match(
+                    batch._matcher_states[0], token
+                )
+
+        decoder = _ngram_decoders.get(uid)
+        if decoder is not None:
+            for token in emitted_tokens:
+                decoder.add_generated_token(token)
+
+        responses = []
+        for idx, (token, logprobs) in enumerate(zip(emitted_tokens, emitted_logprobs)):
+            token_finish_reason = finish_reason if idx == len(emitted_tokens) - 1 else None
+            responses.append(
+                _make_response(
+                    self,
+                    batch,
+                    uid,
+                    token,
+                    logprobs,
+                    token_finish_reason,
+                    current_state if token_finish_reason else None,
+                    match_sequence if token_finish_reason else None,
+                )
+            )
+
+        if finish_reason is not None:
+            _finish_batch(batch, uid)
+        else:
+            next_token = sampled_tokens[accepted]
+            _set_next(batch, next_token, verify_logprobs[accepted])
+
+        if hasattr(self, "_stats"):
+            self._stats.generation_time += _time.perf_counter() - tic
+            self._stats.generation_tokens += len(responses)
+        else:
+            self._gen_tokens_counter += len(responses)
+        return _format_return(self, responses)
+
+    def _fallback(self=batch_gen):
+        raw = _inner_next()
+        _record_inner_responses(_responses_from_raw(raw))
+        return raw
+
+    def _draft_next(self=batch_gen):
+        _sync_states_from_active(self)
+
+        batch = _generation_batch(self)
+        if (
+            batch is None
+            or len(batch) == 0
+            or getattr(self, "unprocessed_prompts", None)
+            or getattr(self, "_unprocessed_sequences", None)
+            or getattr(self, "_currently_processing", None)
+            or len(batch.uids) != 1
+            or len(batch.tokens) != 1
+        ):
+            if batch is not None and len(batch.uids) != 1:
+                _stats["disabled_steps"] += 1
+            return _fallback(self)
+
+        uid = batch.uids[0]
+        if _cooldowns.get(uid, 0) > 0:
+            _cooldowns[uid] -= 1
+            _stats["cooldown_steps"] += 1
+            return _fallback(self)
+
+        pending_token = _pending_token(batch)
+        pending_logprobs = _pending_logprobs(batch)
+        num_tokens = _num_tokens(batch)
+        max_tokens = batch.max_tokens[0]
+
+        if _is_terminal_pending(self, batch, pending_token, num_tokens):
+            return _fallback(self)
+
+        remaining_after_pending = max_tokens - (num_tokens + 1)
+        if remaining_after_pending <= 0:
+            return _fallback(self)
+
+        draft_state = _ensure_draft_state(uid, batch.tokens[0])
+        max_drafts = min(_adaptive_max(uid), remaining_after_pending)
+        try:
+            draft_tokens, processed, snapshot, prefix_before = _draft_model_tokens(
+                uid, draft_state, pending_token, max_drafts
+            )
+            if draft_tokens:
+                _miss_streaks[uid] = 0
+                return _verify_and_emit(
+                    self,
+                    source="draft",
+                    batch=batch,
+                    uid=uid,
+                    pending_token=pending_token,
+                    pending_logprobs=pending_logprobs,
+                    num_tokens=num_tokens,
+                    draft_tokens=draft_tokens,
+                    remaining_after_pending=remaining_after_pending,
+                    draft_state=draft_state,
+                    draft_processed=processed,
+                    draft_snapshot=snapshot,
+                    draft_prefix_before=prefix_before,
+                )
+        except Exception as exc:
+            logger.debug("[draft-model] draft path failed: %s", exc)
+            _stats["errors"] += 1
+            _draft_states.pop(uid, None)
+
+        if hybrid_ngram:
+            draft_tokens = _ngram_tokens(uid, batch, pending_token, remaining_after_pending)
+            if draft_tokens:
+                _miss_streaks[uid] = 0
+                return _verify_and_emit(
+                    self,
+                    source="ngram",
+                    batch=batch,
+                    uid=uid,
+                    pending_token=pending_token,
+                    pending_logprobs=pending_logprobs,
+                    num_tokens=num_tokens,
+                    draft_tokens=draft_tokens,
+                    remaining_after_pending=remaining_after_pending,
+                )
+
+        _stats["fallback_steps"] += 1
+        _miss_streaks[uid] = _miss_streaks.get(uid, 0) + 1
+        if _miss_streaks[uid] >= 32:
+            _cooldowns[uid] = 64
+            _miss_streaks[uid] = 0
+        return _fallback(self)
+
+    def _draft_remove(uids_to_remove, return_prompt_caches: bool = False):
+        for uid in uids_to_remove:
+            _draft_states.pop(uid, None)
+            _ngram_decoders.pop(uid, None)
+        return _orig_remove(uids_to_remove, return_prompt_caches=return_prompt_caches)
+
+    batch_gen._next = _draft_next
+    batch_gen.remove = _draft_remove
+    batch_gen._draft_model_stats = _stats
+    logger.info(
+        "[draft-model] installed mode=%s max=%d min=%d p_min=%.2f adaptive=%s",
+        mode,
+        num_draft_tokens,
+        min_draft_tokens,
+        draft_p_min,
+        adaptive,
+    )
+    return _stats
+
+
 def _new_ngram_stats() -> dict[str, Any]:
     return {
         "enabled": True,
@@ -1150,17 +1932,6 @@ def _install_ngram_mod(
             _stats["tool_limited_steps"] += 1
             return draft_tokens[:limit], False
         return draft_tokens, False
-        return any(
-            marker in text
-            for marker in (
-                "<tool_call",
-                "</tool_call",
-                "<function=",
-                "</function>",
-                "<parameter=",
-                "</parameter>",
-            )
-        )
 
     def _pending_token(batch) -> int:
         if hasattr(batch, "y"):
@@ -1184,7 +1955,7 @@ def _install_ngram_mod(
             batch._num_tokens[0] = value
 
     def _cache(batch):
-        return getattr(batch, "cache", None) or getattr(batch, "prompt_cache")
+        return getattr(batch, "cache", None) or batch.prompt_cache
 
     def _sampler(self, batch):
         if hasattr(batch, "samplers"):
@@ -1229,7 +2000,7 @@ def _install_ngram_mod(
         match_sequence=None,
     ):
         prompt_cache = batch.extract_cache(0) if finish_reason else None
-        response_cls = getattr(self, "Response", None) or getattr(batch, "Response")
+        response_cls = getattr(self, "Response", None) or batch.Response
         fields = getattr(response_cls, "__dataclass_fields__", {})
         kwargs = {
             "uid": uid,
@@ -1875,6 +2646,11 @@ class Scheduler:
         self._ngram_stats: dict[str, Any] | None = (
             _new_ngram_stats() if self.config.spec_type == "ngram-mod" else None
         )
+        self._draft_model_stats: dict[str, Any] | None = (
+            _new_draft_model_stats(self.config.spec_type)
+            if self.config.spec_type in {"draft-model", "draft-ngram-hybrid"}
+            else None
+        )
 
         # Prefix cache for KV state reuse
         self.prefix_cache: PrefixCacheManager | None = None
@@ -2091,6 +2867,29 @@ class Scheduler:
                     ngram_size=self.config.ngram_size,
                     min_matches=self.config.ngram_min_matches,
                     stats=self._ngram_stats,
+                    tokenizer=self.tokenizer,
+                )
+        elif self.config.spec_type in {"draft-model", "draft-ngram-hybrid"}:
+            if self.config.enable_mtp:
+                logger.warning("[draft-model] disabled because MTP is enabled")
+            elif self.config.draft_model is None:
+                logger.warning(
+                    "[draft-model] --spec-type %s set but no draft model loaded",
+                    self.config.spec_type,
+                )
+            else:
+                self._draft_model_stats = _install_draft_model_speculator(
+                    bg,
+                    self.config.draft_model,
+                    num_draft_tokens=self.config.draft_num_draft_tokens,
+                    min_draft_tokens=self.config.draft_min_draft_tokens,
+                    draft_p_min=self.config.draft_p_min,
+                    adaptive=self.config.draft_adaptive,
+                    hybrid_ngram=self.config.spec_type == "draft-ngram-hybrid",
+                    ngram_num_draft_tokens=self.config.ngram_num_draft_tokens,
+                    ngram_size=self.config.ngram_size,
+                    ngram_min_matches=self.config.ngram_min_matches,
+                    stats=self._draft_model_stats,
                     tokenizer=self.tokenizer,
                 )
 
@@ -3359,6 +4158,13 @@ class Scheduler:
                     / self._ngram_stats["proposed_tokens"]
                 )
             stats["ngram_mod"] = dict(self._ngram_stats)
+        if self._draft_model_stats is not None:
+            if self._draft_model_stats["proposed_tokens"] > 0:
+                self._draft_model_stats["acceptance_rate"] = (
+                    self._draft_model_stats["accepted_tokens"]
+                    / self._draft_model_stats["proposed_tokens"]
+                )
+            stats["draft_model"] = dict(self._draft_model_stats)
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

@@ -103,6 +103,7 @@ async def status():
         "requests": stats.get("requests", []),
         "dflash": stats.get("dflash"),
         "ngram_mod": stats.get("ngram_mod"),
+        "draft_model": stats.get("draft_model"),
     }
 
 

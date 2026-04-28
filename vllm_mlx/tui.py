@@ -17,7 +17,6 @@ import tty
 import urllib.error
 import urllib.request
 
-
 COLORS = {
     "reset": "\033[0m",
     "bold": "\033[1m",
@@ -170,6 +169,7 @@ def _build_screen(
 
     dflash_info = status.get("dflash") or {}
     ngram_info = status.get("ngram_mod") or {}
+    draft_info = status.get("draft_model") or {}
 
     running_requests = list(status.get("requests") or [])
     entries = list((requests_data or {}).get("entries") or [])
@@ -263,10 +263,18 @@ def _build_screen(
         adapt_max = _integer(dflash_info.get("adaptive_max", 0))
         obs_min = _integer(dflash_info.get("observed_block_min", 0))
         obs_max = _integer(dflash_info.get("observed_block_max", 0))
+        fallback_mode = str(dflash_info.get("fallback_mode") or "none")
+        disabled_remaining = _integer(dflash_info.get("disabled_remaining", 0))
+        recent_ratio = _num(dflash_info.get("recent_acceptance_ratio", 0.0))
         adaptive_label = (
             f"{adapt_min}-{adapt_max} (obs {obs_min}-{obs_max})"
             if adaptive_on
             else "off"
+        )
+        fallback_label = (
+            f"{fallback_mode} disabled {disabled_remaining}"
+            if disabled_remaining > 0
+            else f"{fallback_mode} recent {recent_ratio:.0%}"
         )
         rows.append(
             _row(
@@ -279,7 +287,26 @@ def _build_screen(
             + gap
             + _row("block size", f"{cur_block} cfg", mid, "magenta", tty_on)
             + gap
-            + _row("adaptive", adaptive_label, right, "magenta", tty_on)
+            + _row("fallback", fallback_label, right, "magenta", tty_on)
+        )
+        rows.append(
+            _row("adaptive", adaptive_label, left, "magenta", tty_on)
+            + gap
+            + _row(
+                "fallback acc",
+                f"{_num(dflash_info.get('fallback_acceptance_ratio', 0.0)):.1%}",
+                mid,
+                "magenta",
+                tty_on,
+            )
+            + gap
+            + _row(
+                "fallback req",
+                str(_integer(dflash_info.get("fallback_requests", 0))),
+                right,
+                "magenta",
+                tty_on,
+            )
         )
     if ngram_info:
         proposed = _integer(ngram_info.get("proposed_tokens", 0))
@@ -303,6 +330,34 @@ def _build_screen(
             + _row(
                 "reject/guard",
                 f"{rejected}/{guarded} limit {limited} disabled {disabled}",
+                right,
+                "magenta",
+                tty_on,
+            )
+        )
+    if draft_info:
+        proposed = _integer(draft_info.get("proposed_tokens", 0))
+        accepted = _integer(draft_info.get("accepted_tokens", 0))
+        rejected = _integer(draft_info.get("rejected_tokens", 0))
+        fallback = _integer(draft_info.get("fallback_steps", 0))
+        cooldown = _integer(draft_info.get("cooldown_steps", 0))
+        p_min = _integer(draft_info.get("p_min_stops", 0))
+        ngram_steps = _integer(draft_info.get("hybrid_ngram_steps", 0))
+        ratio = _num(draft_info.get("acceptance_rate", 0.0))
+        rows.append(
+            _row(
+                "draft accept",
+                f"{ratio:.1%} {_bar(ratio, 1.0, 12)}",
+                left,
+                "magenta",
+                tty_on,
+            )
+            + gap
+            + _row("accepted", f"{accepted}/{proposed}", mid, "magenta", tty_on)
+            + gap
+            + _row(
+                "reject/fallback",
+                f"{rejected}/{fallback} cool {cooldown} pmin {p_min} ng {ngram_steps}",
                 right,
                 "magenta",
                 tty_on,
@@ -371,7 +426,11 @@ def _build_screen(
             else "n/a"
         )
         block_text = str(last_block) if last_block is not None else "n/a"
-        accept_label = "dflash accept" if dflash_info and not ngram_info else "spec accept"
+        accept_label = (
+            "dflash accept"
+            if dflash_info and not (ngram_info or draft_info)
+            else "spec accept"
+        )
         rows.append(
             _row("surface", str(last_surface), left, "white", tty_on)
             + gap

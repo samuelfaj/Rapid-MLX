@@ -109,6 +109,11 @@ def serve_command(args):
         print("Error: --enable-auto-tool-choice requires --tool-call-parser")
         print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
         sys.exit(1)
+    if args.structured_cot_tools:
+        args.structured_cot = True
+    if args.structured_cot and args.no_thinking:
+        print("Error: --structured-cot requires thinking; remove --no-thinking.")
+        sys.exit(1)
 
     # Validate gpu-memory-utilization range
     if not (0.0 < args.gpu_memory_utilization <= 1.0):
@@ -116,6 +121,14 @@ def serve_command(args):
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
         sys.exit(1)
+
+    if getattr(args, "draft_model", None) and getattr(args, "spec_type", "none") == "none":
+        args.spec_type = "draft-model"
+    if (
+        getattr(args, "num_draft_tokens", 4) != 4
+        and getattr(args, "draft_max", 8) == 8
+    ):
+        args.draft_max = args.num_draft_tokens
 
     # Validate DFlash mode incompatibilities up-front
     if getattr(args, "drafter", None):
@@ -132,6 +145,12 @@ def serve_command(args):
         args, "enable_mtp", False
     ):
         print("Error: --spec-type and --enable-mtp are mutually exclusive.")
+        sys.exit(1)
+    if getattr(args, "spec_type", "none") in {
+        "draft-model",
+        "draft-ngram-hybrid",
+    } and not getattr(args, "draft_model", None):
+        print(f"Error: --spec-type {args.spec_type} requires --draft-model")
         sys.exit(1)
 
     # Auto-detect parser config from model name when not explicitly set
@@ -179,6 +198,9 @@ def serve_command(args):
 
     # Configure --no-thinking: suppress chain-of-thought in chat template
     server._no_thinking = args.no_thinking
+    server._structured_cot = args.structured_cot
+    server._structured_cot_tools = args.structured_cot_tools
+    server._structured_cot_token_budget = args.structured_cot_token_budget
 
     # Configure system prompt pinning
     server._pin_system_prompt = args.pin_system_prompt
@@ -237,6 +259,9 @@ def serve_command(args):
         features.append(f"tools: {args.tool_call_parser}{bias_info}")
     if args.reasoning_parser:
         features.append(f"reasoning: {args.reasoning_parser}")
+    if args.structured_cot:
+        target = "+tools" if args.structured_cot_tools else "text-only"
+        features.append(f"structured-cot: {target}")
     if args.api_key:
         features.append("auth: on")
     if args.rate_limit > 0:
@@ -277,11 +302,6 @@ def serve_command(args):
             "\n  ⚠ --kv-bits is deprecated and has no effect."
             "\n    For prefix cache quantization, use --kv-cache-quantization instead.\n"
         )
-    if getattr(args, "draft_model", None):
-        print(
-            "\n  ⚠ --draft-model is deprecated and has no effect."
-            "\n    For speculative decoding, use --enable-mtp (requires model with MTP head).\n"
-        )
     if getattr(args, "specprefill", False):
         print("\n  ⚠ --specprefill is deprecated and has no effect.\n")
 
@@ -321,6 +341,11 @@ def serve_command(args):
         ngram_num_draft_tokens=args.ngram_num_draft_tokens,
         ngram_size=args.ngram_size,
         ngram_min_matches=args.ngram_min_matches,
+        draft_model_path=args.draft_model,
+        draft_num_draft_tokens=args.draft_max,
+        draft_min_draft_tokens=args.draft_min,
+        draft_p_min=args.draft_p_min,
+        draft_adaptive=not args.draft_no_adaptive,
         # KV cache quantization
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -341,6 +366,13 @@ def serve_command(args):
         print(
             f"N-gram speculative decoding: draft_tokens={args.ngram_num_draft_tokens}, "
             f"ngram_size={args.ngram_size}, min_matches={args.ngram_min_matches}"
+        )
+    elif args.spec_type in {"draft-model", "draft-ngram-hybrid"}:
+        hybrid = " + n-gram fallback" if args.spec_type == "draft-ngram-hybrid" else ""
+        print(
+            f"Draft-model speculative decoding{hybrid}: "
+            f"draft_model={args.draft_model}, max={args.draft_max}, "
+            f"min={args.draft_min}, p_min={args.draft_p_min:.2f}"
         )
     print(f"Stream interval: {args.stream_interval} tokens")
     if args.use_paged_cache:
@@ -411,6 +443,17 @@ def serve_command(args):
             dflash_block_min=getattr(args, "dflash_block_min", 8),
             dflash_block_max=getattr(args, "dflash_block_max", 22),
             dflash_turboquant_bits=getattr(args, "dflash_turboquant_bits", None),
+            dflash_fallback_mode=getattr(args, "dflash_fallback_mode", "ngram"),
+            dflash_disable_threshold=getattr(
+                args, "dflash_disable_threshold", 0.55
+            ),
+            dflash_disable_window=getattr(args, "dflash_disable_window", 4),
+            dflash_disable_cooldown=getattr(args, "dflash_disable_cooldown", 8),
+            dflash_ngram_num_draft_tokens=getattr(
+                args, "ngram_num_draft_tokens", 4
+            ),
+            dflash_ngram_size=getattr(args, "ngram_size", 3),
+            dflash_ngram_min_matches=getattr(args, "ngram_min_matches", 1),
         )
     except Exception as e:
         # Show clean error instead of raw traceback
@@ -1181,7 +1224,10 @@ Examples:
         "--draft-model",
         type=str,
         default=None,
-        help=argparse.SUPPRESS,
+        help=(
+            "Path or HF id for a small MLX draft model. Enables "
+            "--spec-type draft-model when --spec-type is omitted."
+        ),
     )
     serve_parser.add_argument(
         "--num-draft-tokens",
@@ -1273,10 +1319,12 @@ Examples:
         "--spec-type",
         type=str,
         default="none",
-        choices=["none", "ngram-mod"],
+        choices=["none", "ngram-mod", "draft-model", "draft-ngram-hybrid"],
         help=(
             "Speculative decoding mode. 'ngram-mod' uses target-verified "
-            "prompt lookup drafts from repeated n-grams."
+            "prompt lookup drafts from repeated n-grams. 'draft-model' uses "
+            "a separate small MLX draft model. 'draft-ngram-hybrid' uses the "
+            "draft model first and tool-aware n-gram fallback."
         ),
     )
     serve_parser.add_argument(
@@ -1296,6 +1344,29 @@ Examples:
         type=int,
         default=1,
         help="Minimum draft length required before verifying (default: 1)",
+    )
+    serve_parser.add_argument(
+        "--draft-max",
+        type=int,
+        default=8,
+        help="Maximum tokens proposed by --draft-model per verify step (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--draft-min",
+        type=int,
+        default=1,
+        help="Minimum draft tokens before --draft-p-min can stop drafting (default: 1)",
+    )
+    serve_parser.add_argument(
+        "--draft-p-min",
+        type=float,
+        default=0.0,
+        help="Stop draft expansion after --draft-min when draft confidence is below this value (default: 0.0)",
+    )
+    serve_parser.add_argument(
+        "--draft-no-adaptive",
+        action="store_true",
+        help="Disable adaptive draft length/cooldown for --draft-model modes.",
     )
     # Prefill step size
     serve_parser.add_argument(
@@ -1413,6 +1484,27 @@ Examples:
             "Thinking tokens will appear as regular content. "
             "Useful for faster responses when chain-of-thought is not needed."
         ),
+    )
+    serve_parser.add_argument(
+        "--structured-cot",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable compact structured chain-of-thought prompt control "
+            "(GOAL/STATE/ALGO/EDGE/VERIFY)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--structured-cot-tools",
+        action="store_true",
+        default=False,
+        help="Apply structured chain-of-thought to tool-call requests too.",
+    )
+    serve_parser.add_argument(
+        "--structured-cot-token-budget",
+        type=int,
+        default=256,
+        help="Extra max_tokens budget when structured CoT reasoning is enabled.",
     )
     # GC control (Tier 0 optimization)
     serve_parser.add_argument(
@@ -1535,6 +1627,35 @@ Examples:
             "Optional KV-cache TurboQuant bits for the target model under "
             "DFlash. Requires mlx-turboquant (installed via the dflash[mlx] extra)."
         ),
+    )
+    serve_parser.add_argument(
+        "--dflash-fallback-mode",
+        type=str,
+        choices=["ngram", "ar", "none"],
+        default="ngram",
+        help=(
+            "Fallback mode when recent DFlash acceptance is low. 'ngram' uses "
+            "tool-aware n-gram speculative decoding, 'ar' uses normal decoding, "
+            "and 'none' keeps DFlash always on. Default: ngram."
+        ),
+    )
+    serve_parser.add_argument(
+        "--dflash-disable-threshold",
+        type=float,
+        default=0.55,
+        help="Disable DFlash temporarily when recent acceptance is below this ratio (default: 0.55).",
+    )
+    serve_parser.add_argument(
+        "--dflash-disable-window",
+        type=int,
+        default=4,
+        help="Number of DFlash requests used for auto-disable acceptance window (default: 4).",
+    )
+    serve_parser.add_argument(
+        "--dflash-disable-cooldown",
+        type=int,
+        default=8,
+        help="Number of fallback requests before DFlash probes again after disable (default: 8).",
     )
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")

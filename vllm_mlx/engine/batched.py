@@ -289,6 +289,18 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        if self._scheduler_config and getattr(
+            self._scheduler_config, "draft_model_path", None
+        ):
+            draft_path = self._scheduler_config.draft_model_path
+            logger.info("[draft-model] Loading draft model: %s", draft_path)
+            draft_model, _draft_tokenizer = load_model_with_fallback(
+                draft_path,
+                tokenizer_config=tokenizer_config,
+            )
+            self._scheduler_config.draft_model = draft_model
+            logger.info("[draft-model] Draft model loaded: %s", draft_path)
+
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
             from ..patches.qwen3_next_mtp import validate_mtp_support

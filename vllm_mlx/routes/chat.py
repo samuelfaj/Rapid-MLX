@@ -53,10 +53,12 @@ from ..service.helpers import (
     _inject_json_instruction,
     _maybe_pin_system_prompt,
     _parse_tool_calls_with_parser,
+    _resolve_enable_thinking,
     _resolve_max_tokens,
     _resolve_model_name,
     _resolve_temperature,
     _resolve_top_p,
+    _structured_cot_suffix,
     _validate_model_name,
     _validate_tool_call_params,
     _wait_with_disconnect,
@@ -348,7 +350,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Auto-inject system prompt suffix for tool use and/or reasoning control
     _inject_suffix = None
     if request.tools and cfg.tool_call_parser:
-        _inject_suffix = _TOOL_USE_SYSTEM_SUFFIX
+        _inject_suffix = (
+            _structured_cot_suffix(tools_requested=True) or _TOOL_USE_SYSTEM_SUFFIX
+        )
+    elif structured_cot := _structured_cot_suffix(tools_requested=False):
+        _inject_suffix = structured_cot
     elif cfg.reasoning_parser_name == "minimax":
         _inject_suffix = (
             "\n\nDo NOT think out loud or show your reasoning process. "
@@ -401,8 +407,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             messages = _inject_json_instruction(messages, json_instruction)
 
     # Prepare kwargs
+    resolved_enable_thinking = _resolve_enable_thinking(
+        request.enable_thinking,
+        tools_requested=bool(request.tools),
+        tool_continuation_retry=added_tool_continuation_prompt,
+    )
     chat_kwargs = {
-        "max_tokens": _resolve_max_tokens(request.max_tokens, request.enable_thinking),
+        "max_tokens": _resolve_max_tokens(request.max_tokens, resolved_enable_thinking),
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
         "stop": request.stop,
@@ -421,13 +432,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
-    # Pass through enable_thinking if explicitly set by the client
-    if request.enable_thinking is not None:
-        chat_kwargs["enable_thinking"] = request.enable_thinking
-    elif cfg.no_thinking or (
-        added_tool_continuation_prompt and cfg.tool_call_parser == "qwen3_coder_xml"
-    ):
-        chat_kwargs["enable_thinking"] = False
+    # Pass through enable_thinking when resolved. Keep None for template defaults.
+    if resolved_enable_thinking is not None:
+        chat_kwargs["enable_thinking"] = resolved_enable_thinking
 
     # Cloud routing: offload large-context requests to cloud LLM
     if cfg.cloud_router and not engine.is_mllm and hasattr(engine, "build_prompt"):

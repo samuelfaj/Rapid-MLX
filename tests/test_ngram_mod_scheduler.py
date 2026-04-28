@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-from vllm_mlx.scheduler import _install_ngram_mod
+from vllm_mlx.scheduler import _install_draft_model_speculator, _install_ngram_mod
 
 
 class FakeCache:
@@ -81,11 +81,35 @@ class FakeModel:
             for cache_layer in cache:
                 if hasattr(cache_layer, "seen"):
                     cache_layer.seen.extend(input_tokens[0].tolist())
-        samples = [4, 1, 9, 0]
+        samples = [4, 1, 9, 0, 0, 0]
         logits = mx.full((1, input_tokens.shape[1], 12), -1000.0)
         for pos in range(input_tokens.shape[1]):
             logits[:, pos, samples[pos]] = 0.0
         return logits
+
+
+class FakeDraftModel:
+    def __call__(self, input_tokens, cache=None):
+        if cache:
+            for cache_layer in cache:
+                if hasattr(cache_layer, "seen"):
+                    cache_layer.seen.extend(input_tokens[0].tolist())
+        next_by_input = {3: 4, 4: 1, 1: 2, 2: 5, 5: 6}
+        logits = mx.full((1, input_tokens.shape[1], 12), -1000.0)
+        for pos, token in enumerate(input_tokens[0].tolist()):
+            logits[:, pos, next_by_input.get(token, 4)] = 0.0
+        return logits
+
+
+class FakeDraftCache(FakeUntrimmableCache):
+    def trim(self, n):
+        if n <= 0:
+            return 0
+        del self.seen[-n:]
+        return n
+
+    def is_trimmable(self):
+        return True
 
 
 class FakeBatch:
@@ -295,3 +319,69 @@ def test_ngram_mod_finishes_batch_on_speculative_length_stop():
     assert [r.token for r in responses] == [3, 4, 1]
     assert [r.finish_reason for r in responses] == [None, None, "length"]
     assert bg.active_batch is None
+
+
+def test_draft_model_speculator_accepts_prefix_and_rewinds_draft_cache(monkeypatch):
+    draft_cache = FakeDraftCache()
+
+    def fake_make_prompt_cache(_model):
+        return [draft_cache]
+
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        fake_make_prompt_cache,
+    )
+
+    bg = FakeBatchGenerator()
+    stats = _install_draft_model_speculator(
+        bg,
+        FakeDraftModel(),
+        num_draft_tokens=4,
+        min_draft_tokens=1,
+        draft_p_min=0.0,
+    )
+
+    responses = bg._next()
+
+    assert [r.token for r in responses] == [3, 4, 1]
+    assert bg.active_batch.y.tolist() == [9]
+    assert bg.active_batch.num_tokens == [3]
+    assert bg.active_batch.tokens[0].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 1]
+    assert draft_cache.seen == [1, 2, 3, 4, 1, 2, 3, 4, 1]
+    assert stats["proposed_tokens"] == 4
+    assert stats["accepted_tokens"] == 2
+    assert stats["rejected_tokens"] == 2
+
+
+def test_draft_ngram_hybrid_falls_back_to_tool_aware_ngram(monkeypatch):
+    draft_cache = FakeDraftCache()
+
+    def fake_make_prompt_cache(_model):
+        return [draft_cache]
+
+    monkeypatch.setattr(
+        "mlx_lm.models.cache.make_prompt_cache",
+        fake_make_prompt_cache,
+    )
+
+    bg = FakeBatchGenerator()
+    stats = _install_draft_model_speculator(
+        bg,
+        FakeDraftModel(),
+        num_draft_tokens=0,
+        hybrid_ngram=True,
+        ngram_num_draft_tokens=3,
+        ngram_size=3,
+        ngram_min_matches=1,
+        tokenizer=FakeToolParameterTokenizer(),
+    )
+    bg.active_batch.tokens = [mx.array([99, 1, 2, 3, 4, 1, 2], mx.uint32)]
+
+    responses = bg._next()
+
+    assert [r.token for r in responses] == [3, 4, 1]
+    assert bg.active_batch.y.tolist() == [9]
+    assert stats["hybrid_ngram_steps"] == 1
+    assert stats["tool_limited_steps"] == 1
+    assert stats["ngram_proposed_tokens"] == 2
+    assert stats["accepted_tokens"] == 2

@@ -47,6 +47,9 @@ class ServerConfig:
     # --- Reasoning ---
     reasoning_parser: Any = None
     reasoning_parser_name: str | None = None
+    structured_cot: bool = False
+    structured_cot_tools: bool = False
+    structured_cot_token_budget: int = 256
 
     # --- MCP ---
     mcp_manager: Any = None

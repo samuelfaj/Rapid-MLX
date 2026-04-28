@@ -98,6 +98,8 @@ class MetricsMiddleware:
         engine_block_size: int | None = None
         ngram_start: tuple[int, int] | None = None
         ngram_latest: tuple[int, int] | None = None
+        draft_start: tuple[int, int] | None = None
+        draft_latest: tuple[int, int] | None = None
         ngram_ambiguous = False
 
         def poll_engine_stats() -> None:
@@ -105,6 +107,7 @@ class MetricsMiddleware:
             nonlocal engine_gen_tps, engine_ttft
             nonlocal engine_acceptance, engine_block_size
             nonlocal ngram_start, ngram_latest, ngram_ambiguous
+            nonlocal draft_start, draft_latest
             try:
                 from ..config import get_config
 
@@ -122,6 +125,13 @@ class MetricsMiddleware:
                     if ngram_start is None:
                         ngram_start = (proposed, accepted)
                     ngram_latest = (proposed, accepted)
+                draft_stats = stats.get("draft_model") or {}
+                if draft_stats.get("enabled"):
+                    proposed = int(draft_stats.get("proposed_tokens") or 0)
+                    accepted = int(draft_stats.get("accepted_tokens") or 0)
+                    if draft_start is None:
+                        draft_start = (proposed, accepted)
+                    draft_latest = (proposed, accepted)
 
                 if len(running_requests) != 1:
                     return
@@ -233,6 +243,16 @@ class MetricsMiddleware:
                             if isinstance(payload, dict):
                                 handle_payload(payload)
                         final_acceptance = engine_acceptance
+                        if (
+                            final_acceptance is None
+                            and draft_start is not None
+                            and draft_latest is not None
+                            and not ngram_ambiguous
+                        ):
+                            proposed_delta = draft_latest[0] - draft_start[0]
+                            accepted_delta = draft_latest[1] - draft_start[1]
+                            if proposed_delta > 0:
+                                final_acceptance = accepted_delta / proposed_delta
                         if (
                             final_acceptance is None
                             and ngram_start is not None

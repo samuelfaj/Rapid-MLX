@@ -47,6 +47,23 @@ _TOOL_USE_SYSTEM_SUFFIX = (
     "Give direct answers only — no preamble like 'The user asks...' or 'Let me think...'."
 )
 
+_STRUCTURED_COT_SUFFIX = (
+    "\n\nWhen thinking is enabled, keep the hidden <think> block short and structured. "
+    "Use exactly these lines, one concise line each, then close the think block: "
+    "GOAL: ... STATE: ... ALGO: ... EDGE: ... VERIFY: ... "
+    "Do not add extra reasoning prose."
+)
+
+_STRUCTURED_COT_TOOL_SUFFIX = (
+    "\n\nIMPORTANT: When the user's request can be answered using the provided tools, "
+    "you MUST use the appropriate tool. Do NOT ask for clarification when a reasonable "
+    "default exists. Do NOT emit a long <think> block for tool calls. If you need a "
+    "brief plan, keep it internal and structured as these lines: "
+    "GOAL: ... STATE: ... ALGO: ... EDGE: ... VERIFY: ... "
+    "Immediately emit the required tool call XML. Do NOT output explanatory text "
+    "before or after the tool call."
+)
+
 _TOOL_CONTINUATION_USER_PROMPT = (
     "Continue the original task after the tool result above. "
     "If any work remains and a suitable tool is available, call the next tool now. "
@@ -99,11 +116,46 @@ def _resolve_max_tokens(
     """Resolve max_tokens with thinking budget for reasoning models."""
     cfg = get_config()
     base = request_value if request_value is not None else cfg.default_max_tokens
-    if enable_thinking is False:
+    if enable_thinking is False or cfg.no_thinking:
         return base
+    if cfg.structured_cot and cfg.reasoning_parser_name and base > 0 and base < 4096:
+        return base + cfg.structured_cot_token_budget
     if cfg.reasoning_parser_name and base > 0 and base < 4096:
         return base + cfg.thinking_token_budget
     return base
+
+
+def _resolve_enable_thinking(
+    request_value: bool | None,
+    *,
+    tools_requested: bool = False,
+    tool_continuation_retry: bool = False,
+) -> bool | None:
+    """Resolve chat-template thinking mode for tool-heavy agent loops."""
+    cfg = get_config()
+    if request_value is not None:
+        return request_value
+    if cfg.no_thinking:
+        return False
+    if tools_requested and cfg.tool_call_parser == "qwen3_coder_xml":
+        return False
+    if cfg.structured_cot:
+        return True
+    if cfg.tool_call_parser == "qwen3_coder_xml" and tool_continuation_retry:
+        return False
+    return None
+
+
+def _structured_cot_suffix(*, tools_requested: bool = False) -> str | None:
+    """Return structured-CoT prompt suffix when enabled for this request."""
+    cfg = get_config()
+    if not cfg.structured_cot:
+        return None
+    if tools_requested:
+        if cfg.structured_cot_tools:
+            return _STRUCTURED_COT_TOOL_SUFFIX
+        return None
+    return _STRUCTURED_COT_SUFFIX
 
 
 def _resolve_temperature(request_value: float | None) -> float:

@@ -174,6 +174,9 @@ _auth_warning_logged: bool = False
 # Reasoning parser (for models like Qwen3, DeepSeek-R1, MiniMax)
 _reasoning_parser = None  # ReasoningParser instance when enabled
 _reasoning_parser_name: str | None = None  # Parser name (e.g., "minimax")
+_structured_cot: bool = False
+_structured_cot_tools: bool = False
+_structured_cot_token_budget: int = 256
 
 # Tool calling configuration
 _enable_auto_tool_choice: bool = False
@@ -449,6 +452,13 @@ def load_model(
     dflash_block_min: int = 8,
     dflash_block_max: int = 22,
     dflash_turboquant_bits: float | None = None,
+    dflash_fallback_mode: str = "ngram",
+    dflash_disable_threshold: float = 0.55,
+    dflash_disable_window: int = 4,
+    dflash_disable_cooldown: int = 8,
+    dflash_ngram_num_draft_tokens: int = 4,
+    dflash_ngram_size: int = 3,
+    dflash_ngram_min_matches: int = 1,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -509,6 +519,13 @@ def load_model(
             adaptive_min=dflash_block_min,
             adaptive_max=dflash_block_max,
             turboquant_bits=dflash_turboquant_bits,
+            fallback_mode=dflash_fallback_mode,
+            disable_threshold=dflash_disable_threshold,
+            disable_window=dflash_disable_window,
+            disable_cooldown=dflash_disable_cooldown,
+            ngram_num_draft_tokens=dflash_ngram_num_draft_tokens,
+            ngram_size=dflash_ngram_size,
+            ngram_min_matches=dflash_ngram_min_matches,
             gpu_memory_utilization=gpu_memory_utilization,
         )
     else:
@@ -602,6 +619,9 @@ def _sync_config() -> None:
     cfg.enable_tool_logits_bias = _enable_tool_logits_bias
     cfg.reasoning_parser = _reasoning_parser
     cfg.reasoning_parser_name = _reasoning_parser_name
+    cfg.structured_cot = _structured_cot
+    cfg.structured_cot_tools = _structured_cot_tools
+    cfg.structured_cot_token_budget = _structured_cot_token_budget
     cfg.mcp_manager = _mcp_manager
     cfg.embedding_engine = _embedding_engine
     cfg.embedding_model_locked = _embedding_model_locked
@@ -820,6 +840,27 @@ Examples:
         help="Enable jump-forward decoding bias for tool call structural tokens",
     )
     parser.add_argument(
+        "--structured-cot",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable compact structured chain-of-thought prompt control "
+            "(GOAL/STATE/ALGO/EDGE/VERIFY)."
+        ),
+    )
+    parser.add_argument(
+        "--structured-cot-tools",
+        action="store_true",
+        default=False,
+        help="Apply structured chain-of-thought to tool-call requests too.",
+    )
+    parser.add_argument(
+        "--structured-cot-token-budget",
+        type=int,
+        default=256,
+        help="Extra max_tokens budget when structured CoT reasoning is enabled.",
+    )
+    parser.add_argument(
         "--embedding-model",
         type=str,
         default=None,
@@ -871,13 +912,21 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.structured_cot_tools:
+        args.structured_cot = True
+    if args.structured_cot and getattr(args, "no_thinking", False):
+        parser.error("--structured-cot requires thinking; remove --no-thinking.")
     uvicorn_log_level = configure_logging(args.log_level)
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
     global _default_temperature, _default_top_p
+    global _structured_cot, _structured_cot_tools, _structured_cot_token_budget
     _api_key = args.api_key
     _default_timeout = args.timeout
+    _structured_cot = args.structured_cot
+    _structured_cot_tools = args.structured_cot_tools
+    _structured_cot_token_budget = args.structured_cot_token_budget
     if args.default_temperature is not None:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:

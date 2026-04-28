@@ -21,6 +21,9 @@ class TestServerConfig:
         assert cfg.model_name is None
         assert cfg.default_max_tokens == 4096
         assert cfg.thinking_token_budget == 2048
+        assert cfg.structured_cot is False
+        assert cfg.structured_cot_tools is False
+        assert cfg.structured_cot_token_budget == 256
         assert cfg.default_timeout == 300.0
         assert cfg.api_key is None
         assert cfg.gc_control is True

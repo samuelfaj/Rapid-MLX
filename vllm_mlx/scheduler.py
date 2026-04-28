@@ -26,6 +26,7 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .speculative.prompt_lookup import PromptLookupDecoder
 from .utils.decode import IncrementalDecoder
 from .utils.mamba_cache import ensure_mamba_support
 
@@ -113,6 +114,13 @@ class SchedulerConfig:
     enable_mtp: bool = False
     mtp_num_draft_tokens: int = 1  # Number of draft tokens from MTP head
     mtp_optimistic: bool = False  # Skip acceptance check for max speed
+
+    # N-gram prompt lookup speculative decoding. ``ngram-mod`` is server-wired
+    # prompt lookup: draft from repeated context, verify with the target model.
+    spec_type: str | None = None
+    ngram_num_draft_tokens: int = 4
+    ngram_size: int = 3
+    ngram_min_matches: int = 1
 
 
 @dataclass
@@ -1025,6 +1033,697 @@ def _install_mtp(
     )
 
 
+def _new_ngram_stats() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": "ngram-mod",
+        "attempts": 0,
+        "drafts": 0,
+        "proposed_tokens": 0,
+        "accepted_tokens": 0,
+        "rejected_tokens": 0,
+        "fallback_steps": 0,
+        "disabled_steps": 0,
+        "disabled_batch_sizes": {},
+        "cooldown_steps": 0,
+        "acceptance_rate": 0.0,
+    }
+
+
+def _install_ngram_mod(
+    batch_gen: "BatchGenerator",
+    num_draft_tokens: int = 4,
+    ngram_size: int = 3,
+    min_matches: int = 2,
+    stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Install target-verified n-gram speculative decoding on BatchGenerator.
+
+    The first implementation is intentionally conservative: it accelerates
+    the single active sequence case used by local coding agents, and falls
+    back to normal BatchGenerator behavior for prompt admission and batches
+    larger than one. Per-row speculative cache rollback in a batch would need
+    expensive extract/merge operations.
+    """
+
+    _inner_next = batch_gen._next
+    _orig_remove = batch_gen.remove
+    _stats = stats or _new_ngram_stats()
+    _stats.update({"enabled": True, "mode": "ngram-mod"})
+    _decoders: dict[int, PromptLookupDecoder] = {}
+    _miss_streaks: dict[int, int] = {}
+    _cooldowns: dict[int, int] = {}
+
+    def _new_batch_api(self=batch_gen) -> bool:
+        return hasattr(self, "_generation_batch")
+
+    def _generation_batch(self=batch_gen):
+        return getattr(self, "active_batch", None) or getattr(
+            self, "_generation_batch", None
+        )
+
+    def _format_return(self, responses, prompt_responses=None):
+        if _new_batch_api(self):
+            return prompt_responses or [], responses
+        return responses
+
+    def _responses_from_raw(raw):
+        if isinstance(raw, tuple):
+            return raw[1]
+        return raw
+
+    def _token_list(tokens) -> list[int]:
+        return tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+
+    def _token_array(tokens) -> mx.array:
+        return tokens if hasattr(tokens, "shape") else mx.array(tokens, mx.uint32)
+
+    def _pending_token(batch) -> int:
+        if hasattr(batch, "y"):
+            return batch.y[0].item()
+        return batch._next_tokens[0].item()
+
+    def _pending_logprobs(batch):
+        if hasattr(batch, "logprobs"):
+            return batch.logprobs[0]
+        return batch._next_logprobs[0]
+
+    def _num_tokens(batch) -> int:
+        if hasattr(batch, "num_tokens"):
+            return batch.num_tokens[0]
+        return batch._num_tokens[0]
+
+    def _set_num_tokens(batch, value: int) -> None:
+        if hasattr(batch, "num_tokens"):
+            batch.num_tokens[0] = value
+        else:
+            batch._num_tokens[0] = value
+
+    def _cache(batch):
+        return getattr(batch, "cache", None) or getattr(batch, "prompt_cache")
+
+    def _sampler(self, batch):
+        if hasattr(batch, "samplers"):
+            return batch.samplers[0] or getattr(self, "sampler", None)
+        return getattr(self, "sampler", None)
+
+    def _logits_processors(batch):
+        processors = batch.logits_processors[0] if batch.logits_processors else []
+        return processors or []
+
+    def _append_tokens(batch, tokens: list[int]) -> None:
+        if hasattr(batch.tokens[0], "shape"):
+            batch.tokens[0] = mx.concatenate(
+                (batch.tokens[0], mx.array(tokens, mx.uint32))
+            )
+        else:
+            batch.tokens[0].extend(tokens)
+
+    def _set_next(batch, token: int, logprobs) -> None:
+        if hasattr(batch, "y"):
+            batch.y = mx.array([token], mx.uint32)
+            batch.logprobs = [logprobs]
+            mx.async_eval(batch.y, batch.logprobs, batch.tokens)
+        else:
+            batch._next_tokens = mx.array([token], mx.uint32)
+            batch._next_logprobs = [logprobs]
+            mx.async_eval(batch._next_tokens, batch._next_logprobs)
+
+    def _is_terminal_pending(self, batch, token: int, num_tokens: int) -> bool:
+        if _new_batch_api():
+            return False
+        return token in batch_gen.stop_tokens or num_tokens + 1 >= batch.max_tokens[0]
+
+    def _make_response(
+        self,
+        batch,
+        uid: int,
+        token: int,
+        logprobs,
+        finish_reason: str | None,
+        current_state=None,
+        match_sequence=None,
+    ):
+        prompt_cache = batch.extract_cache(0) if finish_reason else None
+        response_cls = getattr(self, "Response", None) or getattr(batch, "Response")
+        fields = getattr(response_cls, "__dataclass_fields__", {})
+        kwargs = {
+            "uid": uid,
+            "token": token,
+            "logprobs": logprobs,
+            "finish_reason": finish_reason,
+            "prompt_cache": prompt_cache,
+        }
+        if "current_state" in fields:
+            kwargs["current_state"] = current_state
+        if "match_sequence" in fields:
+            kwargs["match_sequence"] = match_sequence
+        if "all_tokens" in fields:
+            kwargs["all_tokens"] = list(batch.tokens[0]) if finish_reason else None
+        return response_cls(**kwargs)
+
+    def _finish_batch(batch, uid: int) -> None:
+        if getattr(batch_gen, "active_batch", None) is batch:
+            batch_gen.active_batch = None
+        elif getattr(batch_gen, "_generation_batch", None) is batch:
+            batch_gen._generation_batch = None
+        elif hasattr(batch, "filter"):
+            batch.filter([])
+        _decoders.pop(uid, None)
+
+    def _cache_trimmable(prompt_cache) -> bool:
+        return all(
+            hasattr(c, "is_trimmable")
+            and c.is_trimmable()
+            and hasattr(c, "trim")
+            for c in prompt_cache
+        )
+
+    def _snapshot_value(value):
+        if isinstance(value, list):
+            return [_snapshot_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(_snapshot_value(v) for v in value)
+        if isinstance(value, dict):
+            return {k: _snapshot_value(v) for k, v in value.items()}
+        if hasattr(value, "copy"):
+            return value.copy()
+        return value
+
+    def _snapshot_cache(prompt_cache):
+        snapshot = []
+        for c in prompt_cache:
+            if hasattr(c, "is_trimmable") and c.is_trimmable():
+                continue
+            attrs = {}
+            for name in ("lengths", "left_padding", "_right_padding"):
+                if hasattr(c, name):
+                    attrs[name] = _snapshot_value(getattr(c, name))
+            snapshot.append(
+                (
+                    c,
+                    _snapshot_value(c.state),
+                    _snapshot_value(getattr(c, "meta_state", "")),
+                    attrs,
+                )
+            )
+        return snapshot
+
+    def _restore_cache(snapshot) -> None:
+        for c, state, meta_state, attrs in snapshot:
+            c.state = _snapshot_value(state)
+            try:
+                c.meta_state = _snapshot_value(meta_state)
+            except Exception:
+                pass
+            for name, value in attrs.items():
+                setattr(c, name, _snapshot_value(value))
+
+    def _replay_cache(model, prompt_cache, tokens: list[int]) -> None:
+        if not tokens:
+            return
+        replay_logits = model(mx.array([tokens], mx.uint32), cache=prompt_cache)
+        cache_states = [c.state for c in prompt_cache if hasattr(c, "state")]
+        mx.eval(replay_logits, cache_states)
+
+    def _trim_cache(prompt_cache, num_tokens: int) -> bool:
+        if num_tokens <= 0:
+            return True
+        if not _cache_trimmable(prompt_cache):
+            return False
+        trimmed = [c.trim(num_tokens) for c in prompt_cache]
+        return all(t == num_tokens for t in trimmed)
+
+    def _trim_trimmable_layers(prompt_cache, num_tokens: int) -> bool:
+        if num_tokens <= 0:
+            return True
+        for c in prompt_cache:
+            if hasattr(c, "is_trimmable") and c.is_trimmable() and hasattr(c, "trim"):
+                if c.trim(num_tokens) != num_tokens:
+                    return False
+        return True
+
+    def _ensure_decoder(uid: int, token_array: mx.array) -> PromptLookupDecoder:
+        decoder = _decoders.get(uid)
+        if decoder is None:
+            decoder = PromptLookupDecoder(
+                num_draft_tokens=num_draft_tokens,
+                ngram_size=ngram_size,
+                min_matches=min_matches,
+            )
+            decoder.add_prompt_tokens(_token_list(token_array))
+            _decoders[uid] = decoder
+        return decoder
+
+    def _sync_decoders_from_active(self=batch_gen) -> None:
+        batch = _generation_batch(self)
+        if batch is None or len(batch) == 0:
+            return
+        active_uids = set(batch.uids)
+        for uid in list(_decoders):
+            if uid not in active_uids:
+                _decoders.pop(uid, None)
+        for e, uid in enumerate(batch.uids):
+            _ensure_decoder(uid, batch.tokens[e])
+
+    def _record_inner_responses(responses) -> None:
+        for response in responses:
+            decoder = _decoders.get(response.uid)
+            if decoder is not None:
+                decoder.add_generated_token(response.token)
+            if response.finish_reason is not None:
+                _decoders.pop(response.uid, None)
+                _miss_streaks.pop(response.uid, None)
+                _cooldowns.pop(response.uid, None)
+
+    def _sample_verify_positions(
+        self,
+        verify_logits: mx.array,
+        context_tokens: mx.array,
+        pending_token: int,
+        draft_tokens: list[int],
+        sampler,
+        logits_processors,
+    ) -> tuple[list[int], list[mx.array]]:
+        sampled_arrays = []
+        logprobs = []
+        context = mx.concatenate(
+            (context_tokens, mx.array([pending_token], mx.uint32))
+        )
+
+        for pos in range(len(draft_tokens) + 1):
+            sample_logits = verify_logits[:, pos, :]
+            if logits_processors:
+                for processor in logits_processors:
+                    sample_logits = processor(context, sample_logits)
+            sample_logprobs = sample_logits - mx.logsumexp(
+                sample_logits, axis=-1, keepdims=True
+            )
+            sampled = sampler(sample_logprobs)
+            sampled_arrays.append(sampled)
+            logprobs.append(sample_logprobs[0])
+
+            if pos < len(draft_tokens):
+                context = mx.concatenate(
+                    (context, mx.array([draft_tokens[pos]], mx.uint32))
+                )
+
+        sampled_tokens = mx.concatenate(sampled_arrays, axis=0)
+        mx.eval(sampled_tokens, *logprobs)
+        return sampled_tokens.tolist(), logprobs
+
+    def _ngram_next(self=batch_gen):
+        _sync_decoders_from_active(self)
+
+        batch = _generation_batch(self)
+        if (
+            batch is None
+            or len(batch) == 0
+            or getattr(self, "unprocessed_prompts", None)
+            or getattr(self, "_unprocessed_sequences", None)
+            or getattr(self, "_currently_processing", None)
+            or len(batch.uids) != 1
+            or len(batch.tokens) != 1
+        ):
+            if batch is not None and len(batch.uids) != 1:
+                _stats["disabled_steps"] += 1
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+
+        uid = batch.uids[0]
+        if _cooldowns.get(uid, 0) > 0:
+            _cooldowns[uid] -= 1
+            _stats["cooldown_steps"] += 1
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+
+        decoder = _ensure_decoder(uid, batch.tokens[0])
+        pending_token = _pending_token(batch)
+        pending_logprobs = _pending_logprobs(batch)
+        num_tokens = _num_tokens(batch)
+        max_tokens = batch.max_tokens[0]
+
+        # Let the stock path handle terminal pending tokens. It advances cache
+        # once before emitting, matching BatchGenerator's normal cache shape.
+        if _is_terminal_pending(self, batch, pending_token, num_tokens):
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+
+        remaining_after_pending = max_tokens - (num_tokens + 1)
+        draft_tokens = decoder.get_draft_tokens_for_token(pending_token)
+        if remaining_after_pending < len(draft_tokens):
+            draft_tokens = draft_tokens[:remaining_after_pending]
+
+        if not draft_tokens:
+            _stats["fallback_steps"] += 1
+            _miss_streaks[uid] = _miss_streaks.get(uid, 0) + 1
+            if _miss_streaks[uid] >= 32:
+                _cooldowns[uid] = 64
+                _miss_streaks[uid] = 0
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+        _miss_streaks[uid] = 0
+
+        prompt_cache = _cache(batch)
+        cache_is_trimmable = _cache_trimmable(prompt_cache)
+        cache_snapshot = None if cache_is_trimmable else _snapshot_cache(prompt_cache)
+
+        import time as _time
+
+        tic = _time.perf_counter()
+        _stats["attempts"] += 1
+        _stats["drafts"] += 1
+        _stats["proposed_tokens"] += len(draft_tokens)
+
+        verify_input = mx.array([[pending_token] + draft_tokens], mx.uint32)
+        verify_logits = self.model(verify_input, cache=prompt_cache)
+        verify_logits = verify_logits[:, -len(draft_tokens) - 1 :, :]
+
+        sampler = _sampler(self, batch)
+        logits_processors = _logits_processors(batch)
+        sampled_tokens, verify_logprobs = _sample_verify_positions(
+            self,
+            verify_logits,
+            _token_array(batch.tokens[0]),
+            pending_token,
+            draft_tokens,
+            sampler,
+            logits_processors,
+        )
+
+        accepted = 0
+        for draft_token, sampled_token in zip(draft_tokens, sampled_tokens[:-1]):
+            if draft_token != sampled_token:
+                break
+            accepted += 1
+
+        finish_reason = None
+        current_state = None
+        match_sequence = None
+        if _new_batch_api(self):
+            state = batch._matcher_states[0]
+            for idx, token in enumerate([pending_token] + draft_tokens[:accepted]):
+                state, seq, current = batch.state_machines[0].match(state, token)
+                if seq is not None and current is None:
+                    accepted = idx
+                    finish_reason = "stop"
+                    current_state = current
+                    match_sequence = seq
+                    break
+        else:
+            for idx, token in enumerate(draft_tokens[:accepted]):
+                if token not in self.stop_tokens:
+                    continue
+                accepted = idx + 1
+                finish_reason = "stop"
+                break
+
+        if accepted >= remaining_after_pending:
+            accepted = remaining_after_pending
+            finish_reason = finish_reason or "length"
+
+        emitted_tokens = [pending_token] + draft_tokens[:accepted]
+        rejected = len(draft_tokens) - accepted
+        if rejected:
+            if cache_is_trimmable:
+                if not _trim_cache(prompt_cache, rejected):
+                    # The cache is no longer trustworthy because verify already ran.
+                    # Raise and let Scheduler's generation-error recovery abort safely.
+                    raise RuntimeError(
+                        f"[ngram-mod] failed to trim {rejected} rejected draft tokens"
+                    )
+            else:
+                if not _trim_trimmable_layers(prompt_cache, 1 + len(draft_tokens)):
+                    raise RuntimeError(
+                        "[ngram-mod] failed to rewind trimmable cache layers"
+                    )
+                _restore_cache(cache_snapshot)
+                _replay_cache(self.model, prompt_cache, emitted_tokens)
+
+        _stats["accepted_tokens"] += accepted
+        _stats["rejected_tokens"] += rejected
+        if _stats["proposed_tokens"] > 0:
+            _stats["acceptance_rate"] = (
+                _stats["accepted_tokens"] / _stats["proposed_tokens"]
+            )
+
+        emitted_logprobs = [pending_logprobs] + verify_logprobs[:accepted]
+        _append_tokens(batch, emitted_tokens)
+        _set_num_tokens(batch, num_tokens + len(emitted_tokens))
+
+        responses = []
+        for idx, (token, logprobs) in enumerate(zip(emitted_tokens, emitted_logprobs)):
+            token_finish_reason = None
+            if idx == len(emitted_tokens) - 1:
+                token_finish_reason = finish_reason
+            responses.append(
+                _make_response(
+                    self,
+                    batch,
+                    uid,
+                    token,
+                    logprobs,
+                    token_finish_reason,
+                    current_state if token_finish_reason else None,
+                    match_sequence if token_finish_reason else None,
+                )
+            )
+
+        decoder.add_generated_token(pending_token)
+        for token in draft_tokens[:accepted]:
+            decoder.add_generated_token(token)
+
+        if _new_batch_api(self):
+            for token in emitted_tokens:
+                batch._matcher_states[0], _, _ = batch.state_machines[0].match(
+                    batch._matcher_states[0], token
+                )
+
+        if finish_reason is not None:
+            _finish_batch(batch, uid)
+        else:
+            next_token = sampled_tokens[accepted]
+            _set_next(batch, next_token, verify_logprobs[accepted])
+
+        if hasattr(self, "_stats"):
+            self._stats.generation_time += _time.perf_counter() - tic
+            self._stats.generation_tokens += len(responses)
+        else:
+            self._gen_tokens_counter += len(responses)
+        if _stats["attempts"] % 128 == 0:
+            logger.info(
+                "[ngram-mod] accepted=%d proposed=%d acceptance=%.1f%%",
+                _stats["accepted_tokens"],
+                _stats["proposed_tokens"],
+                _stats["acceptance_rate"] * 100,
+            )
+
+        return _format_return(self, responses)
+
+    if _new_batch_api(batch_gen):
+        generation_batch = batch_gen._generation_batch
+        _inner_generation_next = generation_batch.next
+
+        def _ngram_generation_next(self=generation_batch):
+            if len(self.uids) != 1:
+                if len(self.uids) != 0:
+                    _stats["disabled_steps"] += 1
+                    key = str(len(self.uids))
+                    _stats["disabled_batch_sizes"][key] = (
+                        _stats["disabled_batch_sizes"].get(key, 0) + 1
+                    )
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
+
+            uid = self.uids[0]
+            if _cooldowns.get(uid, 0) > 0:
+                _cooldowns[uid] -= 1
+                _stats["cooldown_steps"] += 1
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
+
+            decoder = _ensure_decoder(uid, self.tokens[0])
+            pending_token = self._next_tokens[0].item()
+            pending_logprobs = self._next_logprobs[0]
+            num_tokens = self._num_tokens[0]
+            max_tokens = self.max_tokens[0]
+            remaining_after_pending = max_tokens - (num_tokens + 1)
+
+            if remaining_after_pending <= 0:
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
+
+            draft_tokens = decoder.get_draft_tokens_for_token(pending_token)
+            if remaining_after_pending < len(draft_tokens):
+                draft_tokens = draft_tokens[:remaining_after_pending]
+
+            if not draft_tokens:
+                _stats["fallback_steps"] += 1
+                _miss_streaks[uid] = _miss_streaks.get(uid, 0) + 1
+                if _miss_streaks[uid] >= 32:
+                    _cooldowns[uid] = 64
+                    _miss_streaks[uid] = 0
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
+            _miss_streaks[uid] = 0
+
+            prompt_cache = self.prompt_cache
+            cache_is_trimmable = _cache_trimmable(prompt_cache)
+            cache_snapshot = None if cache_is_trimmable else _snapshot_cache(prompt_cache)
+
+            _stats["attempts"] += 1
+            _stats["drafts"] += 1
+            _stats["proposed_tokens"] += len(draft_tokens)
+
+            verify_input = mx.array([[pending_token] + draft_tokens], mx.uint32)
+            verify_logits = self.model(verify_input, cache=prompt_cache)
+            verify_logits = verify_logits[:, -len(draft_tokens) - 1 :, :]
+
+            sampler = self.samplers[0] or self.fallback_sampler
+            logits_processors = _logits_processors(self)
+            sampled_tokens, verify_logprobs = _sample_verify_positions(
+                self,
+                verify_logits,
+                _token_array(self.tokens[0]),
+                pending_token,
+                draft_tokens,
+                sampler,
+                logits_processors,
+            )
+
+            accepted = 0
+            for draft_token, sampled_token in zip(draft_tokens, sampled_tokens[:-1]):
+                if draft_token != sampled_token:
+                    break
+                accepted += 1
+
+            finish_reason = None
+            current_state = None
+            match_sequence = None
+            state = self._matcher_states[0]
+            for idx, token in enumerate([pending_token] + draft_tokens[:accepted]):
+                state, seq, current = self.state_machines[0].match(state, token)
+                if seq is not None and current is None:
+                    accepted = idx
+                    finish_reason = "stop"
+                    current_state = current
+                    match_sequence = seq
+                    break
+
+            if accepted >= remaining_after_pending:
+                accepted = remaining_after_pending
+                finish_reason = finish_reason or "length"
+
+            emitted_tokens = [pending_token] + draft_tokens[:accepted]
+            rejected = len(draft_tokens) - accepted
+            if rejected:
+                if cache_is_trimmable:
+                    if not _trim_cache(prompt_cache, rejected):
+                        raise RuntimeError(
+                            f"[ngram-mod] failed to trim {rejected} rejected draft tokens"
+                        )
+                else:
+                    if not _trim_trimmable_layers(prompt_cache, 1 + len(draft_tokens)):
+                        raise RuntimeError(
+                            "[ngram-mod] failed to rewind trimmable cache layers"
+                        )
+                    _restore_cache(cache_snapshot)
+                    _replay_cache(self.model, prompt_cache, emitted_tokens)
+
+            _stats["accepted_tokens"] += accepted
+            _stats["rejected_tokens"] += rejected
+            if _stats["proposed_tokens"] > 0:
+                _stats["acceptance_rate"] = (
+                    _stats["accepted_tokens"] / _stats["proposed_tokens"]
+                )
+
+            emitted_logprobs = [pending_logprobs] + verify_logprobs[:accepted]
+            _append_tokens(self, emitted_tokens)
+            self._num_tokens[0] = num_tokens + len(emitted_tokens)
+
+            if any(logits_processors):
+                for token in emitted_tokens:
+                    self._token_context[0].update_and_fetch(
+                        mx.array([token], mx.uint32)
+                    )
+
+            for token in emitted_tokens:
+                self._matcher_states[0], _, _ = self.state_machines[0].match(
+                    self._matcher_states[0], token
+                )
+
+            responses = []
+            for idx, (token, logprobs) in enumerate(
+                zip(emitted_tokens, emitted_logprobs)
+            ):
+                token_finish_reason = finish_reason if idx == len(emitted_tokens) - 1 else None
+                responses.append(
+                    _make_response(
+                        self,
+                        self,
+                        uid,
+                        token,
+                        logprobs,
+                        token_finish_reason,
+                        current_state if token_finish_reason else None,
+                        match_sequence if token_finish_reason else None,
+                    )
+                )
+
+            decoder.add_generated_token(pending_token)
+            for token in draft_tokens[:accepted]:
+                decoder.add_generated_token(token)
+
+            if finish_reason is not None:
+                _finish_batch(self, uid)
+            else:
+                _set_next(self, sampled_tokens[accepted], verify_logprobs[accepted])
+
+            if _stats["attempts"] % 128 == 0:
+                logger.info(
+                    "[ngram-mod] accepted=%d proposed=%d acceptance=%.1f%%",
+                    _stats["accepted_tokens"],
+                    _stats["proposed_tokens"],
+                    _stats["acceptance_rate"] * 100,
+                )
+
+            return responses
+
+        generation_batch.next = _ngram_generation_next
+        batch_gen._ngram_stats = _stats
+        logger.info(
+            "[ngram-mod] installed with num_draft_tokens=%d ngram_size=%d min_matches=%d",
+            num_draft_tokens,
+            ngram_size,
+            min_matches,
+        )
+        return _stats
+
+    def _ngram_remove(uids_to_remove, return_prompt_caches: bool = False):
+        for uid in uids_to_remove:
+            _decoders.pop(uid, None)
+        return _orig_remove(uids_to_remove, return_prompt_caches=return_prompt_caches)
+
+    batch_gen._next = _ngram_next
+    batch_gen.remove = _ngram_remove
+    batch_gen._ngram_stats = _stats
+    logger.info(
+        "[ngram-mod] installed with num_draft_tokens=%d ngram_size=%d min_matches=%d",
+        num_draft_tokens,
+        ngram_size,
+        min_matches,
+    )
+    return _stats
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -1081,6 +1780,9 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: BatchGenerator | None = None
         self._current_sampler_params: tuple | None = None
+        self._ngram_stats: dict[str, Any] | None = (
+            _new_ngram_stats() if self.config.spec_type == "ngram-mod" else None
+        )
 
         # Prefix cache for KV state reuse
         self.prefix_cache: PrefixCacheManager | None = None
@@ -1285,6 +1987,18 @@ class Scheduler:
                 logger.warning(
                     "[MTP] --enable-mtp is set but model has no MTP head "
                     "(model.mtp is None). MTP will be disabled."
+                )
+
+        if self.config.spec_type == "ngram-mod":
+            if self.config.enable_mtp:
+                logger.warning("[ngram-mod] disabled because MTP is enabled")
+            else:
+                self._ngram_stats = _install_ngram_mod(
+                    bg,
+                    num_draft_tokens=self.config.ngram_num_draft_tokens,
+                    ngram_size=self.config.ngram_size,
+                    min_matches=self.config.ngram_min_matches,
+                    stats=self._ngram_stats,
                 )
 
         return bg
@@ -2545,6 +3259,13 @@ class Scheduler:
             stats["memory_aware_cache"] = self.memory_aware_cache.get_stats()
         elif self.prefix_cache is not None:
             stats["prefix_cache"] = self.prefix_cache.get_stats()
+        if self._ngram_stats is not None:
+            if self._ngram_stats["proposed_tokens"] > 0:
+                self._ngram_stats["acceptance_rate"] = (
+                    self._ngram_stats["accepted_tokens"]
+                    / self._ngram_stats["proposed_tokens"]
+                )
+            stats["ngram_mod"] = dict(self._ngram_stats)
         return stats
 
     def get_cache_stats(self) -> dict[str, Any] | None:

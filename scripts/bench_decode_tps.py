@@ -63,7 +63,8 @@ def measure_streaming(base_url: str, model: str, messages: list, max_tokens: int
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             data = json.loads(line[6:])
-            choice = data["choices"][0]
+            choices = data.get("choices") or []
+            choice = choices[0] if choices else {}
             delta = choice.get("delta", {})
 
             if delta.get("content"):

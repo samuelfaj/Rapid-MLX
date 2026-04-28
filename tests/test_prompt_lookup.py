@@ -157,8 +157,8 @@ class TestPromptLookupDecoderGetDraftTokens:
         # Match pos has token after the n-gram; continuation starts one further
         # Best match should give continuation from the repeating pattern
 
-    def test_best_continuation_selected(self):
-        """Longest continuation wins among multiple matches."""
+    def test_ambiguous_longest_continuation_is_rejected(self):
+        """Multiple matches must agree before drafting."""
         decoder = PromptLookupDecoder(num_draft_tokens=4, ngram_size=2, min_matches=1)
         # History: [1, 2, 1, 2, 3, 4, 5, 1, 2]
         # query = (1, 2)
@@ -172,7 +172,7 @@ class TestPromptLookupDecoderGetDraftTokens:
         # Continuation from pos 2+1 = [2,3,4,5,1,2][:4] = [2,3,4,5]
         decoder.add_prompt_tokens([1, 2, 1, 2, 3, 4, 5, 1, 2])
         drafts = decoder.get_draft_tokens()
-        assert len(drafts) > 0
+        assert drafts == []
 
     def test_current_position_excluded(self):
         """Current position in n-gram index should be skipped."""
@@ -341,3 +341,28 @@ class TestPromptLookupDecoderEdgeCases:
         drafts = decoder.get_draft_tokens()
         assert len(drafts) > 0
         assert drafts[0] == 4
+
+    def test_peek_with_pending_token_does_not_mutate_history(self):
+        decoder = PromptLookupDecoder(ngram_size=3, num_draft_tokens=3, min_matches=1)
+        decoder.add_prompt_tokens([1, 2, 3, 4, 1, 2])
+
+        drafts = decoder.get_draft_tokens_for_token(3)
+
+        assert drafts == [4, 1, 2]
+        assert decoder._token_history == [1, 2, 3, 4, 1, 2]
+
+    def test_multiple_matches_use_common_continuation_prefix(self):
+        decoder = PromptLookupDecoder(ngram_size=2, num_draft_tokens=3, min_matches=1)
+        decoder.add_prompt_tokens([1, 2, 3, 4, 1, 2, 3, 5, 1, 2])
+
+        drafts = decoder.get_draft_tokens()
+
+        assert drafts == [3]
+
+    def test_multiple_matches_reject_ambiguous_continuation(self):
+        decoder = PromptLookupDecoder(ngram_size=2, num_draft_tokens=3, min_matches=1)
+        decoder.add_prompt_tokens([1, 2, 3, 4, 1, 2, 5, 4, 1, 2])
+
+        drafts = decoder.get_draft_tokens()
+
+        assert drafts == []

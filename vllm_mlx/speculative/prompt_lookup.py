@@ -112,42 +112,84 @@ class PromptLookupDecoder:
         Returns:
             List of draft token IDs (may be empty if no match found)
         """
-        if len(self._token_history) < self.ngram_size:
+        return self._get_draft_tokens()
+
+    def get_draft_tokens_for_token(self, token: int) -> list[int]:
+        """
+        Get draft tokens as if ``token`` had just been appended.
+
+        This lets streaming generators propose after a pending token without
+        mutating history until the pending token is actually emitted.
+        """
+        return self._get_draft_tokens(extra_token=token)
+
+    def _get_draft_tokens(self, extra_token: int | None = None) -> list[int]:
+        """Internal lookup with an optional uncommitted suffix token."""
+        history_len = len(self._token_history)
+        lookup_len = history_len + (1 if extra_token is not None else 0)
+        max_ngram = min(self.ngram_size, lookup_len)
+        if max_ngram <= 0:
             return []
 
-        # Query: the last ngram_size tokens
-        query = tuple(self._token_history[-self.ngram_size :])
+        # Prefer the longest available n-gram, but fall back to shorter matches.
+        # This uses the index built for every n in [1, ngram_size].
+        for n in range(max_ngram, 0, -1):
+            if extra_token is None:
+                query = tuple(self._token_history[-n:])
+            elif n == 1:
+                query = (extra_token,)
+            else:
+                query = tuple(self._token_history[-(n - 1) :] + [extra_token])
 
-        # Look up start positions where this n-gram occurred
-        positions = self._ngram_index.get(query, [])
+            # Look up start positions where this n-gram occurred.
+            positions = self._ngram_index.get(query, [])
 
-        if not positions:
-            return []
-
-        # The n-gram occupies [start, start+ngram_size).
-        # Continuation begins at start + ngram_size.
-        current_start = len(self._token_history) - self.ngram_size
-
-        draft_tokens = []
-        best_continuation_length = 0
-
-        for start in positions:
-            # Skip the current occurrence (the query itself)
-            if start == current_start:
+            if not positions:
                 continue
 
-            cont_begin = start + self.ngram_size
-            cont_end = min(cont_begin + self.num_draft_tokens, len(self._token_history))
-            continuation = self._token_history[cont_begin:cont_end]
+            # The n-gram occupies [start, start+n). Continuation begins
+            # at start + n. Reverse scan makes ties prefer recent context.
+            current_start = lookup_len - n
 
-            if len(continuation) > best_continuation_length:
-                best_continuation_length = len(continuation)
-                draft_tokens = continuation[: self.num_draft_tokens]
+            continuations: list[list[int]] = []
 
-        if len(draft_tokens) >= self.min_matches:
-            self.total_drafts += 1
-            self.total_draft_tokens += len(draft_tokens)
-            return draft_tokens
+            for start in reversed(positions):
+                # Skip the current occurrence (the query itself).
+                if start == current_start:
+                    continue
+
+                cont_begin = start + n
+                cont_end = min(cont_begin + self.num_draft_tokens, history_len)
+                continuation = self._token_history[cont_begin:cont_end]
+
+                if continuation:
+                    continuations.append(continuation)
+
+                # Recent context is the best signal; old prompt repetitions can
+                # disagree on variable names, numbers, or tool payload fields.
+                if len(continuations) >= 4:
+                    break
+
+            if not continuations:
+                continue
+
+            draft_tokens = []
+            if len(continuations) == 1:
+                draft_tokens = continuations[0][: self.num_draft_tokens]
+            else:
+                for i in range(self.num_draft_tokens):
+                    candidates = [c[i] for c in continuations if len(c) > i]
+                    if not candidates:
+                        break
+                    token = candidates[0]
+                    if any(candidate != token for candidate in candidates[1:]):
+                        break
+                    draft_tokens.append(token)
+
+            if len(draft_tokens) >= self.min_matches:
+                self.total_drafts += 1
+                self.total_draft_tokens += len(draft_tokens)
+                return draft_tokens
 
         return []
 

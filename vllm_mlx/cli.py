@@ -122,9 +122,17 @@ def serve_command(args):
         if getattr(args, "enable_mtp", False):
             print("Error: --drafter (DFlash) and --enable-mtp are mutually exclusive.")
             sys.exit(1)
+        if getattr(args, "spec_type", "none") != "none":
+            print("Error: --drafter (DFlash) and --spec-type are mutually exclusive.")
+            sys.exit(1)
         if getattr(args, "mllm", False):
             print("Error: --drafter (DFlash) is text-only; remove --mllm.")
             sys.exit(1)
+    if getattr(args, "spec_type", "none") != "none" and getattr(
+        args, "enable_mtp", False
+    ):
+        print("Error: --spec-type and --enable-mtp are mutually exclusive.")
+        sys.exit(1)
 
     # Auto-detect parser config from model name when not explicitly set
     if not args.tool_call_parser or not args.reasoning_parser:
@@ -239,6 +247,8 @@ def serve_command(args):
         features.append("gc-control")
     if args.pin_system_prompt:
         features.append("pin-system-prompt")
+    if getattr(args, "spec_type", "none") != "none":
+        features.append(f"spec: {args.spec_type}")
     if args.cors_origins:
         features.append(f"cors: {', '.join(args.cors_origins)}")
     if features:
@@ -306,6 +316,11 @@ def serve_command(args):
         enable_mtp=args.enable_mtp,
         mtp_num_draft_tokens=args.mtp_num_draft_tokens,
         mtp_optimistic=args.mtp_optimistic,
+        # Speculative decoding
+        spec_type=None if args.spec_type == "none" else args.spec_type,
+        ngram_num_draft_tokens=args.ngram_num_draft_tokens,
+        ngram_size=args.ngram_size,
+        ngram_min_matches=args.ngram_min_matches,
         # KV cache quantization
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -322,6 +337,11 @@ def serve_command(args):
         print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
     if args.enable_mtp:
         print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
+    if args.spec_type == "ngram-mod":
+        print(
+            f"N-gram speculative decoding: draft_tokens={args.ngram_num_draft_tokens}, "
+            f"ngram_size={args.ngram_size}, min_matches={args.ngram_min_matches}"
+        )
     print(f"Stream interval: {args.stream_interval} tokens")
     if args.use_paged_cache:
         print(
@@ -1247,6 +1267,35 @@ Examples:
         default=False,
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
+    )
+    # N-gram speculative decoding
+    serve_parser.add_argument(
+        "--spec-type",
+        type=str,
+        default="none",
+        choices=["none", "ngram-mod"],
+        help=(
+            "Speculative decoding mode. 'ngram-mod' uses target-verified "
+            "prompt lookup drafts from repeated n-grams."
+        ),
+    )
+    serve_parser.add_argument(
+        "--ngram-num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of n-gram draft tokens to verify per step (default: 4)",
+    )
+    serve_parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=3,
+        help="Maximum n-gram size for prompt lookup (default: 3)",
+    )
+    serve_parser.add_argument(
+        "--ngram-min-matches",
+        type=int,
+        default=1,
+        help="Minimum draft length required before verifying (default: 1)",
     )
     # Prefill step size
     serve_parser.add_argument(

@@ -1046,6 +1046,7 @@ def _new_ngram_stats() -> dict[str, Any]:
         "disabled_steps": 0,
         "disabled_batch_sizes": {},
         "tool_guard_steps": 0,
+        "tool_limited_steps": 0,
         "cooldown_steps": 0,
         "acceptance_rate": 0.0,
     }
@@ -1100,17 +1101,55 @@ def _install_ngram_mod(
     def _token_array(tokens) -> mx.array:
         return tokens if hasattr(tokens, "shape") else mx.array(tokens, mx.uint32)
 
-    def _looks_like_tool_call(decoder, pending_token: int, draft_tokens: list[int]) -> bool:
+    def _decode_probe(tokens: list[int]) -> str:
         if tokenizer is None:
-            return False
-        history = getattr(decoder, "_token_history", [])
-        probe = list(history[-96:]) + [pending_token] + draft_tokens
+            return ""
         try:
-            text = tokenizer.decode(probe)
+            return tokenizer.decode(tokens)
         except TypeError:
-            text = tokenizer.decode(probe, skip_special_tokens=False)
+            return tokenizer.decode(tokens, skip_special_tokens=False)
         except Exception:
-            return False
+            return ""
+
+    def _last_index(text: str, *needles: str) -> int:
+        return max((text.rfind(needle) for needle in needles), default=-1)
+
+    def _tool_context(context_text: str) -> tuple[bool, bool]:
+        tool_open = _last_index(context_text, "<tool_call")
+        tool_close = _last_index(context_text, "</tool_call")
+        in_tool = tool_open > tool_close
+        if not in_tool:
+            return False, False
+        param_open = _last_index(context_text, "<parameter=")
+        param_close = _last_index(context_text, "</parameter>")
+        return True, param_open > max(param_close, tool_close)
+
+    def _adapt_tool_call_draft(
+        decoder, pending_token: int, draft_tokens: list[int]
+    ) -> tuple[list[int], bool]:
+        if tokenizer is None or not draft_tokens:
+            return draft_tokens, False
+        history = list(getattr(decoder, "_token_history", []))
+        context_text = _decode_probe(history[-128:])
+        draft_text = _decode_probe([pending_token] + draft_tokens)
+        structural_markers = (
+            "<tool_call",
+            "</tool_call",
+            "<function=",
+            "</function>",
+            "<parameter=",
+            "</parameter>",
+        )
+        if any(marker in draft_text for marker in structural_markers):
+            return [], True
+        in_tool, in_parameter = _tool_context(context_text)
+        if not in_tool:
+            return draft_tokens, False
+        limit = 2 if in_parameter else 1
+        if len(draft_tokens) > limit:
+            _stats["tool_limited_steps"] += 1
+            return draft_tokens[:limit], False
+        return draft_tokens, False
         return any(
             marker in text
             for marker in (
@@ -1413,8 +1452,16 @@ def _install_ngram_mod(
             return raw
         _miss_streaks[uid] = 0
 
-        if _looks_like_tool_call(decoder, pending_token, draft_tokens):
+        draft_tokens, tool_guarded = _adapt_tool_call_draft(
+            decoder, pending_token, draft_tokens
+        )
+        if tool_guarded:
             _stats["tool_guard_steps"] += 1
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+        if not draft_tokens:
+            _stats["fallback_steps"] += 1
             raw = _inner_next()
             _record_inner_responses(_responses_from_raw(raw))
             return raw
@@ -1606,8 +1653,16 @@ def _install_ngram_mod(
                 return responses
             _miss_streaks[uid] = 0
 
-            if _looks_like_tool_call(decoder, pending_token, draft_tokens):
+            draft_tokens, tool_guarded = _adapt_tool_call_draft(
+                decoder, pending_token, draft_tokens
+            )
+            if tool_guarded:
                 _stats["tool_guard_steps"] += 1
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
+            if not draft_tokens:
+                _stats["fallback_steps"] += 1
                 responses = _inner_generation_next()
                 _record_inner_responses(responses)
                 return responses

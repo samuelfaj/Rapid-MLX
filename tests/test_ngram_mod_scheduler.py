@@ -152,6 +152,13 @@ class FakeToolTokenizer:
         return "plain text"
 
 
+class FakeToolParameterTokenizer:
+    def decode(self, tokens, *args, **kwargs):
+        if 99 in tokens:
+            return "<tool_call><function=bash><parameter=cmd>"
+        return "echo repeated file body"
+
+
 def test_ngram_mod_accepts_prefix_and_trims_rejected_suffix():
     bg = FakeBatchGenerator()
     stats = _install_ngram_mod(
@@ -249,6 +256,28 @@ def test_ngram_mod_falls_back_for_tool_call_drafts():
     assert stats["attempts"] == 0
     assert stats["tool_guard_steps"] == 1
     assert stats["proposed_tokens"] == 0
+
+
+def test_ngram_mod_allows_limited_drafts_inside_tool_parameters():
+    bg = FakeBatchGenerator()
+    bg.active_batch.tokens = [mx.array([99, 1, 2, 3, 4, 1, 2], mx.uint32)]
+    stats = _install_ngram_mod(
+        bg,
+        num_draft_tokens=3,
+        ngram_size=3,
+        min_matches=1,
+        tokenizer=FakeToolParameterTokenizer(),
+    )
+
+    responses = bg._next()
+
+    assert [r.token for r in responses] == [3, 4, 1]
+    assert bg.active_batch.y.tolist() == [9]
+    assert stats["attempts"] == 1
+    assert stats["tool_guard_steps"] == 0
+    assert stats["tool_limited_steps"] == 1
+    assert stats["proposed_tokens"] == 2
+    assert stats["accepted_tokens"] == 2
 
 
 def test_ngram_mod_finishes_batch_on_speculative_length_stop():

@@ -1045,6 +1045,7 @@ def _new_ngram_stats() -> dict[str, Any]:
         "fallback_steps": 0,
         "disabled_steps": 0,
         "disabled_batch_sizes": {},
+        "tool_guard_steps": 0,
         "cooldown_steps": 0,
         "acceptance_rate": 0.0,
     }
@@ -1056,6 +1057,7 @@ def _install_ngram_mod(
     ngram_size: int = 3,
     min_matches: int = 2,
     stats: dict[str, Any] | None = None,
+    tokenizer: Any | None = None,
 ) -> dict[str, Any]:
     """Install target-verified n-gram speculative decoding on BatchGenerator.
 
@@ -1097,6 +1099,29 @@ def _install_ngram_mod(
 
     def _token_array(tokens) -> mx.array:
         return tokens if hasattr(tokens, "shape") else mx.array(tokens, mx.uint32)
+
+    def _looks_like_tool_call(decoder, pending_token: int, draft_tokens: list[int]) -> bool:
+        if tokenizer is None:
+            return False
+        history = getattr(decoder, "_token_history", [])
+        probe = list(history[-96:]) + [pending_token] + draft_tokens
+        try:
+            text = tokenizer.decode(probe)
+        except TypeError:
+            text = tokenizer.decode(probe, skip_special_tokens=False)
+        except Exception:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "<tool_call",
+                "</tool_call",
+                "<function=",
+                "</function>",
+                "<parameter=",
+                "</parameter>",
+            )
+        )
 
     def _pending_token(batch) -> int:
         if hasattr(batch, "y"):
@@ -1388,6 +1413,12 @@ def _install_ngram_mod(
             return raw
         _miss_streaks[uid] = 0
 
+        if _looks_like_tool_call(decoder, pending_token, draft_tokens):
+            _stats["tool_guard_steps"] += 1
+            raw = _inner_next()
+            _record_inner_responses(_responses_from_raw(raw))
+            return raw
+
         prompt_cache = _cache(batch)
         cache_is_trimmable = _cache_trimmable(prompt_cache)
         cache_snapshot = None if cache_is_trimmable else _snapshot_cache(prompt_cache)
@@ -1574,6 +1605,12 @@ def _install_ngram_mod(
                 _record_inner_responses(responses)
                 return responses
             _miss_streaks[uid] = 0
+
+            if _looks_like_tool_call(decoder, pending_token, draft_tokens):
+                _stats["tool_guard_steps"] += 1
+                responses = _inner_generation_next()
+                _record_inner_responses(responses)
+                return responses
 
             prompt_cache = self.prompt_cache
             cache_is_trimmable = _cache_trimmable(prompt_cache)
@@ -1999,6 +2036,7 @@ class Scheduler:
                     ngram_size=self.config.ngram_size,
                     min_matches=self.config.ngram_min_matches,
                     stats=self._ngram_stats,
+                    tokenizer=self.tokenizer,
                 )
 
         return bg

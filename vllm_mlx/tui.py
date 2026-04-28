@@ -286,6 +286,7 @@ def _build_screen(
         accepted = _integer(ngram_info.get("accepted_tokens", 0))
         rejected = _integer(ngram_info.get("rejected_tokens", 0))
         disabled = _integer(ngram_info.get("disabled_steps", 0))
+        guarded = _integer(ngram_info.get("tool_guard_steps", 0))
         ratio = _num(ngram_info.get("acceptance_rate", 0.0))
         rows.append(
             _row(
@@ -299,7 +300,11 @@ def _build_screen(
             + _row("accepted", f"{accepted}/{proposed}", mid, "magenta", tty_on)
             + gap
             + _row(
-                "reject/disabled", f"{rejected}/{disabled}", right, "magenta", tty_on
+                "reject/guard",
+                f"{rejected}/{guarded}  disabled {disabled}",
+                right,
+                "magenta",
+                tty_on,
             )
         )
     rows.append(_line(width))

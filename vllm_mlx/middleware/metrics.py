@@ -96,11 +96,15 @@ class MetricsMiddleware:
         engine_ttft: float | None = None
         engine_acceptance: float | None = None
         engine_block_size: int | None = None
+        ngram_start: tuple[int, int] | None = None
+        ngram_latest: tuple[int, int] | None = None
+        ngram_ambiguous = False
 
         def poll_engine_stats() -> None:
             """Snapshot engine's per-request tps/ttft/acceptance during the stream."""
             nonlocal engine_gen_tps, engine_ttft
             nonlocal engine_acceptance, engine_block_size
+            nonlocal ngram_start, ngram_latest, ngram_ambiguous
             try:
                 from ..config import get_config
 
@@ -108,12 +112,23 @@ class MetricsMiddleware:
                 if cfg.engine is None:
                     return
                 stats = cfg.engine.get_stats()
-                for r in stats.get("requests") or []:
+                running_requests = stats.get("requests") or []
+                if len(running_requests) > 1:
+                    ngram_ambiguous = True
+                ngram_stats = stats.get("ngram_mod") or {}
+                if ngram_stats.get("enabled"):
+                    proposed = int(ngram_stats.get("proposed_tokens") or 0)
+                    accepted = int(ngram_stats.get("accepted_tokens") or 0)
+                    if ngram_start is None:
+                        ngram_start = (proposed, accepted)
+                    ngram_latest = (proposed, accepted)
+
+                if len(running_requests) != 1:
+                    return
+                for r in running_requests:
                     tps = r.get("tokens_per_second")
                     if tps is not None:
-                        v = float(tps)
-                        if v > engine_gen_tps:
-                            engine_gen_tps = v
+                        engine_gen_tps = float(tps)
                     ttft_s = r.get("ttft_s")
                     if ttft_s is not None and engine_ttft is None:
                         try:
@@ -217,6 +232,17 @@ class MetricsMiddleware:
                             payload = _safe_json_loads(bytes(json_buffer))
                             if isinstance(payload, dict):
                                 handle_payload(payload)
+                        final_acceptance = engine_acceptance
+                        if (
+                            final_acceptance is None
+                            and ngram_start is not None
+                            and ngram_latest is not None
+                            and not ngram_ambiguous
+                        ):
+                            proposed_delta = ngram_latest[0] - ngram_start[0]
+                            accepted_delta = ngram_latest[1] - ngram_start[1]
+                            if proposed_delta > 0:
+                                final_acceptance = accepted_delta / proposed_delta
                         recorder.finish(
                             req_id,
                             finish_reason=last_finish_reason,
@@ -225,7 +251,7 @@ class MetricsMiddleware:
                             non_streaming=not is_sse,
                             engine_gen_tps=engine_gen_tps if engine_gen_tps > 0 else None,
                             engine_ttft=engine_ttft,
-                            acceptance_ratio=engine_acceptance,
+                            acceptance_ratio=final_acceptance,
                             block_size=engine_block_size,
                         )
             except Exception as exc:  # never let metrics break the response

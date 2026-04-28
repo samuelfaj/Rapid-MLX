@@ -113,6 +113,22 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _weighted_tps(entries: list[dict], token_key: str, tps_key: str) -> float:
+    total_tokens = 0.0
+    total_seconds = 0.0
+    fallback = []
+    for item in entries:
+        tokens = _num(item.get(token_key, 0.0))
+        tps = _num(item.get(tps_key, 0.0))
+        if tokens > 0 and tps > 0:
+            total_tokens += tokens
+            total_seconds += tokens / tps
+            fallback.append(tps)
+    if total_seconds > 0:
+        return total_tokens / total_seconds
+    return _mean(fallback)
+
+
 def _build_screen(
     base_url: str,
     pid: int | str,
@@ -153,6 +169,7 @@ def _build_screen(
     cache_entries = _integer(cache_info.get("entries", 0))
 
     dflash_info = status.get("dflash") or {}
+    ngram_info = status.get("ngram_mod") or {}
 
     running_requests = list(status.get("requests") or [])
     entries = list((requests_data or {}).get("entries") or [])
@@ -264,6 +281,27 @@ def _build_screen(
             + gap
             + _row("adaptive", adaptive_label, right, "magenta", tty_on)
         )
+    if ngram_info:
+        proposed = _integer(ngram_info.get("proposed_tokens", 0))
+        accepted = _integer(ngram_info.get("accepted_tokens", 0))
+        rejected = _integer(ngram_info.get("rejected_tokens", 0))
+        disabled = _integer(ngram_info.get("disabled_steps", 0))
+        ratio = _num(ngram_info.get("acceptance_rate", 0.0))
+        rows.append(
+            _row(
+                "ngram accept",
+                f"{ratio:.1%} {_bar(ratio, 1.0, 12)}",
+                left,
+                "magenta",
+                tty_on,
+            )
+            + gap
+            + _row("accepted", f"{accepted}/{proposed}", mid, "magenta", tty_on)
+            + gap
+            + _row(
+                "reject/disabled", f"{rejected}/{disabled}", right, "magenta", tty_on
+            )
+        )
     rows.append(_line(width))
 
     # Last request panel
@@ -327,10 +365,11 @@ def _build_screen(
             else "n/a"
         )
         block_text = str(last_block) if last_block is not None else "n/a"
+        accept_label = "dflash accept" if dflash_info and not ngram_info else "spec accept"
         rows.append(
             _row("surface", str(last_surface), left, "white", tty_on)
             + gap
-            + _row("dflash accept", accept_text, mid, "magenta", tty_on)
+            + _row(accept_label, accept_text, mid, "magenta", tty_on)
             + gap
             + _row("block size", block_text, right, "magenta", tty_on)
         )
@@ -343,8 +382,8 @@ def _build_screen(
     else:
         avg_out = _mean([_num(item.get("generated_tokens", 0)) for item in entries])
         avg_prompt = _mean([_num(item.get("prompt_tokens", 0)) for item in entries])
-        avg_gen_tps = _mean([_num(item.get("generation_tps", 0.0)) for item in entries])
-        avg_pre_tps = _mean([_num(item.get("prompt_tps", 0.0)) for item in entries])
+        avg_gen_tps = _weighted_tps(entries, "generated_tokens", "generation_tps")
+        avg_pre_tps = _weighted_tps(entries, "prompt_tokens", "prompt_tps")
         avg_elapsed = _mean([_num(item.get("elapsed", 0.0)) for item in entries])
         accept_values = [
             _num(item.get("acceptance_ratio"))
@@ -386,10 +425,12 @@ def _build_screen(
         any_accept = any(
             item.get("acceptance_ratio") is not None for item in recent_entries
         )
+        any_block = any(item.get("block_size") is not None for item in recent_entries)
         if any_accept:
-            header = (
-                "  time      surface              out  prompt  gen tok/s  prefill tok/s  accept  block  finish"
-            )
+            header = "  time      surface              out  prompt  gen tok/s  prefill tok/s  accept"
+            if any_block:
+                header += "  block"
+            header += "  finish"
         else:
             header = (
                 "  time      surface              out  prompt  gen tok/s  prefill tok/s  finish"
@@ -415,9 +456,12 @@ def _build_screen(
                 accept_s = (
                     f"{_num(accept):>5.0%}" if accept is not None else "  -  "
                 )
-                block = item.get("block_size")
-                block_s = f"{_integer(block):>4}" if block is not None else "  - "
-                row = base + f"{accept_s}  {block_s}  {str(item.get('finish_reason', 'n/a'))[:8]}"
+                row = base + f"{accept_s}  "
+                if any_block:
+                    block = item.get("block_size")
+                    block_s = f"{_integer(block):>4}" if block is not None else "  - "
+                    row += f"{block_s}  "
+                row += str(item.get("finish_reason", "n/a"))[:8]
             else:
                 row = base + str(item.get("finish_reason", "n/a"))[:12]
             rows.append(_clamp(row, width))

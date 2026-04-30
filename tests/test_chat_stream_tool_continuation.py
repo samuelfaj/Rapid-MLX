@@ -8,7 +8,10 @@ import pytest
 from vllm_mlx.api.models import ChatCompletionRequest
 from vllm_mlx.domain.events import StreamEvent
 from vllm_mlx.engine import GenerationOutput
-from vllm_mlx.routes.chat import stream_chat_completion
+from vllm_mlx.routes.chat import (
+    _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
+    stream_chat_completion,
+)
 from vllm_mlx.service.helpers import (
     _TOOL_CALL_JSON_RETRY_PROMPT,
     _TOOL_CALL_REQUIRED_RETRY_PROMPT,
@@ -42,6 +45,38 @@ class _EngineThatExhaustsThenCallsTool:
             new_text="<tool_call>",
             prompt_tokens=12,
             completion_tokens=3,
+            finished=True,
+            finish_reason="stop",
+        )
+
+
+class _EngineThatRepeatsToolThenAnswers:
+    def __init__(self):
+        self.calls = 0
+        self.messages_seen = []
+        self.kwargs_seen = []
+        self.tokenizer = MagicMock()
+
+    async def stream_chat(self, messages, **kwargs):
+        self.calls += 1
+        self.messages_seen.append(messages)
+        self.kwargs_seen.append(kwargs)
+        if self.calls == 1:
+            yield GenerationOutput(
+                text="<tool_call>",
+                new_text="<tool_call>",
+                prompt_tokens=10,
+                completion_tokens=3,
+                finished=True,
+                finish_reason="stop",
+            )
+            return
+
+        yield GenerationOutput(
+            text="Already wrote it.",
+            new_text="Already wrote it.",
+            prompt_tokens=12,
+            completion_tokens=4,
             finished=True,
             finish_reason="stop",
         )
@@ -81,6 +116,83 @@ class _FakeStreamingPostProcessor:
 
     def finalize(self):
         return []
+
+
+class _FakeRepeatedWritePostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            return [
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_repeat",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "function": {
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"same"}'
+                                ),
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    tool_calls_detected=True,
+                ),
+            ]
+        return [
+            StreamEvent(type="content", content="Already wrote it."),
+            StreamEvent(type="finish", finish_reason="stop"),
+        ]
+
+
+class _FakeLargeWritePostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        large_arguments = '{"filePath":"src/App.tsx","content":"' + (
+            "x" * (_TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS + 1)
+        )
+        return [
+            StreamEvent(
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_large",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": "",
+                        },
+                    }
+                ],
+                tool_calls_detected=True,
+            ),
+            StreamEvent(
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "function": {
+                            "arguments": large_arguments,
+                        },
+                    }
+                ],
+                tool_calls_detected=True,
+            ),
+        ]
 
 
 class _FakeRepetitionPostProcessor(_FakeStreamingPostProcessor):
@@ -380,6 +492,134 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
     assert engine.calls == 1
     assert any("Thinking only." in chunk for chunk in chunks)
     assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_call_retries_with_anti_loop_prompt(monkeypatch):
+    """Do not emit the same tool call again after its result."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeRepeatedWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "write app"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatRepeatsToolThenAnswers()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"same"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_prev", "content": "ok"},
+            ],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+            tools=[{"type": "function", "function": {"name": "write"}}],
+        )
+    ]
+
+    assert engine.calls == 2
+    assert "tools" in engine.kwargs_seen[0]
+    assert "tools" in engine.kwargs_seen[1]
+    assert any("Already wrote it." in chunk for chunk in chunks)
+    assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_large_auto_tool_call_streams_after_repeat_buffer_limit(monkeypatch):
+    """Do not hold large non-required tool calls while checking for repeats."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeLargeWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "write app"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatRepeatsToolThenAnswers()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"same"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_prev", "content": "ok"},
+            ],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+            tools=[{"type": "function", "function": {"name": "write"}}],
+        )
+    ]
+
+    assert engine.calls == 1
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any("call_large" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio

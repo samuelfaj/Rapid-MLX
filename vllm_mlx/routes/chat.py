@@ -52,12 +52,14 @@ from ..service.helpers import (
     _disconnect_guard,
     _extract_token_logprob,
     _inject_json_instruction,
+    _last_assistant_tool_call_signature,
     _maybe_pin_system_prompt,
     _parse_tool_calls_with_parser,
     _resolve_max_tokens,
     _resolve_model_name,
     _resolve_temperature,
     _resolve_top_p,
+    _tool_call_signature,
     _validate_model_name,
     _validate_tool_call_params,
     _wait_with_disconnect,
@@ -73,6 +75,7 @@ _REPETITION_WORD_RE = re.compile(r"[A-Za-z0-9_'-]+")
 _TOOL_TEXT_REPETITION_MIN_WORDS = 32
 _TOOL_TEXT_REPETITION_MIN_COUNT = 24
 _TOOL_TEXT_REPETITION_RATIO = 0.60
+_TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 8192
 
 
 def _tool_choice_requires_tool_call(tool_choice) -> bool:
@@ -150,9 +153,7 @@ def _buffered_tool_calls_complete(buffered_events: list[tuple]) -> bool:
 
             arguments = _tool_call_value(function, "arguments")
             if arguments is not None:
-                assembled["arguments"] = (
-                    (assembled["arguments"] or "") + str(arguments)
-                )
+                assembled["arguments"] = (assembled["arguments"] or "") + str(arguments)
 
     if not calls:
         return False
@@ -171,6 +172,71 @@ def _buffered_tool_calls_complete(buffered_events: list[tuple]) -> bool:
             return False
 
     return True
+
+
+def _assembled_tool_call_signatures(
+    buffered_events: list[tuple],
+) -> list[tuple[str, str]]:
+    calls: dict[int, dict[str, str | None]] = {}
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            index = _tool_call_value(tool_call, "index")
+            if not isinstance(index, int):
+                index = len(calls)
+            assembled = calls.setdefault(index, {"name": None, "arguments": ""})
+
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            name = _tool_call_value(function, "name")
+            if name:
+                assembled["name"] = str(name)
+
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                assembled["arguments"] = (assembled["arguments"] or "") + str(arguments)
+
+    signatures: list[tuple[str, str]] = []
+    for assembled in calls.values():
+        signature = _tool_call_signature(
+            {
+                "function": {
+                    "name": assembled.get("name"),
+                    "arguments": assembled.get("arguments"),
+                }
+            }
+        )
+        if signature:
+            signatures.append(signature)
+    return signatures
+
+
+def _buffered_tool_call_argument_chars(buffered_events: list[tuple]) -> int:
+    total = 0
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                total += len(str(arguments))
+    return total
+
+
+def _stream_tool_call_repeats_recent(event, recent_signature) -> bool:
+    if not recent_signature:
+        return False
+    for tool_call in getattr(event, "tool_calls", None) or []:
+        if _tool_call_signature(tool_call) == recent_signature:
+            return True
+    return False
+
+
+def _buffered_tool_call_repeats_recent(
+    buffered_events: list[tuple],
+    recent_signature,
+) -> bool:
+    return bool(
+        recent_signature
+        and recent_signature in _assembled_tool_call_signatures(buffered_events)
+    )
 
 
 @router.post(
@@ -436,9 +502,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["enable_thinking"] = False
 
     if (
-        (cfg.structured_cot or (cfg.structured_cot_tools and request.tools))
-        and chat_kwargs.get("enable_thinking") is not False
-    ):
+        cfg.structured_cot or (cfg.structured_cot_tools and request.tools)
+    ) and chat_kwargs.get("enable_thinking") is not False:
         chat_kwargs["structured_cot"] = True
         chat_kwargs["structured_cot_token_budget"] = cfg.structured_cot_token_budget
 
@@ -831,6 +896,10 @@ async def stream_chat_completion(
 
         retry_attempts = 0
         active_messages = messages
+        active_kwargs = kwargs
+        tools_disabled_for_retry = False
+        repeated_tool_retry_active = False
+        recent_tool_call_signature = _last_assistant_tool_call_signature(messages)
         last_message = active_messages[-1] if active_messages else {}
         last_content = (
             last_message.get("content")
@@ -847,6 +916,7 @@ async def stream_chat_completion(
             and not repeated_tool_continuation
         )
         max_tool_continuation_retries = 2 if tool_retries_enabled else 0
+        max_repeated_tool_retries = 2 if tool_continuation_retry else 0
         retry_prompt = (
             _TOOL_CONTINUATION_RETRY_PROMPT
             if tool_continuation_retry
@@ -854,10 +924,24 @@ async def stream_chat_completion(
         )
 
         while True:
+            active_tool_retries_enabled = (
+                tool_retries_enabled
+                and not tools_disabled_for_retry
+                and not repeated_tool_retry_active
+            )
+            repeat_tool_detection_enabled = (
+                tool_continuation_retry
+                and bool(recent_tool_call_signature)
+                and not tools_disabled_for_retry
+            )
+            tool_call_buffering_enabled = (
+                active_tool_retries_enabled or repeat_tool_detection_enabled
+            )
+            tool_call_buffering_active = tool_call_buffering_enabled
             # Initialize post-processor
             processor = StreamingPostProcessor(
                 cfg,
-                tools_requested=bool(request.tools),
+                tools_requested=bool(request.tools) and not tools_disabled_for_retry,
                 json_mode=bool(
                     request.response_format
                     and getattr(request.response_format, "type", "text") != "text"
@@ -875,7 +959,9 @@ async def stream_chat_completion(
             retry_reason = None
 
             # Stream content — PostProcessor handles reasoning/tool/sanitize
-            async for output in engine.stream_chat(messages=active_messages, **kwargs):
+            async for output in engine.stream_chat(
+                messages=active_messages, **active_kwargs
+            ):
                 last_output = output
                 if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                     prompt_tokens = output.prompt_tokens
@@ -883,7 +969,8 @@ async def stream_chat_completion(
                     completion_tokens = output.completion_tokens
 
                 retry_window = (
-                    retry_attempts < max_tool_continuation_retries
+                    active_tool_retries_enabled
+                    and retry_attempts < max_tool_continuation_retries
                     and not emitted_tool_call
                 )
 
@@ -910,15 +997,44 @@ async def stream_chat_completion(
                         continue
 
                     if (
-                        tool_retries_enabled
+                        tool_call_buffering_active
                         and event.type == "finish"
                         and buffered_tool_call_events
                     ):
                         deferred_finish = (event, output)
                         continue
 
-                    if tool_retries_enabled and event.type == "tool_call":
+                    if tool_call_buffering_active and event.type == "tool_call":
                         buffered_tool_call_events.append((event, output))
+                        if (
+                            repeat_tool_detection_enabled
+                            and not active_tool_retries_enabled
+                            and _buffered_tool_call_argument_chars(
+                                buffered_tool_call_events
+                            )
+                            > _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS
+                        ):
+                            logger.info(
+                                "[tool-continuation] repeated-tool buffer exceeded "
+                                "%d argument chars; streaming current tool call",
+                                _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
+                            )
+                            for buffered_event, buffered_output in buffered_events:
+                                for _sse in _format_stream_event(
+                                    buffered_event, buffered_output
+                                ):
+                                    yield _sse
+                            buffered_events.clear()
+
+                            emitted_tool_call = True
+                            for tool_event, tool_output in buffered_tool_call_events:
+                                for _sse in _format_stream_event(
+                                    tool_event, tool_output
+                                ):
+                                    yield _sse
+                            buffered_tool_call_events.clear()
+                            deferred_finish = None
+                            tool_call_buffering_active = active_tool_retries_enabled
                         continue
 
                     if event.type == "tool_call":
@@ -940,7 +1056,7 @@ async def stream_chat_completion(
             if not retry_reason:
                 for event in processor.finalize():
                     if event.type == "tool_call":
-                        if tool_retries_enabled:
+                        if tool_call_buffering_active:
                             buffered_tool_call_events.append((event, last_output))
                             continue
 
@@ -972,26 +1088,32 @@ async def stream_chat_completion(
 
             if not retry_reason and buffered_tool_call_events:
                 if _buffered_tool_calls_complete(buffered_tool_call_events):
-                    emitted_tool_call = True
-                    for buffered_event, buffered_output in buffered_events:
-                        for _sse in _format_stream_event(
-                            buffered_event, buffered_output
-                        ):
-                            yield _sse
-                    buffered_events.clear()
+                    if tool_continuation_retry and _buffered_tool_call_repeats_recent(
+                        buffered_tool_call_events,
+                        recent_tool_call_signature,
+                    ):
+                        retry_reason = "repeated tool call"
+                    else:
+                        emitted_tool_call = True
+                        for buffered_event, buffered_output in buffered_events:
+                            for _sse in _format_stream_event(
+                                buffered_event, buffered_output
+                            ):
+                                yield _sse
+                        buffered_events.clear()
 
-                    for tool_event, tool_output in buffered_tool_call_events:
-                        if tool_output is None:
-                            continue
-                        for _sse in _format_stream_event(tool_event, tool_output):
-                            yield _sse
-                    buffered_tool_call_events.clear()
+                        for tool_event, tool_output in buffered_tool_call_events:
+                            if tool_output is None:
+                                continue
+                            for _sse in _format_stream_event(tool_event, tool_output):
+                                yield _sse
+                        buffered_tool_call_events.clear()
 
-                    if deferred_finish:
-                        event, output = deferred_finish
-                        for _sse in _format_stream_event(event, output):
-                            yield _sse
-                        deferred_finish = None
+                        if deferred_finish:
+                            event, output = deferred_finish
+                            for _sse in _format_stream_event(event, output):
+                                yield _sse
+                            deferred_finish = None
                 else:
                     retry_reason = "incomplete tool call JSON"
 
@@ -1000,23 +1122,45 @@ async def stream_chat_completion(
             elif not retry_reason and buffered_events and not emitted_tool_call:
                 retry_reason = "stream exhausted without tool call"
 
-            if retry_reason and retry_attempts < max_tool_continuation_retries:
+            can_retry_repeated_tool = (
+                retry_reason == "repeated tool call"
+                and retry_attempts < max_repeated_tool_retries
+            )
+            can_retry_tool_continuation = (
+                retry_reason != "repeated tool call"
+                and retry_attempts < max_tool_continuation_retries
+            )
+            if retry_reason and (
+                can_retry_tool_continuation or can_retry_repeated_tool
+            ):
                 retry_attempts += 1
+                retry_limit = (
+                    max_repeated_tool_retries
+                    if can_retry_repeated_tool
+                    else max_tool_continuation_retries
+                )
                 logger.info(
                     "[tool-continuation] retrying after %s following "
                     "tool result (attempt %d/%d)",
                     retry_reason,
                     retry_attempts,
-                    max_tool_continuation_retries,
+                    retry_limit,
                 )
                 selected_retry_prompt = (
                     _TOOL_CALL_JSON_RETRY_PROMPT
                     if retry_reason == "incomplete tool call JSON"
-                    else retry_prompt
+                    else (
+                        _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
+                        if retry_reason == "repeated tool call"
+                        else retry_prompt
+                    )
                 )
                 active_messages = list(messages) + [
                     {"role": "user", "content": selected_retry_prompt}
                 ]
+                active_kwargs = kwargs
+                tools_disabled_for_retry = False
+                repeated_tool_retry_active = retry_reason == "repeated tool call"
                 continue
 
             if retry_reason and (buffered_events or buffered_tool_call_events):

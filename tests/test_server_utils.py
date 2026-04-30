@@ -343,6 +343,57 @@ class TestAppendToolContinuationPrompt:
         assert added is True
         assert "Do not call the same tool" in result[-1]["content"]
 
+    def test_repeated_converted_tool_call_gets_anti_loop_prompt(self):
+        from vllm_mlx.service.helpers import _append_tool_continuation_prompt
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    '[Calling tool: exec_command({"cmd":"cd /tmp/app && npm run test '
+                    '-- --watchAll=false 2>&1","yield_time_ms":30000})]'
+                ),
+            },
+            {
+                "role": "user",
+                "content": "[Tool Result (call_1)]: npm error Command exited with code 1",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    '[Calling tool: exec_command({"yield_time_ms":30000,"cmd":"cd /tmp/app '
+                    '&& npm run test -- --watchAll=false 2>&1"})]'
+                ),
+            },
+            {
+                "role": "user",
+                "content": "[Tool Result (call_2)]: npm error Command exited with code 1",
+            },
+        ]
+        result, added = _append_tool_continuation_prompt(messages, True)
+
+        assert added is True
+        assert "Do not call the same tool" in result[-1]["content"]
+
+    def test_repeated_plain_write_transcript_gets_anti_loop_prompt(self):
+        from vllm_mlx.service.helpers import _append_tool_continuation_prompt
+
+        write_transcript = (
+            "write ~/dev/test/src/main.tsx\n\n"
+            "import App from './App';\n"
+            "createRoot(document.getElementById('root')!).render(<App />);"
+        )
+        messages = [
+            {"role": "assistant", "content": write_transcript},
+            {"role": "user", "content": "[Tool Result (call_1)]: wrote file"},
+            {"role": "assistant", "content": write_transcript},
+            {"role": "user", "content": "[Tool Result (call_2)]: wrote file"},
+        ]
+        result, added = _append_tool_continuation_prompt(messages, True)
+
+        assert added is True
+        assert "Do not call the same tool" in result[-1]["content"]
+
     def test_repeated_read_after_mutating_tool_uses_normal_prompt(self):
         from vllm_mlx.service.helpers import _append_tool_continuation_prompt
 

@@ -58,7 +58,9 @@ _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT = (
     "You just repeated the same tool call after receiving its result. "
     "Use the tool result already present in the conversation. "
     "Do not call the same tool with the same arguments again. "
-    "Make a different tool call or provide the final answer if the task is complete."
+    "If the repeated tool wrote or edited a file path, choose a different missing "
+    "file path or run a validation command. "
+    "Make a different tool call now unless the entire task is complete."
 )
 
 _TOOL_CONTINUATION_RETRY_PROMPT = (
@@ -393,7 +395,9 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
 
 def _message_role(message) -> str | None:
     return (
-        message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        message.get("role")
+        if isinstance(message, dict)
+        else getattr(message, "role", None)
     )
 
 
@@ -442,15 +446,7 @@ def _normalize_tool_arguments(arguments) -> str:
         return stripped
 
 
-def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
-    if _message_role(message) != "assistant":
-        return None
-
-    tool_calls = _object_value(message, "tool_calls")
-    if not tool_calls:
-        return None
-
-    tool_call = tool_calls[0]
+def _tool_call_signature(tool_call) -> tuple[str, str] | None:
     function = _object_value(tool_call, "function")
     if not function:
         return None
@@ -461,6 +457,54 @@ def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
 
     arguments = _normalize_tool_arguments(_object_value(function, "arguments"))
     return str(name), arguments
+
+
+def _plain_write_transcript_signature(content: str) -> tuple[str, str] | None:
+    stripped = content.strip()
+    if not stripped.startswith("write "):
+        return None
+
+    first_line, separator, body = stripped.partition("\n")
+    if not separator:
+        return None
+
+    path = first_line.removeprefix("write ").strip()
+    if not path:
+        return None
+
+    arguments = json.dumps(
+        {"content": body.strip(), "path": path},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "write", arguments
+
+
+def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
+    if _message_role(message) != "assistant":
+        return None
+
+    tool_calls = _object_value(message, "tool_calls")
+    if tool_calls:
+        return _tool_call_signature(tool_calls[0])
+
+    content = _message_content(message)
+    if not isinstance(content, str):
+        return None
+
+    _, parsed_tool_calls = parse_tool_calls(content)
+    if parsed_tool_calls:
+        return _tool_call_signature(parsed_tool_calls[0])
+
+    return _plain_write_transcript_signature(content)
+
+
+def _last_assistant_tool_call_signature(messages: list) -> tuple[str, str] | None:
+    for message in reversed(messages):
+        signature = _assistant_tool_call_signature(message)
+        if signature:
+            return signature
+    return None
 
 
 def _has_repeated_recent_tool_call(messages: list) -> bool:
@@ -483,7 +527,9 @@ def _has_repeated_recent_tool_call(messages: list) -> bool:
     return False
 
 
-def _append_tool_continuation_prompt(messages: list, tools_requested: bool) -> tuple[list, bool]:
+def _append_tool_continuation_prompt(
+    messages: list, tools_requested: bool
+) -> tuple[list, bool]:
     """Add a hidden continuation nudge after tool results for local tool models."""
     if not tools_requested or not messages:
         return messages, False
@@ -495,7 +541,6 @@ def _append_tool_continuation_prompt(messages: list, tools_requested: bool) -> t
         else _TOOL_CONTINUATION_USER_PROMPT
     )
     return messages + [{"role": "user", "content": prompt}], True
-
 
 
 def _maybe_pin_system_prompt(messages: list) -> None:

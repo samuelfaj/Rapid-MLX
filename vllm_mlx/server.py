@@ -591,6 +591,25 @@ def load_model(
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
 
+    # Register in multi-model registry
+    aliases = set()
+    if _model_alias and _model_alias != _model_name:
+        aliases.add(_model_alias)
+    entry = ModelEntry(
+        engine=_engine,
+        model_name=_model_name,
+        model_path=_model_path or model_name,
+        aliases=aliases,
+        tool_call_parser=_tool_call_parser,
+        reasoning_parser=_reasoning_parser_name,
+        is_mllm=getattr(_engine, "is_mllm", False),
+        max_tokens=_default_max_tokens,
+    )
+    _model_registry.add(entry, is_default=True)
+
+    # Sync globals into ServerConfig so route modules can use get_config()
+    _sync_config()
+
 
 def _retry_tool_logits_setup() -> None:
     """Retry tool logits bias setup after engine.start().
@@ -636,25 +655,6 @@ def _retry_tool_logits_setup() -> None:
         )
     except Exception as e:
         logger.warning(f"Deferred tool logits bias setup failed: {e}")
-
-    # Register in multi-model registry
-    aliases = set()
-    if _model_alias and _model_alias != _model_name:
-        aliases.add(_model_alias)
-    entry = ModelEntry(
-        engine=_engine,
-        model_name=_model_name,
-        model_path=_model_path or model_name,
-        aliases=aliases,
-        tool_call_parser=_tool_call_parser,
-        reasoning_parser=_reasoning_parser_name,
-        is_mllm=getattr(_engine, "is_mllm", False),
-        max_tokens=_default_max_tokens,
-    )
-    _model_registry.add(entry, is_default=True)
-
-    # Sync globals into ServerConfig so route modules can use get_config()
-    _sync_config()
 
 
 def _sync_config() -> None:

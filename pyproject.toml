@@ -3,13 +3,14 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rapid-mlx"
+name = "lightning-mlx"
 version = "0.6.1"
-description = "Rapid-MLX — AI inference for Apple Silicon. Drop-in OpenAI API, 2-4x faster than Ollama."
+description = "Lightning-MLX — fast local OpenAI-compatible inference for Apple Silicon."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 authors = [
+    {name = "Samuel Fajreldines"},
     {name = "vllm-mlx contributors"}
 ]
 keywords = ["llm", "mlx", "apple-silicon", "vllm", "inference", "transformers"]
@@ -28,7 +29,7 @@ classifiers = [
 ]
 
 dependencies = [
-    # Core — these are all you need for `rapid-mlx serve <text-model>`
+    # Core — these are all you need for `lightning-mlx serve <text-model>`
     "mlx>=0.29.0",
     "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
     "mlx-vlm>=0.4.4",  # 0.4.4+ required for Gemma 4 support
@@ -116,14 +117,16 @@ audio = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/raullenchai/Rapid-MLX"
-Documentation = "https://github.com/raullenchai/Rapid-MLX#readme"
-Repository = "https://github.com/raullenchai/Rapid-MLX"
+Homepage = "https://github.com/samuelfaj/lightning-mlx"
+Documentation = "https://github.com/samuelfaj/lightning-mlx#readme"
+Repository = "https://github.com/samuelfaj/lightning-mlx"
+Original = "https://github.com/raullenchai/Rapid-MLX"
 
 [project.entry-points."vllm.platform_plugins"]
 mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 
 [project.scripts]
+lightning-mlx = "vllm_mlx.cli:main"
 rapid-mlx = "vllm_mlx.cli:main"
 vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"

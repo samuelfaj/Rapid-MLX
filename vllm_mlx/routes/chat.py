@@ -2,6 +2,7 @@
 """Chat completion endpoints — /v1/chat/completions."""
 
 import gc
+import asyncio
 import json
 import logging
 import re
@@ -52,6 +53,7 @@ from ..service.helpers import (
     _disconnect_guard,
     _extract_token_logprob,
     _inject_json_instruction,
+    _last_assistant_tool_call_path_signature,
     _last_assistant_tool_call_signature,
     _maybe_pin_system_prompt,
     _parse_tool_calls_with_parser,
@@ -59,6 +61,7 @@ from ..service.helpers import (
     _resolve_model_name,
     _resolve_temperature,
     _resolve_top_p,
+    _tool_call_path_signature,
     _tool_call_signature,
     _validate_model_name,
     _validate_tool_call_params,
@@ -77,6 +80,10 @@ _TOOL_TEXT_REPETITION_MIN_COUNT = 24
 _TOOL_TEXT_REPETITION_RATIO = 0.60
 _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 4096
 _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 8192
+_STREAM_IDLE_TIMEOUT_SECONDS = 60.0
+_PARTIAL_TOOL_PATH_RE = re.compile(
+    r'"(?:filePath|filepath|file_path|path)"\s*:\s*"((?:\\.|[^"\\])*)"',
+)
 
 
 def _tool_choice_requires_tool_call(tool_choice) -> bool:
@@ -210,6 +217,87 @@ def _assembled_tool_call_signatures(
     return signatures
 
 
+def _assembled_tool_call_path_signatures(
+    buffered_events: list[tuple],
+) -> list[tuple[str, str]]:
+    calls: dict[int, dict[str, str | None]] = {}
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            index = _tool_call_value(tool_call, "index")
+            if not isinstance(index, int):
+                index = len(calls)
+            assembled = calls.setdefault(index, {"name": None, "arguments": ""})
+
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            name = _tool_call_value(function, "name")
+            if name:
+                assembled["name"] = str(name)
+
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                assembled["arguments"] = (assembled["arguments"] or "") + str(arguments)
+
+    signatures: list[tuple[str, str]] = []
+    for assembled in calls.values():
+        signature = _tool_call_path_signature(
+            {
+                "function": {
+                    "name": assembled.get("name"),
+                    "arguments": assembled.get("arguments"),
+                }
+            }
+        )
+        if signature:
+            signatures.append(signature)
+    return signatures
+
+
+def _partial_tool_path_signature(name: str | None, arguments: str) -> tuple[str, str] | None:
+    if not name:
+        return None
+    match = _PARTIAL_TOOL_PATH_RE.search(arguments)
+    if not match:
+        return None
+    try:
+        path = json.loads(f'"{match.group(1)}"')
+    except (json.JSONDecodeError, ValueError):
+        path = match.group(1)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    return str(name), path.strip()
+
+
+def _assembled_partial_tool_call_path_signatures(
+    buffered_events: list[tuple],
+) -> list[tuple[str, str]]:
+    calls: dict[int, dict[str, str | None]] = {}
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            index = _tool_call_value(tool_call, "index")
+            if not isinstance(index, int):
+                index = len(calls)
+            assembled = calls.setdefault(index, {"name": None, "arguments": ""})
+
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            name = _tool_call_value(function, "name")
+            if name:
+                assembled["name"] = str(name)
+
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                assembled["arguments"] = (assembled["arguments"] or "") + str(arguments)
+
+    signatures: list[tuple[str, str]] = []
+    for assembled in calls.values():
+        signature = _partial_tool_path_signature(
+            assembled.get("name"),
+            assembled.get("arguments") or "",
+        )
+        if signature:
+            signatures.append(signature)
+    return signatures
+
+
 def _buffered_tool_call_argument_chars(buffered_events: list[tuple]) -> int:
     total = 0
     for event, _ in buffered_events:
@@ -230,6 +318,15 @@ def _stream_tool_call_repeats_recent(event, recent_signature) -> bool:
     return False
 
 
+def _stream_tool_call_repeats_recent_path(event, recent_signature) -> bool:
+    if not recent_signature:
+        return False
+    for tool_call in getattr(event, "tool_calls", None) or []:
+        if _tool_call_path_signature(tool_call) == recent_signature:
+            return True
+    return False
+
+
 def _buffered_tool_call_repeats_recent(
     buffered_events: list[tuple],
     recent_signature,
@@ -238,6 +335,33 @@ def _buffered_tool_call_repeats_recent(
         recent_signature
         and recent_signature in _assembled_tool_call_signatures(buffered_events)
     )
+
+
+def _buffered_tool_call_repeats_recent_path(
+    buffered_events: list[tuple],
+    recent_signature,
+) -> bool:
+    return bool(
+        recent_signature
+        and (
+            recent_signature in _assembled_tool_call_path_signatures(buffered_events)
+            or recent_signature
+            in _assembled_partial_tool_call_path_signatures(buffered_events)
+        )
+    )
+
+
+async def _iterate_with_idle_timeout(async_iter, timeout: float):
+    iterator = async_iter.__aiter__()
+    while True:
+        try:
+            yield await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+        except TimeoutError:
+            if hasattr(iterator, "aclose"):
+                await iterator.aclose()
+            raise
 
 
 @router.post(
@@ -901,6 +1025,9 @@ async def stream_chat_completion(
         tools_disabled_for_retry = False
         repeated_tool_retry_active = False
         recent_tool_call_signature = _last_assistant_tool_call_signature(messages)
+        recent_tool_call_path_signature = _last_assistant_tool_call_path_signature(
+            messages
+        )
         last_message = active_messages[-1] if active_messages else {}
         last_content = (
             last_message.get("content")
@@ -936,6 +1063,8 @@ async def stream_chat_completion(
             if tool_continuation_retry
             else _TOOL_CALL_REQUIRED_RETRY_PROMPT
         )
+        configured_timeout = request.timeout or cfg.default_timeout
+        stream_idle_timeout = min(configured_timeout, _STREAM_IDLE_TIMEOUT_SECONDS)
 
         while True:
             active_tool_retries_enabled = (
@@ -945,7 +1074,9 @@ async def stream_chat_completion(
             )
             repeat_tool_detection_enabled = (
                 tool_continuation_retry
-                and bool(recent_tool_call_signature)
+                and bool(
+                    recent_tool_call_signature or recent_tool_call_path_signature
+                )
                 and not tools_disabled_for_retry
             )
             tool_call_buffering_enabled = (
@@ -971,73 +1102,130 @@ async def stream_chat_completion(
             emitted_tool_call = False
             last_output = None
             retry_reason = None
+            last_progress_time = time.perf_counter()
+            last_progress_tokens = 0
 
             # Stream content — PostProcessor handles reasoning/tool/sanitize
-            async for output in engine.stream_chat(
-                messages=active_messages, **active_kwargs
-            ):
-                last_output = output
-                if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-                    prompt_tokens = output.prompt_tokens
-                if hasattr(output, "completion_tokens") and output.completion_tokens:
-                    completion_tokens = output.completion_tokens
-
-                retry_window = (
-                    active_tool_retries_enabled
-                    and retry_attempts < max_tool_continuation_retries
-                    and not emitted_tool_call
-                )
-
-                for event in processor.process_chunk(output):
-                    if retry_window and event.type in ("content", "reasoning"):
-                        buffered_events.append((event, output))
-                        buffered_text = _buffered_stream_text(buffered_events)
-                        if len(buffered_text) > _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS:
-                            retry_reason = "too much text before tool call"
-                            logger.info(
-                                "[tool-continuation] buffered text exceeded %d "
-                                "chars before tool call; aborting current stream",
-                                _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS,
-                            )
-                            break
-                        if _is_repetitive_tool_text(buffered_text):
-                            retry_reason = "repetitive text before tool call"
-                            logger.info(
-                                "[tool-continuation] detected repetitive text "
-                                "before tool call; aborting current stream"
-                            )
-                            break
-                        continue
-
+            try:
+                async for output in _iterate_with_idle_timeout(
+                    engine.stream_chat(messages=active_messages, **active_kwargs),
+                    stream_idle_timeout,
+                ):
+                    last_output = output
+                    if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+                        prompt_tokens = output.prompt_tokens
+                    if hasattr(output, "completion_tokens") and output.completion_tokens:
+                        completion_tokens = output.completion_tokens
+                    output_tokens = int(getattr(output, "completion_tokens", 0) or 0)
+                    output_text = getattr(output, "new_text", None) or ""
                     if (
-                        retry_window
-                        and event.type == "finish"
-                        and event.finish_reason == "stop"
+                        output_text
+                        or output_tokens > last_progress_tokens
+                        or getattr(output, "finished", False)
                     ):
-                        deferred_finish = (event, output)
-                        continue
+                        last_progress_time = time.perf_counter()
+                        last_progress_tokens = max(last_progress_tokens, output_tokens)
+                    elif time.perf_counter() - last_progress_time > stream_idle_timeout:
+                        retry_reason = "stream no-progress timeout"
+                        logger.warning(
+                            "[tool-continuation] stream yielded no text/token "
+                            "progress for %.1fs; aborting current stream",
+                            stream_idle_timeout,
+                        )
+                        break
 
-                    if (
-                        tool_call_buffering_active
-                        and event.type == "finish"
-                        and buffered_tool_call_events
-                    ):
-                        deferred_finish = (event, output)
-                        continue
+                    retry_window = (
+                        active_tool_retries_enabled
+                        and retry_attempts < max_tool_continuation_retries
+                        and not emitted_tool_call
+                    )
 
-                    if tool_call_buffering_active and event.type == "tool_call":
-                        buffered_tool_call_events.append((event, output))
+                    for event in processor.process_chunk(output):
+                        if retry_window and event.type in ("content", "reasoning"):
+                            buffered_events.append((event, output))
+                            buffered_text = _buffered_stream_text(buffered_events)
+                            if (
+                                len(buffered_text)
+                                > _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS
+                            ):
+                                retry_reason = "too much text before tool call"
+                                logger.info(
+                                    "[tool-continuation] buffered text exceeded %d "
+                                    "chars before tool call; aborting current stream",
+                                    _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS,
+                                )
+                                break
+                            if _is_repetitive_tool_text(buffered_text):
+                                retry_reason = "repetitive text before tool call"
+                                logger.info(
+                                    "[tool-continuation] detected repetitive text "
+                                    "before tool call; aborting current stream"
+                                )
+                                break
+                            continue
+
                         if (
-                            _buffered_tool_call_argument_chars(
-                                buffered_tool_call_events
-                            )
-                            > _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS
+                            retry_window
+                            and event.type == "finish"
+                            and event.finish_reason == "stop"
                         ):
-                            logger.info(
-                                "[tool-continuation] tool-call buffer exceeded "
-                                "%d argument chars; streaming current tool call",
-                                _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
-                            )
+                            deferred_finish = (event, output)
+                            continue
+
+                        if (
+                            tool_call_buffering_active
+                            and event.type == "finish"
+                            and buffered_tool_call_events
+                        ):
+                            deferred_finish = (event, output)
+                            continue
+
+                        if tool_call_buffering_active and event.type == "tool_call":
+                            buffered_tool_call_events.append((event, output))
+                            if (
+                                repeat_tool_detection_enabled
+                                and _buffered_tool_call_repeats_recent_path(
+                                    buffered_tool_call_events,
+                                    recent_tool_call_path_signature,
+                                )
+                            ):
+                                retry_reason = "repeated tool call"
+                                logger.info(
+                                    "[tool-continuation] detected repeated tool path "
+                                    "from partial arguments; aborting current stream"
+                                )
+                                break
+                            if (
+                                _buffered_tool_call_argument_chars(
+                                    buffered_tool_call_events
+                                )
+                                > _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS
+                            ):
+                                logger.info(
+                                    "[tool-continuation] tool-call buffer exceeded "
+                                    "%d argument chars; streaming current tool call",
+                                    _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
+                                )
+                                for buffered_event, buffered_output in buffered_events:
+                                    for _sse in _format_stream_event(
+                                        buffered_event, buffered_output
+                                    ):
+                                        yield _sse
+                                buffered_events.clear()
+
+                                emitted_tool_call = True
+                                for tool_event, tool_output in buffered_tool_call_events:
+                                    for _sse in _format_stream_event(
+                                        tool_event, tool_output
+                                    ):
+                                        yield _sse
+                                buffered_tool_call_events.clear()
+                                deferred_finish = None
+                                tool_call_buffering_active = False
+                            continue
+
+                        if event.type == "tool_call":
+                            emitted_tool_call = True
                             for buffered_event, buffered_output in buffered_events:
                                 for _sse in _format_stream_event(
                                     buffered_event, buffered_output
@@ -1045,31 +1233,18 @@ async def stream_chat_completion(
                                     yield _sse
                             buffered_events.clear()
 
-                            emitted_tool_call = True
-                            for tool_event, tool_output in buffered_tool_call_events:
-                                for _sse in _format_stream_event(
-                                    tool_event, tool_output
-                                ):
-                                    yield _sse
-                            buffered_tool_call_events.clear()
-                            deferred_finish = None
-                            tool_call_buffering_active = False
-                        continue
+                        for _sse in _format_stream_event(event, output):
+                            yield _sse
 
-                    if event.type == "tool_call":
-                        emitted_tool_call = True
-                        for buffered_event, buffered_output in buffered_events:
-                            for _sse in _format_stream_event(
-                                buffered_event, buffered_output
-                            ):
-                                yield _sse
-                        buffered_events.clear()
-
-                    for _sse in _format_stream_event(event, output):
-                        yield _sse
-
-                if retry_reason:
-                    break
+                    if retry_reason:
+                        break
+            except TimeoutError:
+                retry_reason = "stream idle timeout"
+                logger.warning(
+                    "[tool-continuation] stream produced no chunk for %.1fs; "
+                    "aborting current stream",
+                    stream_idle_timeout,
+                )
 
             # Fallback tool call detection
             if not retry_reason:
@@ -1107,9 +1282,15 @@ async def stream_chat_completion(
 
             if not retry_reason and buffered_tool_call_events:
                 if _buffered_tool_calls_complete(buffered_tool_call_events):
-                    if tool_continuation_retry and _buffered_tool_call_repeats_recent(
-                        buffered_tool_call_events,
-                        recent_tool_call_signature,
+                    if tool_continuation_retry and (
+                        _buffered_tool_call_repeats_recent(
+                            buffered_tool_call_events,
+                            recent_tool_call_signature,
+                        )
+                        or _buffered_tool_call_repeats_recent_path(
+                            buffered_tool_call_events,
+                            recent_tool_call_path_signature,
+                        )
                     ):
                         retry_reason = "repeated tool call"
                     else:

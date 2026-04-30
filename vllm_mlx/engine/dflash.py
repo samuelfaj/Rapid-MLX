@@ -32,6 +32,7 @@ from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
+_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS = 60.0
 
 
 _TOOL_STOP_AFTER_STRINGS = (
@@ -627,7 +628,18 @@ class DFlashEngine(BatchedEngine):
         saw_step = False
         try:
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    stop_event.set()
+                    logger.warning(
+                        "[DDTree] no stream events for %.1fs; aborting request",
+                        _DDTREE_STREAM_IDLE_TIMEOUT_SECONDS,
+                    )
+                    break
                 if item is sentinel:
                     break
                 is_final = "finish_reason" in item

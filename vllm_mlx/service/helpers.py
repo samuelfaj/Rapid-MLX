@@ -58,8 +58,9 @@ _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT = (
     "You just repeated the same tool call after receiving its result. "
     "Use the tool result already present in the conversation. "
     "Do not call the same tool with the same arguments again. "
+    "Do not write or edit the same file path again, even with different content. "
     "If the repeated tool wrote or edited a file path, choose a different missing "
-    "file path or run a validation command. "
+    "file path, run a validation command, or give the final answer if complete. "
     "Make a different tool call now unless the entire task is complete."
 )
 
@@ -459,6 +460,31 @@ def _tool_call_signature(tool_call) -> tuple[str, str] | None:
     return str(name), arguments
 
 
+def _tool_call_path_signature(tool_call) -> tuple[str, str] | None:
+    function = _object_value(tool_call, "function")
+    if not function:
+        return None
+
+    name = _object_value(function, "name")
+    if not name:
+        return None
+
+    arguments = _object_value(function, "arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments.strip())
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(arguments, dict):
+        return None
+
+    for key in ("filePath", "filepath", "file_path", "path"):
+        path = arguments.get(key)
+        if isinstance(path, str) and path.strip():
+            return str(name), path.strip()
+    return None
+
+
 def _plain_write_transcript_signature(content: str) -> tuple[str, str] | None:
     stripped = content.strip()
     if not stripped.startswith("write "):
@@ -480,6 +506,21 @@ def _plain_write_transcript_signature(content: str) -> tuple[str, str] | None:
     return "write", arguments
 
 
+def _plain_write_transcript_path_signature(content: str) -> tuple[str, str] | None:
+    stripped = content.strip()
+    if not stripped.startswith("write "):
+        return None
+
+    first_line, separator, _ = stripped.partition("\n")
+    if not separator:
+        return None
+
+    path = first_line.removeprefix("write ").strip()
+    if not path:
+        return None
+    return "write", path
+
+
 def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
     if _message_role(message) != "assistant":
         return None
@@ -499,6 +540,25 @@ def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
     return _plain_write_transcript_signature(content)
 
 
+def _assistant_tool_call_path_signature(message) -> tuple[str, str] | None:
+    if _message_role(message) != "assistant":
+        return None
+
+    tool_calls = _object_value(message, "tool_calls")
+    if tool_calls:
+        return _tool_call_path_signature(tool_calls[0])
+
+    content = _message_content(message)
+    if not isinstance(content, str):
+        return None
+
+    _, parsed_tool_calls = parse_tool_calls(content)
+    if parsed_tool_calls:
+        return _tool_call_path_signature(parsed_tool_calls[0])
+
+    return _plain_write_transcript_path_signature(content)
+
+
 def _last_assistant_tool_call_signature(messages: list) -> tuple[str, str] | None:
     for message in reversed(messages):
         signature = _assistant_tool_call_signature(message)
@@ -507,22 +567,38 @@ def _last_assistant_tool_call_signature(messages: list) -> tuple[str, str] | Non
     return None
 
 
+def _last_assistant_tool_call_path_signature(messages: list) -> tuple[str, str] | None:
+    for message in reversed(messages):
+        signature = _assistant_tool_call_path_signature(message)
+        if signature:
+            return signature
+    return None
+
+
 def _has_repeated_recent_tool_call(messages: list) -> bool:
     """Detect the same assistant tool call repeated consecutively."""
     last_signature = None
+    last_path_signature = None
     saw_last = False
 
     for message in reversed(messages):
         signature = _assistant_tool_call_signature(message)
-        if not signature:
+        path_signature = _assistant_tool_call_path_signature(message)
+        if not signature and not path_signature:
             continue
 
         if not saw_last:
             last_signature = signature
+            last_path_signature = path_signature
             saw_last = True
             continue
 
-        return signature == last_signature
+        return bool(
+            signature
+            and signature == last_signature
+            or path_signature
+            and path_signature == last_path_signature
+        )
 
     return False
 

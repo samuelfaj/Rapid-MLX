@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for chat streaming tool-continuation retry behavior."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -77,6 +78,29 @@ class _EngineThatRepeatsToolThenAnswers:
             new_text="Already wrote it.",
             prompt_tokens=12,
             completion_tokens=4,
+            finished=True,
+            finish_reason="stop",
+        )
+
+
+class _EngineThatStallsThenCallsTool:
+    def __init__(self):
+        self.calls = 0
+        self.messages_seen = []
+        self.tokenizer = MagicMock()
+
+    async def stream_chat(self, messages, **kwargs):
+        self.calls += 1
+        self.messages_seen.append(messages)
+        if self.calls == 1:
+            await asyncio.sleep(60)
+            return
+
+        yield GenerationOutput(
+            text="<tool_call>",
+            new_text="<tool_call>",
+            prompt_tokens=12,
+            completion_tokens=3,
             finished=True,
             finish_reason="stop",
         )
@@ -159,6 +183,47 @@ class _FakeRepeatedWritePostProcessor(_FakeStreamingPostProcessor):
         ]
 
 
+class _FakeRepeatedWriteSamePathPostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            return [
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_repeat_path",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "function": {
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"changed"}'
+                                ),
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    tool_calls_detected=True,
+                ),
+            ]
+        return [
+            StreamEvent(type="content", content="Already handled."),
+            StreamEvent(type="finish", finish_reason="stop"),
+        ]
+
+
 class _FakeLargeWritePostProcessor(_FakeStreamingPostProcessor):
     def process_chunk(self, output):
         large_arguments = '{"filePath":"src/App.tsx","content":"' + (
@@ -192,6 +257,47 @@ class _FakeLargeWritePostProcessor(_FakeStreamingPostProcessor):
                 ],
                 tool_calls_detected=True,
             ),
+        ]
+
+
+class _FakeLargeRepeatedPathWritePostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            large_arguments = '{"filePath":"src/main.tsx","content":"' + (
+                "x" * (_TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS + 1)
+            )
+            return [
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_large_repeat",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "function": {
+                                "arguments": large_arguments,
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+            ]
+        return [
+            StreamEvent(type="content", content="Moved on."),
+            StreamEvent(type="finish", finish_reason="stop"),
         ]
 
 
@@ -682,6 +788,178 @@ async def test_repeated_tool_call_retries_with_anti_loop_prompt(monkeypatch):
     assert "tools" in engine.kwargs_seen[1]
     assert any("Already wrote it." in chunk for chunk in chunks)
     assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_repeated_write_to_same_path_retries_even_when_content_changes(monkeypatch):
+    """Do not rewrite the same file path after its tool result."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeRepeatedWriteSamePathPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "write app"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatRepeatsToolThenAnswers()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"same"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_prev", "content": "ok"},
+            ],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+            tools=[{"type": "function", "function": {"name": "write"}}],
+        )
+    ]
+
+    assert engine.calls == 2
+    assert any("Already handled." in chunk for chunk in chunks)
+    assert not any("call_repeat_path" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_repeated_large_write_to_same_path_retries_from_partial_path(monkeypatch):
+    """Detect repeated file paths before holding a huge incomplete JSON buffer."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeLargeRepeatedPathWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "write app"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatRepeatsToolThenAnswers()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_prev",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"filePath":"src/main.tsx","content":"same"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_prev", "content": "ok"},
+            ],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+            tools=[{"type": "function", "function": {"name": "write"}}],
+        )
+    ]
+
+    assert engine.calls == 2
+    assert any("Moved on." in chunk for chunk in chunks)
+    assert not any("call_large_repeat" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_tool_continuation_retries_when_stream_idles(monkeypatch):
+    """A stalled stream attempt should not leave the client waiting forever."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "do work"}],
+        stream=True,
+        timeout=0.01,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatStallsThenCallsTool()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [{"role": "tool", "content": "done"}],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+        )
+    ]
+
+    assert engine.calls == 2
+    assert engine.messages_seen[1][-1]["content"] == _TOOL_CONTINUATION_RETRY_PROMPT
+    assert any('"tool_calls"' in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio

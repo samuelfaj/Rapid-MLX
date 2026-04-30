@@ -54,12 +54,11 @@ _TOOL_CONTINUATION_USER_PROMPT = (
     "Only give a final answer when the task is complete."
 )
 
-_TOOL_CONTINUATION_REPEATED_READ_PROMPT = (
-    "You just repeated the same read-only tool call after receiving its result. "
+_TOOL_CONTINUATION_REPEATED_TOOL_PROMPT = (
+    "You just repeated the same tool call after receiving its result. "
     "Use the tool result already present in the conversation. "
-    "Do not call the same read-only tool with the same arguments again. "
-    "Make a state-changing tool call, run a diagnostic command, or provide the "
-    "final answer if the task is complete."
+    "Do not call the same tool with the same arguments again. "
+    "Make a different tool call or provide the final answer if the task is complete."
 )
 
 _TOOL_CONTINUATION_RETRY_PROMPT = (
@@ -464,8 +463,8 @@ def _assistant_tool_call_signature(message) -> tuple[str, str] | None:
     return str(name), arguments
 
 
-def _has_repeated_recent_read_tool_call(messages: list) -> bool:
-    """Detect repeated read-only tool calls without a state-changing call between."""
+def _has_repeated_recent_tool_call(messages: list) -> bool:
+    """Detect the same assistant tool call repeated consecutively."""
     last_signature = None
     saw_last = False
 
@@ -474,19 +473,12 @@ def _has_repeated_recent_read_tool_call(messages: list) -> bool:
         if not signature:
             continue
 
-        name, _arguments = signature
-        if name != "read":
-            if saw_last:
-                return False
-            continue
-
         if not saw_last:
             last_signature = signature
             saw_last = True
             continue
 
-        if signature == last_signature:
-            return True
+        return signature == last_signature
 
     return False
 
@@ -498,8 +490,8 @@ def _append_tool_continuation_prompt(messages: list, tools_requested: bool) -> t
     if not _is_tool_result_message(messages[-1]):
         return messages, False
     prompt = (
-        _TOOL_CONTINUATION_REPEATED_READ_PROMPT
-        if _has_repeated_recent_read_tool_call(messages)
+        _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
+        if _has_repeated_recent_tool_call(messages)
         else _TOOL_CONTINUATION_USER_PROMPT
     )
     return messages + [{"role": "user", "content": prompt}], True

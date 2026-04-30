@@ -12,6 +12,7 @@ from vllm_mlx.routes.chat import stream_chat_completion
 from vllm_mlx.service.helpers import (
     _TOOL_CALL_JSON_RETRY_PROMPT,
     _TOOL_CALL_REQUIRED_RETRY_PROMPT,
+    _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT,
     _TOOL_CONTINUATION_RETRY_PROMPT,
 )
 
@@ -370,6 +371,56 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
         async for chunk in stream_chat_completion(
             engine,
             [{"role": "tool", "content": "done"}],
+            request,
+            tool_continuation_retry=True,
+            max_tokens=16,
+        )
+    ]
+
+    assert engine.calls == 1
+    assert any("Thinking only." in chunk for chunk in chunks)
+    assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_repeated_tool_prompt_allows_text_final_with_required_tool_choice(
+    monkeypatch,
+):
+    """Do not force another tool after anti-loop repeated-tool prompt."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "do work"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [
+                {"role": "tool", "content": "npm error"},
+                {"role": "user", "content": _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT},
+            ],
             request,
             tool_continuation_retry=True,
             max_tokens=16,

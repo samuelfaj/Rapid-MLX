@@ -44,6 +44,7 @@ from ..middleware.auth import check_rate_limit, verify_api_key
 from ..service.helpers import (
     _TOOL_CALL_JSON_RETRY_PROMPT,
     _TOOL_CALL_REQUIRED_RETRY_PROMPT,
+    _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT,
     _TOOL_CONTINUATION_RETRY_PROMPT,
     _TOOL_USE_SYSTEM_SUFFIX,
     _append_tool_continuation_prompt,
@@ -830,8 +831,20 @@ async def stream_chat_completion(
 
         retry_attempts = 0
         active_messages = messages
-        tool_retries_enabled = bool(request.tools) and _tool_choice_requires_tool_call(
-            request.tool_choice
+        last_message = active_messages[-1] if active_messages else {}
+        last_content = (
+            last_message.get("content")
+            if isinstance(last_message, dict)
+            else getattr(last_message, "content", None)
+        )
+        repeated_tool_continuation = (
+            tool_continuation_retry
+            and last_content == _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
+        )
+        tool_retries_enabled = (
+            bool(request.tools)
+            and _tool_choice_requires_tool_call(request.tool_choice)
+            and not repeated_tool_continuation
         )
         max_tool_continuation_retries = 2 if tool_retries_enabled else 0
         retry_prompt = (

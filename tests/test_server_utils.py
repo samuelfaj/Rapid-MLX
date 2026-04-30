@@ -271,7 +271,7 @@ class TestAppendToolContinuationPrompt:
         assert result[-1]["role"] == "user"
         assert "Do not stop with only reasoning" in result[-1]["content"]
 
-    def test_repeated_read_gets_anti_loop_prompt(self):
+    def test_repeated_tool_call_gets_anti_loop_prompt(self):
         from vllm_mlx.service.helpers import _append_tool_continuation_prompt
 
         messages = [
@@ -305,7 +305,43 @@ class TestAppendToolContinuationPrompt:
         result, added = _append_tool_continuation_prompt(messages, True)
 
         assert added is True
-        assert "Do not call the same read-only tool" in result[-1]["content"]
+        assert "Do not call the same tool" in result[-1]["content"]
+
+    def test_repeated_bash_command_gets_anti_loop_prompt(self):
+        from vllm_mlx.service.helpers import _append_tool_continuation_prompt
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"cmd":"npm run test 2>&1 | tail -100"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "npm error"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"cmd":"npm run test 2>&1 | tail -100"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "npm error"},
+        ]
+        result, added = _append_tool_continuation_prompt(messages, True)
+
+        assert added is True
+        assert "Do not call the same tool" in result[-1]["content"]
 
     def test_repeated_read_after_mutating_tool_uses_normal_prompt(self):
         from vllm_mlx.service.helpers import _append_tool_continuation_prompt

@@ -75,6 +75,7 @@ _REPETITION_WORD_RE = re.compile(r"[A-Za-z0-9_'-]+")
 _TOOL_TEXT_REPETITION_MIN_WORDS = 32
 _TOOL_TEXT_REPETITION_MIN_COUNT = 24
 _TOOL_TEXT_REPETITION_RATIO = 0.60
+_TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 4096
 _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 8192
 
 
@@ -910,12 +911,25 @@ async def stream_chat_completion(
             tool_continuation_retry
             and last_content == _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
         )
-        tool_retries_enabled = (
-            bool(request.tools)
-            and _tool_choice_requires_tool_call(request.tool_choice)
+        structured_agentic_continuation = (
+            tool_continuation_retry
+            and cfg.structured_cot_tools
+            and bool(request.tools)
             and not repeated_tool_continuation
         )
-        max_tool_continuation_retries = 2 if tool_retries_enabled else 0
+        tool_retries_enabled = (
+            bool(request.tools)
+            and (
+                _tool_choice_requires_tool_call(request.tool_choice)
+                or structured_agentic_continuation
+            )
+            and not repeated_tool_continuation
+        )
+        max_tool_continuation_retries = (
+            6
+            if structured_agentic_continuation
+            else (2 if tool_retries_enabled else 0)
+        )
         max_repeated_tool_retries = 2 if tool_continuation_retry else 0
         retry_prompt = (
             _TOOL_CONTINUATION_RETRY_PROMPT
@@ -977,9 +991,16 @@ async def stream_chat_completion(
                 for event in processor.process_chunk(output):
                     if retry_window and event.type in ("content", "reasoning"):
                         buffered_events.append((event, output))
-                        if _is_repetitive_tool_text(
-                            _buffered_stream_text(buffered_events)
-                        ):
+                        buffered_text = _buffered_stream_text(buffered_events)
+                        if len(buffered_text) > _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS:
+                            retry_reason = "too much text before tool call"
+                            logger.info(
+                                "[tool-continuation] buffered text exceeded %d "
+                                "chars before tool call; aborting current stream",
+                                _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS,
+                            )
+                            break
+                        if _is_repetitive_tool_text(buffered_text):
                             retry_reason = "repetitive text before tool call"
                             logger.info(
                                 "[tool-continuation] detected repetitive text "
@@ -1007,15 +1028,13 @@ async def stream_chat_completion(
                     if tool_call_buffering_active and event.type == "tool_call":
                         buffered_tool_call_events.append((event, output))
                         if (
-                            repeat_tool_detection_enabled
-                            and not active_tool_retries_enabled
-                            and _buffered_tool_call_argument_chars(
+                            _buffered_tool_call_argument_chars(
                                 buffered_tool_call_events
                             )
                             > _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS
                         ):
                             logger.info(
-                                "[tool-continuation] repeated-tool buffer exceeded "
+                                "[tool-continuation] tool-call buffer exceeded "
                                 "%d argument chars; streaming current tool call",
                                 _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
                             )
@@ -1034,7 +1053,7 @@ async def stream_chat_completion(
                                     yield _sse
                             buffered_tool_call_events.clear()
                             deferred_finish = None
-                            tool_call_buffering_active = active_tool_retries_enabled
+                            tool_call_buffering_active = False
                         continue
 
                     if event.type == "tool_call":

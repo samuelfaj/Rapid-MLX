@@ -216,6 +216,27 @@ class _FakeRepetitionPostProcessor(_FakeStreamingPostProcessor):
         ]
 
 
+class _FakeLongTextPostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            return [StreamEvent(type="content", content="x" * 5000)]
+        return [
+            StreamEvent(
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_after_long_text",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+                finish_reason="tool_calls",
+                tool_calls_detected=True,
+            )
+        ]
+
+
 class _EngineThatTruncatesThenCallsTool:
     def __init__(self):
         self.calls = 0
@@ -495,6 +516,110 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_structured_cot_tools_retries_auto_text_after_tool_result(monkeypatch):
+    """Agentic structured-COT mode keeps tool continuation moving for auto tools."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    get_config().structured_cot_tools = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "do work"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                [{"role": "tool", "content": "done"}],
+                request,
+                tool_continuation_retry=True,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert engine.messages_seen[1][-1]["content"] == _TOOL_CONTINUATION_RETRY_PROMPT
+    assert not any("Thinking only." in chunk for chunk in chunks)
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_structured_cot_tools_retries_long_auto_text_before_tool_call(monkeypatch):
+    """Agentic continuation does not wait for max_tokens of text before retrying."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    get_config().structured_cot_tools = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeLongTextPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "do work"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                [{"role": "tool", "content": "done"}],
+                request,
+                tool_continuation_retry=True,
+                max_tokens=32768,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert engine.messages_seen[1][-1]["content"] == _TOOL_CONTINUATION_RETRY_PROMPT
+    assert not any('"xxxxx' in chunk for chunk in chunks)
+    assert any("call_after_long_text" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
 async def test_repeated_tool_call_retries_with_anti_loop_prompt(monkeypatch):
     """Do not emit the same tool call again after its result."""
     from vllm_mlx.service import postprocessor
@@ -612,6 +737,52 @@ async def test_large_auto_tool_call_streams_after_repeat_buffer_limit(monkeypatc
             ],
             request,
             tool_continuation_retry=True,
+            max_tokens=16,
+            tools=[{"type": "function", "function": {"name": "write"}}],
+        )
+    ]
+
+    assert engine.calls == 1
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any("call_large" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_large_required_tool_call_streams_after_buffer_limit(monkeypatch):
+    """Large write arguments should stream instead of waiting for full JSON."""
+    from vllm_mlx.service import postprocessor
+
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeLargeWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "write app"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+    engine = _EngineThatRepeatsToolThenAnswers()
+
+    chunks = [
+        chunk
+        async for chunk in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "Build app"}],
+            request,
+            tool_continuation_retry=False,
             max_tokens=16,
             tools=[{"type": "function", "function": {"name": "write"}}],
         )

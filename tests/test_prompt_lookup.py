@@ -2,6 +2,70 @@
 """Tests for PromptLookupDecoder."""
 
 from vllm_mlx.speculative.prompt_lookup import PromptLookupDecoder
+from vllm_mlx.api.structured_cot import (
+    StructuredCoTLogitsProcessor,
+    prompt_thinking_prefix,
+)
+from vllm_mlx.speculative.ddtree.engine import _update_thinking_state
+
+
+class TestStructuredCoT:
+    """Tests for structured CoT constraint helpers."""
+
+    def test_prompt_prefix_when_think_already_open(self):
+        assert prompt_thinking_prefix("assistant<think>") == "\n"
+        assert prompt_thinking_prefix("assistant<think>\n") == ""
+        assert prompt_thinking_prefix("plain prompt") == "<think>\n"
+
+    def test_rejects_freeform_thinking_prefix(self):
+        processor = StructuredCoTLogitsProcessor(None)
+        assert processor._is_valid_partial("Thinking: The user wants") is False
+
+    def test_accepts_structured_prefix(self):
+        processor = StructuredCoTLogitsProcessor(None)
+        text = "<think>\nGOAL: build game\nAPPROACH: implement loop\nEDGE: tests\n"
+        assert processor._is_valid_partial(text) is True
+        assert processor._is_valid_partial(text + "</think>\n\nanswer") is True
+
+    def test_masks_freeform_start_token(self):
+        import mlx.core as mx
+
+        class Tokenizer:
+            vocab = ["<think>\n", "Thinking: ", "GOAL: "]
+
+            def decode(self, ids, **kwargs):
+                return "".join(self.vocab[i] for i in ids)
+
+        processor = StructuredCoTLogitsProcessor(Tokenizer())
+        masked = processor([], mx.zeros((1, len(Tokenizer.vocab)))).tolist()[0]
+        assert masked[0] == 0.0
+        assert masked[1] < -1e8
+
+    def test_strips_prompt_tokens_before_validation(self):
+        class Tokenizer:
+            vocab = ["prompt", "<think>\n"]
+
+            def decode(self, ids, **kwargs):
+                return "".join(self.vocab[i] for i in ids)
+
+        processor = StructuredCoTLogitsProcessor(Tokenizer(), prompt_token_count=1)
+        assert processor._decode_tokens([0, 1]) == "<think>\n"
+
+
+class TestThinkingNgramState:
+    """Tests for DDTree thinking-only n-gram state tracking."""
+
+    def test_enters_and_exits_thinking_block(self):
+        assert _update_thinking_state(False, "abc <think>reason") is True
+        assert _update_thinking_state(True, "more</think> answer") is False
+
+    def test_preserves_state_without_tags(self):
+        assert _update_thinking_state(True, "reasoning text") is True
+        assert _update_thinking_state(False, "answer text") is False
+
+    def test_uses_last_tag_when_both_present(self):
+        text = "<think>one</think> answer <think>two"
+        assert _update_thinking_state(False, text) is True
 
 
 class TestPromptLookupDecoderInit:

@@ -434,6 +434,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     ):
         chat_kwargs["enable_thinking"] = False
 
+    if (
+        (cfg.structured_cot or (cfg.structured_cot_tools and request.tools))
+        and chat_kwargs.get("enable_thinking") is not False
+    ):
+        chat_kwargs["structured_cot"] = True
+        chat_kwargs["structured_cot_token_budget"] = cfg.structured_cot_token_budget
+
     # Cloud routing: offload large-context requests to cloud LLM
     if cfg.cloud_router and not engine.is_mllm and hasattr(engine, "build_prompt"):
         try:

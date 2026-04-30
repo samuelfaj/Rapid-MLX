@@ -189,6 +189,9 @@ _gc_control: bool = True  # Disable GC during generation to avoid latency spikes
 _no_thinking: bool = (
     False  # --no-thinking: force enable_thinking=False in chat template
 )
+_structured_cot: bool = False
+_structured_cot_tools: bool = False
+_structured_cot_token_budget: int = 256
 
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
@@ -464,6 +467,12 @@ def load_model(
     dflash_ngram_num_draft_tokens: int | None = None,
     dflash_ngram_size: int | None = None,
     dflash_ngram_min_matches: int | None = None,
+    dflash_thinking_ngram_num_draft_tokens: int | None = None,
+    dflash_thinking_ngram_size: int | None = None,
+    dflash_thinking_ngram_min_matches: int | None = None,
+    structured_cot: bool = False,
+    structured_cot_tools: bool = False,
+    structured_cot_token_budget: int = 256,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -484,12 +493,18 @@ def load_model(
         _model_path, \
         _default_max_tokens, \
         _tool_parser_instance, \
-        _cloud_router
+        _cloud_router, \
+        _structured_cot, \
+        _structured_cot_tools, \
+        _structured_cot_token_budget
 
     _default_max_tokens = max_tokens
     _model_path = model_name
     _model_name = served_model_name or model_name
     _tool_parser_instance = None
+    _structured_cot = bool(structured_cot)
+    _structured_cot_tools = bool(structured_cot_tools)
+    _structured_cot_token_budget = int(structured_cot_token_budget)
 
     # Initialize cloud router if --cloud-model is set
     if cloud_model:
@@ -533,6 +548,9 @@ def load_model(
             ngram_disable_threshold=dflash_disable_threshold,
             ngram_disable_window=dflash_disable_window,
             ngram_disable_cooldown=dflash_disable_cooldown,
+            thinking_ngram_num_draft_tokens=dflash_thinking_ngram_num_draft_tokens,
+            thinking_ngram_size=dflash_thinking_ngram_size,
+            thinking_ngram_min_matches=dflash_thinking_ngram_min_matches,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -686,6 +704,9 @@ def _sync_config() -> None:
     cfg.cloud_router = _cloud_router
     cfg.gc_control = _gc_control
     cfg.no_thinking = _no_thinking
+    cfg.structured_cot = _structured_cot
+    cfg.structured_cot_tools = _structured_cot_tools
+    cfg.structured_cot_token_budget = _structured_cot_token_budget
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
@@ -869,6 +890,27 @@ Examples:
             f"Options: {', '.join(reasoning_choices)}."
         ),
     )
+    parser.add_argument(
+        "--structured-cot",
+        action="store_true",
+        default=False,
+        help=(
+            "Constrain thinking to <think> GOAL/APPROACH/EDGE </think> "
+            "using decode-time logits masking."
+        ),
+    )
+    parser.add_argument(
+        "--structured-cot-tools",
+        action="store_true",
+        default=False,
+        help="Enable structured CoT when tool calling is active.",
+    )
+    parser.add_argument(
+        "--structured-cot-token-budget",
+        type=int,
+        default=256,
+        help="Approximate token budget for structured CoT lines.",
+    )
     # Tool call parser options
     from .tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -1037,6 +1079,9 @@ Examples:
         cloud_threshold=args.cloud_threshold,
         cloud_api_base=args.cloud_api_base,
         cloud_api_key=args.cloud_api_key,
+        structured_cot=args.structured_cot,
+        structured_cot_tools=args.structured_cot_tools,
+        structured_cot_token_budget=args.structured_cot_token_budget,
     )
 
     # Start server

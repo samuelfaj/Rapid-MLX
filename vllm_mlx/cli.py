@@ -402,6 +402,19 @@ def serve_command(args):
             ),
             dflash_ngram_size=getattr(args, "ngram_size", None),
             dflash_ngram_min_matches=getattr(args, "ngram_min_matches", None),
+            dflash_thinking_ngram_num_draft_tokens=(
+                getattr(args, "thinking_ngram_num_draft_tokens", None)
+                or (16 if getattr(args, "thinking_ngram", False) else None)
+            ),
+            dflash_thinking_ngram_size=getattr(args, "thinking_ngram_size", None),
+            dflash_thinking_ngram_min_matches=getattr(
+                args, "thinking_ngram_min_matches", None
+            ),
+            structured_cot=getattr(args, "structured_cot", False),
+            structured_cot_tools=getattr(args, "structured_cot_tools", False),
+            structured_cot_token_budget=getattr(
+                args, "structured_cot_token_budget", 256
+            ),
         )
     except Exception as e:
         # Show clean error instead of raw traceback
@@ -1380,19 +1393,22 @@ Examples:
         "--structured-cot",
         action="store_true",
         default=False,
-        help=argparse.SUPPRESS,
+        help=(
+            "Constrain thinking to <think> GOAL/APPROACH/EDGE </think> "
+            "with decode-time logits masking."
+        ),
     )
     serve_parser.add_argument(
         "--structured-cot-tools",
         action="store_true",
         default=False,
-        help=argparse.SUPPRESS,
+        help="Enable structured CoT only for tool-calling requests.",
     )
     serve_parser.add_argument(
         "--structured-cot-token-budget",
         type=int,
         default=256,
-        help=argparse.SUPPRESS,
+        help="Approximate token budget for structured CoT lines.",
     )
     # GC control (Tier 0 optimization)
     serve_parser.add_argument(
@@ -1570,6 +1586,33 @@ Examples:
         "--ngram-min-matches",
         type=int,
         default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--thinking-ngram",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable aggressive prompt-lookup n-gram only inside generated "
+            "<think>...</think> blocks (default: size=1, draft=16, min=1)."
+        ),
+    )
+    serve_parser.add_argument(
+        "--thinking-ngram-num-draft-tokens",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--thinking-ngram-size",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--thinking-ngram-min-matches",
+        type=int,
+        default=1,
         help=argparse.SUPPRESS,
     )
     # Bench command

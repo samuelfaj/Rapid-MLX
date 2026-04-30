@@ -91,6 +91,38 @@ _TOOL_CALL_MARKERS = (
 )
 
 
+def _update_thinking_state(in_thinking: bool, text: str) -> bool:
+    """Track whether generated text is currently inside a <think> block."""
+    pos = 0
+    while pos < len(text):
+        open_index = text.find("<think>", pos)
+        close_index = text.find("</think>", pos)
+        if open_index == -1 and close_index == -1:
+            break
+        if open_index != -1 and (close_index == -1 or open_index < close_index):
+            in_thinking = True
+            pos = open_index + len("<think>")
+        else:
+            in_thinking = False
+            pos = close_index + len("</think>")
+    return in_thinking
+
+
+def _prompt_starts_in_thinking(tokenizer: Any, prompt_token_ids: list[int]) -> bool:
+    """Infer Qwen-style generation prompts that already opened <think>."""
+    if not prompt_token_ids:
+        return False
+    try:
+        prompt_tail = tokenizer.decode(prompt_token_ids[-256:])
+    except TypeError:
+        prompt_tail = tokenizer.decode(
+            prompt_token_ids[-256:], skip_special_tokens=False
+        )
+    except Exception:
+        return False
+    return _update_thinking_state(False, prompt_tail)
+
+
 def _looks_like_tool_call_draft(
     tokenizer: Any,
     history: list[int],
@@ -153,6 +185,23 @@ def _tree_token_id(tree: Any, root_token: int, tree_index: int) -> int:
 
 def _tree_token_ids(tree: Any, root_token: int, indices: list[int]) -> list[int]:
     return [_tree_token_id(tree, root_token, idx) for idx in indices]
+
+
+def _tree_path_indices(child_maps: list[dict[int, int]], tree_index: int) -> list[int]:
+    if tree_index == 0:
+        return [0]
+    parent_by_child: dict[int, int] = {}
+    for parent, child_map in enumerate(child_maps):
+        for child in child_map.values():
+            parent_by_child[int(child)] = parent
+    path = [tree_index]
+    while path[-1] != 0:
+        parent = parent_by_child.get(path[-1])
+        if parent is None:
+            return [0]
+        path.append(parent)
+    path.reverse()
+    return path
 
 
 def _tree_node_count(tree: Any) -> int:
@@ -257,6 +306,10 @@ def generate_ddtree(
     ngram_disable_threshold: float | None = None,
     ngram_disable_window: int | None = None,
     ngram_disable_cooldown: int | None = None,
+    thinking_ngram_num_draft_tokens: int | None = None,
+    thinking_ngram_size: int | None = None,
+    thinking_ngram_min_matches: int | None = None,
+    logits_processors: list[Any] | None = None,
     emit_step_text: bool = True,
 ) -> dict[str, Any]:
     (
@@ -320,7 +373,10 @@ def generate_ddtree(
     prefill_seconds = prefill.prefill_seconds
     prompt_tps = prefill.prompt_tps
     target_hidden = prefill.hidden
-    staged_first = greedy_tokens_with_mask(prefill_logits[:, -1, :], suppress_mask).reshape(-1)
+    first_logits = prefill_logits[:, -1, :]
+    for processor in logits_processors or ():
+        first_logits = processor([], first_logits)
+    staged_first = greedy_tokens_with_mask(first_logits, suppress_mask).reshape(-1)
 
     generated_token_ids: list[int] = []
     generated_hidden_chunks: list[mx.array] = []
@@ -341,6 +397,7 @@ def generate_ddtree(
     stop_hit = False
     cancelled = False
     ngram_decoder: PromptLookupDecoder | None = None
+    thinking_ngram_decoder: PromptLookupDecoder | None = None
     ngram_recent: list[tuple[int, int]] = []
     ngram_cooldown_remaining = 0
     ngram_cycles_completed = 0
@@ -357,11 +414,19 @@ def generate_ddtree(
             min_matches=max(1, int(ngram_min_matches or 1)),
         )
         ngram_decoder.add_prompt_tokens(prompt_token_ids)
+    if thinking_ngram_num_draft_tokens is not None:
+        thinking_ngram_decoder = PromptLookupDecoder(
+            num_draft_tokens=max(1, int(thinking_ngram_num_draft_tokens)),
+            ngram_size=max(1, int(thinking_ngram_size or 1)),
+            min_matches=max(1, int(thinking_ngram_min_matches or 1)),
+        )
+        thinking_ngram_decoder.add_prompt_tokens(prompt_token_ids)
     ngram_threshold = float(
         0.55 if ngram_disable_threshold is None else ngram_disable_threshold
     )
     ngram_window = max(1, int(ngram_disable_window or 4))
     ngram_cooldown = max(0, int(ngram_disable_cooldown or 8))
+    in_thinking_block = _prompt_starts_in_thinking(tokenizer, prompt_token_ids)
 
     def stop_requested() -> bool:
         if should_stop is None:
@@ -384,6 +449,12 @@ def generate_ddtree(
     )
     stop_text_tail = ""
 
+    def apply_logits_processors(context_tokens: list[int], logits: mx.array) -> mx.array:
+        processed = logits
+        for processor in logits_processors or ():
+            processed = processor(context_tokens, processed)
+        return processed
+
     while len(generated_token_ids) < max_new_tokens:
         if stop_requested():
             cancelled = True
@@ -393,25 +464,32 @@ def generate_ddtree(
         root_token = int(staged_first[0].item() if staged_first.ndim > 0 else staged_first.item())
         used_ngram = False
         tree_node_count = 0
+        active_ngram_decoder = (
+            thinking_ngram_decoder
+            if in_thinking_block and thinking_ngram_decoder is not None
+            else ngram_decoder
+        )
 
         if ngram_decoder is not None:
             ngram_decoder.add_generated_token(root_token)
+        if thinking_ngram_decoder is not None:
+            thinking_ngram_decoder.add_generated_token(root_token)
 
         draft_tokens: list[int] = []
-        if ngram_decoder is not None:
+        if active_ngram_decoder is not None:
             if ngram_disabled_for_request:
                 ngram_disabled_cycles += 1
             elif ngram_cooldown_remaining > 0:
                 ngram_disabled_cycles += 1
                 ngram_cooldown_remaining -= 1
             else:
-                draft_tokens = ngram_decoder.get_draft_tokens()
+                draft_tokens = active_ngram_decoder.get_draft_tokens()
 
         if (
             draft_tokens
             and _looks_like_tool_call_draft(
                 tokenizer,
-                getattr(ngram_decoder, "_token_history", []),
+                getattr(active_ngram_decoder, "_token_history", []),
                 root_token,
                 draft_tokens,
             )
@@ -432,7 +510,16 @@ def generate_ddtree(
                 cache=target_cache,
                 capture_layer_ids=capture_layer_ids,
             )
-            posterior_mx = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
+            processed_logits = []
+            verify_context = [*generated_token_ids, root_token]
+            for pos in range(int(verify_logits.shape[1])):
+                step_logits = verify_logits[:, pos, :]
+                step_logits = apply_logits_processors(verify_context, step_logits)
+                processed_logits.append(step_logits)
+                if pos < len(draft_tokens):
+                    verify_context.append(int(draft_tokens[pos]))
+            verify_logits_2d = mx.concatenate(processed_logits, axis=0)
+            posterior_mx = greedy_tokens_with_mask(verify_logits_2d, suppress_mask)
             mx.eval(posterior_mx)
             phase_timings_us["ngram_verify"] += (
                 time.perf_counter_ns() - verify_started
@@ -451,7 +538,7 @@ def generate_ddtree(
             ngram_cycles_completed += 1
             ngram_proposed_tokens += len(draft_tokens)
             ngram_accepted_tokens += ngram_draft_accepted
-            ngram_decoder.record_accepted(ngram_draft_accepted)
+            active_ngram_decoder.record_accepted(ngram_draft_accepted)
             ngram_recent.append((ngram_draft_accepted, len(draft_tokens)))
             if len(ngram_recent) > ngram_window:
                 ngram_recent.pop(0)
@@ -491,7 +578,7 @@ def generate_ddtree(
                 time.perf_counter_ns() - commit_started
             ) / 1_000.0
         else:
-            ngram_fallback_cycles += 1 if ngram_decoder is not None else 0
+            ngram_fallback_cycles += 1 if active_ngram_decoder is not None else 0
             proposed_count = block_len
             block_token_ids = mx.full(
                 (block_len,),
@@ -542,7 +629,18 @@ def generate_ddtree(
                 tree_aware_linear=True,
                 tree_cache_state=tree_cache_state,
             )
-            posterior_mx = greedy_tokens_with_mask(verify_logits[0], suppress_mask)
+            processed_logits = []
+            for tree_index in range(int(verify_logits.shape[1])):
+                path_indices = _tree_path_indices(tree.child_maps, tree_index)
+                context_tokens = [
+                    *generated_token_ids,
+                    *_tree_token_ids(tree, root_token, path_indices),
+                ]
+                step_logits = verify_logits[:, tree_index, :]
+                step_logits = apply_logits_processors(context_tokens, step_logits)
+                processed_logits.append(step_logits)
+            verify_logits_2d = mx.concatenate(processed_logits, axis=0)
+            posterior_mx = greedy_tokens_with_mask(verify_logits_2d, suppress_mask)
             mx.eval(posterior_mx)
             phase_timings_us["tree_verify"] += (time.perf_counter_ns() - verify_started) / 1_000.0
 
@@ -593,6 +691,9 @@ def generate_ddtree(
         if ngram_decoder is not None and len(accepted_token_ids) > 1:
             for token_id in accepted_token_ids[1:]:
                 ngram_decoder.add_generated_token(token_id)
+        if thinking_ngram_decoder is not None and len(accepted_token_ids) > 1:
+            for token_id in accepted_token_ids[1:]:
+                thinking_ngram_decoder.add_generated_token(token_id)
 
         emitted = accepted_token_ids
         for index, token_id in enumerate(accepted_token_ids):
@@ -609,6 +710,11 @@ def generate_ddtree(
             if emitted and (emit_step_text or check_text_stops)
             else ""
         )
+        if emitted:
+            thinking_probe_text = delta_text if delta_text else tokenizer.decode(emitted)
+            in_thinking_block = _update_thinking_state(
+                in_thinking_block, thinking_probe_text
+            )
 
         if check_text_stops and delta_text:
             probe_text = stop_text_tail + delta_text
@@ -764,7 +870,11 @@ def generate_ddtree(
         "prompt_cache_state": prefill.prefill_state if capture_prefill_state else None,
         "extended_prompt_cache_state": extended_prompt_cache_state,
         "prefix_boundary_state": prefix_boundary_state,
-        "engine": "ddtree-ngram" if ngram_decoder is not None else "ddtree",
+        "engine": (
+            "ddtree-ngram"
+            if ngram_decoder is not None or thinking_ngram_decoder is not None
+            else "ddtree"
+        ),
         "target_turboquant_bits": target_turboquant_bits,
         "ddtree_commit": "tree_aware" if tree_aware_commit else "slow_path",
         "tree_budget": tree_budget,
@@ -775,7 +885,7 @@ def generate_ddtree(
             else 0.0
         ),
         "ddtree_phase_timings_us": phase_timings_us,
-        "ngram_enabled": ngram_decoder is not None,
+        "ngram_enabled": ngram_decoder is not None or thinking_ngram_decoder is not None,
         "ngram_num_draft_tokens": (
             ngram_decoder.num_draft_tokens if ngram_decoder is not None else 0
         ),
@@ -792,4 +902,20 @@ def generate_ddtree(
         "ngram_acceptance_ratio": ngram_acceptance_ratio,
         "ngram_cooldown_remaining": ngram_cooldown_remaining,
         "ngram_disabled_for_request": ngram_disabled_for_request,
+        "thinking_ngram_enabled": thinking_ngram_decoder is not None,
+        "thinking_ngram_num_draft_tokens": (
+            thinking_ngram_decoder.num_draft_tokens
+            if thinking_ngram_decoder is not None
+            else 0
+        ),
+        "thinking_ngram_size": (
+            thinking_ngram_decoder.ngram_size
+            if thinking_ngram_decoder is not None
+            else 0
+        ),
+        "thinking_ngram_min_matches": (
+            thinking_ngram_decoder.min_matches
+            if thinking_ngram_decoder is not None
+            else 0
+        ),
     }

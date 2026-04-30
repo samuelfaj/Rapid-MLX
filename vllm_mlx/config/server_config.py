@@ -65,6 +65,9 @@ class ServerConfig:
     # --- Behavior flags ---
     gc_control: bool = True
     no_thinking: bool = False
+    structured_cot: bool = False
+    structured_cot_tools: bool = False
+    structured_cot_token_budget: int = 256
     pin_system_prompt: bool = False
     pinned_system_prompt_hash: str | None = None
 

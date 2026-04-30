@@ -214,6 +214,9 @@ class DFlashEngine(BatchedEngine):
         ngram_disable_threshold: float | None = None,
         ngram_disable_window: int | None = None,
         ngram_disable_cooldown: int | None = None,
+        thinking_ngram_num_draft_tokens: int | None = None,
+        thinking_ngram_size: int | None = None,
+        thinking_ngram_min_matches: int | None = None,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         trust_remote_code: bool = True,
@@ -254,6 +257,24 @@ class DFlashEngine(BatchedEngine):
         )
         self._ngram_disable_window = max(1, int(ngram_disable_window or 4))
         self._ngram_disable_cooldown = max(0, int(ngram_disable_cooldown or 8))
+        self._thinking_ngram_num_draft_tokens = (
+            max(1, int(thinking_ngram_num_draft_tokens))
+            if thinking_ngram_num_draft_tokens is not None
+            else None
+        )
+        self._thinking_ngram_size = (
+            max(1, int(thinking_ngram_size))
+            if thinking_ngram_size is not None
+            else None
+        )
+        self._thinking_ngram_min_matches = (
+            max(1, int(thinking_ngram_min_matches))
+            if thinking_ngram_min_matches is not None
+            else None
+        )
+        self._thinking_ngram_enabled = (
+            self._thinking_ngram_num_draft_tokens is not None
+        )
 
         self._lock = asyncio.Lock()
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -475,6 +496,7 @@ class DFlashEngine(BatchedEngine):
         on_step: Any = None,
         should_stop: Any = None,
         emit_step_text: bool = False,
+        logits_processors: list[Any] | None = None,
     ) -> dict[str, Any]:
         from ..speculative.ddtree.engine import generate_ddtree, tokenize_prompt
 
@@ -519,6 +541,10 @@ class DFlashEngine(BatchedEngine):
             ngram_disable_cooldown=(
                 self._ngram_disable_cooldown if self._ngram_first_enabled else None
             ),
+            thinking_ngram_num_draft_tokens=self._thinking_ngram_num_draft_tokens,
+            thinking_ngram_size=self._thinking_ngram_size,
+            thinking_ngram_min_matches=self._thinking_ngram_min_matches,
+            logits_processors=logits_processors,
             should_stop=should_stop,
             on_step=on_step,
             emit_step_text=emit_step_text,
@@ -548,6 +574,7 @@ class DFlashEngine(BatchedEngine):
         stop: list[str] | None,
         tools_requested: bool,
         prefix_boundary: int = 0,
+        logits_processor_factories: list[Any] | None = None,
     ):
         """Run the Rapid-MLX DDTree loop on the DFlash MLX worker thread."""
         if temperature not in (0, 0.0) or top_p not in (0, 0.0, 1, 1.0):
@@ -564,7 +591,19 @@ class DFlashEngine(BatchedEngine):
         queue: asyncio.Queue[Any] = asyncio.Queue()
         sentinel = object()
 
+        def _make_processors() -> list[Any]:
+            processors = []
+            for factory in logits_processor_factories or ():
+                processor = factory()
+                if processor is not None:
+                    if hasattr(processor, "prompt_token_count"):
+                        processor.prompt_token_count = 0
+                    processors.append(processor)
+            return processors
+
         def _run():
+            logits_processors = _make_processors()
+
             def _on_step(step: dict[str, Any]) -> None:
                 loop.call_soon_threadsafe(queue.put_nowait, step)
 
@@ -578,6 +617,7 @@ class DFlashEngine(BatchedEngine):
                     on_step=_on_step,
                     should_stop=stop_event.is_set,
                     emit_step_text=True,
+                    logits_processors=logits_processors,
                 )
                 loop.call_soon_threadsafe(queue.put_nowait, result)
             finally:
@@ -633,6 +673,19 @@ class DFlashEngine(BatchedEngine):
             stop_event.set()
             raise
 
+    def _make_ddtree_logits_processors(
+        self, logits_processor_factories: list[Any] | None
+    ) -> list[Any]:
+        processors = []
+        for factory in logits_processor_factories or ():
+            processor = factory()
+            if processor is None:
+                continue
+            if hasattr(processor, "prompt_token_count"):
+                processor.prompt_token_count = 0
+            processors.append(processor)
+        return processors
+
     async def generate(
         self,
         prompt: str,
@@ -656,9 +709,12 @@ class DFlashEngine(BatchedEngine):
                 async with self._lock:
                     tools_requested = bool(kwargs.pop("tools_requested", False))
                     prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                    logits_processor_factories = kwargs.pop(
+                        "logits_processor_factories", None
+                    )
                     mode = (
                         "ddtree-ngram"
-                        if self._ngram_first_enabled
+                        if self._ngram_first_enabled or self._thinking_ngram_enabled
                         else "ddtree"
                     )
                     self._track_request_start(mode)
@@ -675,6 +731,9 @@ class DFlashEngine(BatchedEngine):
                                 tools_requested=tools_requested,
                                 prefix_boundary=prefix_boundary,
                                 emit_step_text=False,
+                                logits_processors=self._make_ddtree_logits_processors(
+                                    logits_processor_factories
+                                ),
                             ),
                         )
                         resp = SimpleNamespace(
@@ -767,6 +826,9 @@ class DFlashEngine(BatchedEngine):
             async with self._lock:
                 tools_requested = bool(kwargs.pop("tools_requested", False))
                 prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                logits_processor_factories = kwargs.pop(
+                    "logits_processor_factories", None
+                )
                 greedy_request = temperature in (0, 0.0)
                 if self._ddtree_budget > 0 and not greedy_request:
                     logger.warning(
@@ -776,13 +838,22 @@ class DFlashEngine(BatchedEngine):
                     )
                 mode = (
                     "ddtree-ngram"
-                    if self._ngram_first_enabled and greedy_request
+                    if (
+                        (self._ngram_first_enabled or self._thinking_ngram_enabled)
+                        and greedy_request
+                    )
                     else (
                         "ddtree"
                         if self._ddtree_budget > 0 and greedy_request
                         else "dflash"
                     )
                 )
+                if logits_processor_factories and mode == "dflash":
+                    raise RuntimeError(
+                        "Structured CoT logits masking requires greedy DDTree mode "
+                        "when using DFlash. Set --dflash-ddtree-budget and "
+                        "--default-temperature 0, or disable --structured-cot."
+                    )
                 self._track_request_start(mode)
                 cumulative = ""
                 last_resp = None
@@ -801,6 +872,7 @@ class DFlashEngine(BatchedEngine):
                             stop,
                             tools_requested,
                             prefix_boundary,
+                            logits_processor_factories,
                         )
                     else:
                         response_stream = stream(prompt, max_tokens, temperature, top_p)
@@ -988,7 +1060,7 @@ class DFlashEngine(BatchedEngine):
             "dflash": {
                 "mode": (
                     "ddtree-ngram"
-                    if self._ngram_first_enabled
+                    if self._ngram_first_enabled or self._thinking_ngram_enabled
                     else ("ddtree" if self._ddtree_budget > 0 else "dflash")
                 ),
                 "lifetime_acceptance_ratio": lifetime_ratio,
@@ -1017,6 +1089,14 @@ class DFlashEngine(BatchedEngine):
                 "ngram_disable_threshold": self._ngram_disable_threshold,
                 "ngram_disable_window": self._ngram_disable_window,
                 "ngram_disable_cooldown": self._ngram_disable_cooldown,
+                "thinking_ngram_enabled": self._thinking_ngram_enabled,
+                "thinking_ngram_num_draft_tokens": (
+                    self._thinking_ngram_num_draft_tokens or 0
+                ),
+                "thinking_ngram_size": self._thinking_ngram_size or 0,
+                "thinking_ngram_min_matches": (
+                    self._thinking_ngram_min_matches or 0
+                ),
                 "ngram_last_acceptance_ratio": self._ddtree_last.get(
                     "ngram_acceptance_ratio", 0.0
                 ),

@@ -168,6 +168,8 @@ class BatchedEngine(BaseEngine):
         self._gpu_memory_utilization = gpu_memory_utilization
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._tool_logits_processor_factory = None
+        self._structured_cot_enabled = False
+        self._structured_cot_token_budget = 256
 
         self._model = None
         self._processor = None  # For MLLM
@@ -511,10 +513,12 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             stop=stop or [],
         )
+        logits_processor_factories = kwargs.pop("logits_processor_factories", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            logits_processor_factories=logits_processor_factories,
         )
 
         text = clean_output_text(output.output_text)
@@ -590,12 +594,14 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             stop=stop or [],
         )
+        logits_processor_factories = kwargs.pop("logits_processor_factories", None)
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            logits_processor_factories=logits_processor_factories,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -654,6 +660,13 @@ class BatchedEngine(BaseEngine):
 
         # Extract enable_thinking before passing kwargs downstream
         enable_thinking = kwargs.pop("enable_thinking", None)
+        structured_cot = bool(kwargs.pop("structured_cot", False))
+        structured_cot_token_budget = int(
+            kwargs.pop(
+                "structured_cot_token_budget",
+                self._structured_cot_token_budget,
+            )
+        )
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -674,6 +687,15 @@ class BatchedEngine(BaseEngine):
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
             tools_requested=bool(tools),
+            logits_processor_factories=(
+                [
+                    self._make_structured_cot_factory(
+                        prompt, structured_cot_token_budget
+                    )
+                ]
+                if structured_cot
+                else None
+            ),
             **kwargs,
         )
 
@@ -770,6 +792,13 @@ class BatchedEngine(BaseEngine):
 
         # Extract enable_thinking before passing kwargs downstream
         enable_thinking = kwargs.pop("enable_thinking", None)
+        structured_cot = bool(kwargs.pop("structured_cot", False))
+        structured_cot_token_budget = int(
+            kwargs.pop(
+                "structured_cot_token_budget",
+                self._structured_cot_token_budget,
+            )
+        )
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -787,6 +816,10 @@ class BatchedEngine(BaseEngine):
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
         kwargs["tools_requested"] = bool(tools)
+        if structured_cot:
+            kwargs["logits_processor_factories"] = [
+                self._make_structured_cot_factory(prompt, structured_cot_token_budget)
+            ]
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -798,6 +831,23 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         ):
             yield output
+
+    def _make_structured_cot_factory(self, prompt: str, token_budget: int):
+        def factory():
+            from ..api.structured_cot import create_structured_cot_logits_processor
+
+            try:
+                prompt_token_count = len(self.tokenizer.encode(prompt))
+            except Exception:
+                prompt_token_count = 0
+            return create_structured_cot_logits_processor(
+                self.tokenizer,
+                prompt=prompt,
+                token_budget=token_budget,
+                prompt_token_count=prompt_token_count,
+            )
+
+        return factory
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

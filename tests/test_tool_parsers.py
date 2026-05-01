@@ -16,6 +16,7 @@ from vllm_mlx.tool_parsers import (
     LlamaToolParser,
     MistralToolParser,
     NemotronToolParser,
+    Qwen3CoderToolParser,
     QwenToolParser,
     ToolParserManager,
     xLAMToolParser,
@@ -40,6 +41,8 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "qwen3_coder_xml",
+            "qwen3_xml",
         ]
         for p in expected:
             assert p in parsers, f"Parser '{p}' not found"
@@ -69,6 +72,8 @@ class TestToolParserManager:
             ("meetkai", FunctionaryToolParser),
             ("hermes", HermesToolParser),
             ("nous", HermesToolParser),
+            ("qwen3_coder_xml", Qwen3CoderToolParser),
+            ("qwen3_xml", Qwen3CoderToolParser),
         ]
         for name, expected_cls in test_cases:
             parser_cls = ToolParserManager.get_tool_parser(name)
@@ -93,6 +98,8 @@ class TestToolParserManager:
             "nemotron",
             "xlam",
             "functionary",
+            "qwen3_coder_xml",
+            "qwen3_xml",
         ]:
             parser_cls = ToolParserManager.get_tool_parser(name)
             parser = parser_cls()  # Should not raise
@@ -192,6 +199,47 @@ class TestQwenToolParser:
         result = parser.extract_tool_calls(text)
 
         assert not result.tools_called
+
+
+class TestQwen3CoderToolParser:
+    @pytest.fixture
+    def parser(self):
+        return Qwen3CoderToolParser()
+
+    def test_parameter_xml_format_from_pi(self, parser):
+        text = """I'll inspect the directory.
+
+<tool_call>
+<function=bash>
+<parameter=command>
+ls -la
+</parameter>
+</function>
+</tool_call>"""
+
+        result = parser.extract_tool_calls(
+            text,
+            {
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"command": {"type": "string"}},
+                            },
+                        },
+                    }
+                ]
+            },
+        )
+
+        assert result.tools_called
+        assert result.content == "I'll inspect the directory.\n\n"
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "bash"
+        assert json.loads(result.tool_calls[0]["arguments"]) == {"command": "ls -la"}
 
 
 class TestGenericToolCallParsing:

@@ -191,6 +191,7 @@ _no_thinking: bool = (
 )
 _structured_cot: bool = False
 _structured_cot_tools: bool = False
+_agentic_guard: bool = False
 _structured_cot_token_budget: int = 256
 
 # Pinned prefix cache (Tier 0 optimization)
@@ -472,6 +473,7 @@ def load_model(
     dflash_thinking_ngram_min_matches: int | None = None,
     structured_cot: bool = False,
     structured_cot_tools: bool = False,
+    agentic_guard: bool = False,
     structured_cot_token_budget: int = 256,
 ):
     """
@@ -496,6 +498,7 @@ def load_model(
         _cloud_router, \
         _structured_cot, \
         _structured_cot_tools, \
+        _agentic_guard, \
         _structured_cot_token_budget
 
     _default_max_tokens = max_tokens
@@ -504,6 +507,7 @@ def load_model(
     _tool_parser_instance = None
     _structured_cot = bool(structured_cot)
     _structured_cot_tools = bool(structured_cot_tools)
+    _agentic_guard = bool(agentic_guard)
     _structured_cot_token_budget = int(structured_cot_token_budget)
 
     # Initialize cloud router if --cloud-model is set
@@ -706,6 +710,7 @@ def _sync_config() -> None:
     cfg.no_thinking = _no_thinking
     cfg.structured_cot = _structured_cot
     cfg.structured_cot_tools = _structured_cot_tools
+    cfg.agentic_guard = _agentic_guard
     cfg.structured_cot_token_budget = _structured_cot_token_budget
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
@@ -906,6 +911,12 @@ Examples:
         help="Enable structured CoT when tool calling is active.",
     )
     parser.add_argument(
+        "--agentic-guard",
+        action="store_true",
+        default=False,
+        help="Enable benchmark-specific agentic repair guard for tool workflows.",
+    )
+    parser.add_argument(
         "--structured-cot-token-budget",
         type=int,
         default=256,
@@ -1081,6 +1092,7 @@ Examples:
         cloud_api_key=args.cloud_api_key,
         structured_cot=args.structured_cot,
         structured_cot_tools=args.structured_cot_tools,
+        agentic_guard=args.agentic_guard,
         structured_cot_token_budget=args.structured_cot_token_budget,
     )
 

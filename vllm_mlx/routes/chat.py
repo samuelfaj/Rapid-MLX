@@ -1362,7 +1362,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             "'We should respond...' or 'Let me think...'. Be concise."
         )
     agentic_verification_required = bool(
-        cfg.structured_cot_tools
+        cfg.agentic_guard
         and request.tools
         and _agentic_completion_needs_verification(messages)
     )
@@ -1966,7 +1966,7 @@ async def stream_chat_completion(
             return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
         agentic_stream_guard = (
-            cfg.structured_cot_tools
+            cfg.agentic_guard
             and bool(request.tools)
             and _agentic_completion_needs_verification(messages)
             and not _agentic_verification_present(messages)

@@ -622,6 +622,125 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_structured_cot_tools_does_not_enable_agentic_guard(monkeypatch):
+    """Structured CoT for tools should not force agentic retries by itself."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    get_config().structured_cot_tools = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Build a React TypeScript Tailwind app and run npm test."
+                        ),
+                    }
+                ],
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 1
+    assert any("Thinking only." in chunk for chunk in chunks)
+    assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_agentic_guard_retries_auto_text_for_agentic_prompt(monkeypatch):
+    """Agentic repair retries remain available when explicitly enabled."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    cfg = get_config()
+    cfg.structured_cot_tools = True
+    cfg.agentic_guard = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Build a React TypeScript Tailwind app and run npm test."
+                        ),
+                    }
+                ],
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert engine.messages_seen[1][-1]["content"] == _TOOL_CALL_REQUIRED_RETRY_PROMPT
+    assert not any("Thinking only." in chunk for chunk in chunks)
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
 async def test_structured_cot_tools_retries_auto_text_after_tool_result(monkeypatch):
     """Agentic structured-COT mode keeps tool continuation moving for auto tools."""
     from vllm_mlx.config import get_config, reset_config

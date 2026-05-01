@@ -25,6 +25,8 @@ class TestServerConfig:
         assert cfg.api_key is None
         assert cfg.gc_control is True
         assert cfg.enable_auto_tool_choice is False
+        assert cfg.structured_cot_tools is False
+        assert cfg.agentic_guard is False
 
     def test_get_config_singleton(self):
         """get_config returns the same instance."""

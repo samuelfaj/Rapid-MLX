@@ -89,6 +89,16 @@ def _check_disk_space(model_name: str) -> None:
         pass  # Non-critical — don't block startup on check failure
 
 
+def _finalize_tool_call_args(args) -> None:
+    if getattr(args, "tool_call_parser", None):
+        args.enable_auto_tool_choice = True
+        return
+    if getattr(args, "enable_auto_tool_choice", False):
+        print("Error: --enable-auto-tool-choice requires --tool-call-parser")
+        print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
+        sys.exit(1)
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -104,12 +114,6 @@ def serve_command(args):
 
     logger = logging.getLogger(__name__)
     uvicorn_log_level = server.configure_logging(args.log_level)
-
-    # Validate tool calling arguments
-    if args.enable_auto_tool_choice and not args.tool_call_parser:
-        print("Error: --enable-auto-tool-choice requires --tool-call-parser")
-        print("Example: --enable-auto-tool-choice --tool-call-parser mistral")
-        sys.exit(1)
 
     # Validate gpu-memory-utilization range
     if not (0.0 < args.gpu_memory_utilization <= 1.0):
@@ -151,6 +155,8 @@ def serve_command(args):
                     )
         except Exception as e:
             logger.debug(f"Auto-detection failed (non-fatal): {e}")
+
+    _finalize_tool_call_args(args)
 
     # Pass alias info to server (for /v1/models)
     server._model_alias = getattr(args, "_original_alias", None)
@@ -415,6 +421,7 @@ def serve_command(args):
             ),
             structured_cot=getattr(args, "structured_cot", False),
             structured_cot_tools=getattr(args, "structured_cot_tools", False),
+            agentic_guard=getattr(args, "agentic_guard", False),
             structured_cot_token_budget=getattr(
                 args, "structured_cot_token_budget", 256
             ),
@@ -1406,6 +1413,12 @@ Examples:
         action="store_true",
         default=False,
         help="Enable structured CoT only for tool-calling requests.",
+    )
+    serve_parser.add_argument(
+        "--agentic-guard",
+        action="store_true",
+        default=False,
+        help="Enable benchmark-specific agentic repair guard for tool workflows.",
     )
     serve_parser.add_argument(
         "--structured-cot-token-budget",

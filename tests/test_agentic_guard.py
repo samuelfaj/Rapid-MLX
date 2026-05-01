@@ -1,20 +1,10 @@
 import asyncio
-import json
 
 from vllm_mlx.routes.chat import _iterate_with_idle_timeout
 from vllm_mlx.routes.chat import (
-    _AGENTIC_VERIFICATION_MARKER,
     _agentic_completion_needs_verification,
-    _agentic_should_force_verification,
     _agentic_failed_validation_present,
-    _agentic_forced_missing_tests_tool_call,
-    _agentic_forced_package_repair_tool_call,
-    _agentic_forced_snake_scaffold_tool_call,
-    _agentic_forced_verification_tool_call,
-    _agentic_missing_tests_present,
-    _agentic_missing_test_write_path,
-    _agentic_should_force_package_repair,
-    _agentic_should_force_snake_scaffold,
+    _agentic_requested_artifacts_missing,
     _agentic_verification_present,
 )
 from vllm_mlx.service.helpers import _disconnect_guard
@@ -25,10 +15,7 @@ def test_agentic_verification_ignores_system_prompt_evidence():
         [
             {
                 "role": "system",
-                "content": (
-                    "Run npm test, npm run build, and npm run lint. "
-                    f"Echo {_AGENTIC_VERIFICATION_MARKER}."
-                ),
+                "content": "Run the requested validation and report success.",
             }
         ]
     )
@@ -39,13 +26,13 @@ def test_agentic_verification_accepts_marker_from_tool_context():
         [
             {
                 "role": "tool",
-                "content": f"All checks passed\n{_AGENTIC_VERIFICATION_MARKER}",
+                "content": "All checks passed",
             }
         ]
     )
 
 
-def test_agentic_verification_rejects_marker_from_tool_call_arguments():
+def test_agentic_verification_rejects_success_from_tool_call_arguments():
     assert not _agentic_verification_present(
         [
             {
@@ -54,15 +41,333 @@ def test_agentic_verification_rejects_marker_from_tool_call_arguments():
                     {
                         "function": {
                             "name": "bash",
-                            "arguments": (
-                                f'{{"command": "echo {_AGENTIC_VERIFICATION_MARKER}"}}'
-                            ),
+                            "arguments": '{"command": "echo all checks passed"}',
                         }
                     }
                 ],
             }
         ]
     )
+
+
+def test_agentic_verification_rejects_plain_command_success_exit_code():
+    assert not _agentic_verification_present(
+        [
+            {
+                "role": "tool",
+                "content": "bun add completed\nCommand exited with code 0",
+            }
+        ]
+    )
+
+
+def test_agentic_verification_accepts_successful_validation_command():
+    assert _agentic_verification_present(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun run test 2>&1 | tail -20"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "Command exited with code 0",
+            },
+        ]
+    )
+
+
+def test_agentic_verification_accepts_runner_zero_fail_summary():
+    assert _agentic_verification_present(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun test"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "17 pass\n0 fail",
+            },
+        ]
+    )
+
+
+def test_agentic_verification_rejects_success_before_later_failed_validation():
+    assert not _agentic_verification_present(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun test"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "17 pass\n0 fail",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun test"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "23 pass\n9 fail",
+            },
+        ]
+    )
+
+
+def test_agentic_verification_accepts_success_after_earlier_failed_validation():
+    assert _agentic_verification_present(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun test"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "23 pass\n9 fail",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "cd app && bun test"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "32 pass\n0 fail",
+            },
+        ]
+    )
+
+
+def test_agentic_verification_rejects_zero_fail_without_validation_command():
+    assert not _agentic_verification_present(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command": "echo 0 fail"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "0 fail",
+            },
+        ]
+    )
+
+
+def test_agentic_requested_artifacts_missing_detects_named_categories():
+    missing = _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": "Create models, seeders, migrations, and unit tests.",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/models/User.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/scripts/seed.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "test/UserService.test.ts"}',
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert missing == {"migration"}
+
+
+def test_agentic_requested_artifacts_missing_accepts_all_named_categories():
+    assert not _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": "Create seeders and migrations.",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/seeders/user.seed.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/migrations/001-init.ts"}',
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+
+
+def test_agentic_requested_artifacts_missing_detects_vertical_slice_and_rest_api():
+    assert _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": "Create a REST api that is vertical sliced.",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/models/User.ts"}',
+                        }
+                    }
+                ],
+            },
+        ]
+    ) == {"route", "vertical_slice"}
+
+    assert not _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": "Create a REST api that is vertical sliced.",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/modules/users/routes/user.routes.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+
+
+def test_agentic_requested_artifacts_missing_requires_tests_for_each_service():
+    missing = _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": "Create services and unit tests for each service.",
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/services/UserService.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/services/ProductService.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "test/UserService.test.ts"}',
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert missing == {"test"}
 
 
 def test_agentic_detection_reads_tool_transcript_when_original_user_pruned():
@@ -74,12 +379,12 @@ def test_agentic_detection_reads_tool_transcript_when_original_user_pruned():
                     {
                         "function": {
                             "name": "bash",
-                            "arguments": '{"command": "npm test && npm run build"}',
+                            "arguments": '{"command": "validate project"}',
                         }
                     }
                 ],
             },
-            {"role": "tool", "content": "No test files found"},
+            {"role": "tool", "content": "Validation still needed"},
         ]
     )
 
@@ -89,7 +394,7 @@ def test_agentic_failed_validation_detects_failed_npm_output():
         [
             {
                 "role": "tool",
-                "content": "Ran `npm test`\nCannot find module './GameBoard'\nCommand exited with code 1",
+                "content": "Ran validation\nCannot find module './component'\nCommand exited with code 1",
             }
         ]
     )
@@ -104,17 +409,17 @@ def test_agentic_failed_validation_reads_tool_call_arguments():
                     {
                         "function": {
                             "name": "bash",
-                            "arguments": '{"command": "npm test && npm run build"}',
+                            "arguments": '{"command": "validate project"}',
                         }
                     }
                 ],
             },
-            {"role": "tool", "content": "Test Files 1 failed"},
+            {"role": "tool", "content": "Validation failed"},
         ]
     )
 
 
-def test_agentic_failed_validation_detects_explicit_verifier_failure():
+def test_agentic_failed_validation_detects_explicit_failure():
     assert _agentic_failed_validation_present(
         [
             {
@@ -123,19 +428,17 @@ def test_agentic_failed_validation_detects_explicit_verifier_failure():
                     {
                         "function": {
                             "name": "bash",
-                            "arguments": (
-                                '{"command": "npm test && npm run build && npm run lint"}'
-                            ),
+                            "arguments": '{"command": "validate project"}',
                         }
                     }
                 ],
             },
-            {"role": "tool", "content": "VALIDATION_FAILED: npm test exited with code 1"},
+            {"role": "tool", "content": "VALIDATION_FAILED: exited with code 1"},
         ]
     )
 
 
-def test_agentic_failed_validation_detects_missing_tests():
+def test_agentic_failed_validation_detects_missing_requested_tests():
     assert _agentic_failed_validation_present(
         [
             {
@@ -144,9 +447,7 @@ def test_agentic_failed_validation_detects_missing_tests():
                     {
                         "function": {
                             "name": "bash",
-                            "arguments": (
-                                '{"command": "npm test && npm run build && npm run lint"}'
-                            ),
+                            "arguments": '{"command": "run tests"}',
                         }
                     }
                 ],
@@ -156,194 +457,38 @@ def test_agentic_failed_validation_detects_missing_tests():
     )
 
 
-def test_agentic_failed_validation_detects_no_package_without_npm_evidence():
+def test_agentic_failed_validation_detects_bun_no_tests_found():
     assert _agentic_failed_validation_present(
         [
             {
                 "role": "tool",
-                "content": "VALIDATION_FAILED: No package.json found",
+                "content": (
+                    'No tests found. Tests need ".test", "_test_", ".spec" '
+                    'or "_spec_" in the filename.'
+                ),
             }
         ]
     )
 
 
-def test_agentic_failed_validation_detects_missing_test_script_without_npm_evidence():
+def test_agentic_failed_validation_detects_explicit_validation_failure():
     assert _agentic_failed_validation_present(
         [
             {
                 "role": "tool",
-                "content": "npm error Missing script: \"test\"",
+                "content": "VALIDATION_FAILED: project is not complete",
             }
         ]
     )
 
 
-def test_agentic_failed_validation_detects_verifier_requested_without_output():
+def test_agentic_failed_validation_detects_missing_test_script():
     assert _agentic_failed_validation_present(
         [
             {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "function": {
-                            "name": "bash",
-                            "arguments": (
-                                f'{{"command": "echo {_AGENTIC_VERIFICATION_MARKER}"}}'
-                            ),
-                        }
-                    }
-                ],
-            },
-            {"role": "tool", "content": ""},
-        ]
-    )
-
-
-def test_agentic_missing_test_write_path_uses_reported_project():
-    assert (
-        _agentic_missing_test_write_path(
-            [
-                {
-                    "role": "tool",
-                    "content": (
-                        "VALIDATION_FAILED: No test files found under "
-                        "snake-game/src/features/snake."
-                    ),
-                }
-            ]
-        )
-        == "snake-game/src/features/snake/snake.test.ts"
-    )
-
-
-def test_agentic_forced_missing_tests_tool_call_uses_write():
-    tool_calls = _agentic_forced_missing_tests_tool_call(
-        [{"type": "function", "function": {"name": "write"}}],
-        [{"role": "tool", "content": "No test files found"}],
-    )
-
-    assert tool_calls is not None
-    assert tool_calls[0].function.name == "write"
-    args = json.loads(tool_calls[0].function.arguments)
-    assert args["path"] == "src/features/snake/snake.test.ts"
-    assert "vitest" in args["content"]
-    assert "snake movement" in args["content"]
-
-
-def test_agentic_forced_package_repair_tool_call_adds_vitest_test_script():
-    tool_calls = _agentic_forced_package_repair_tool_call(
-        [{"type": "function", "function": {"name": "bash"}}],
-        [{"role": "tool", "content": "npm error Missing script: \"test\""}],
-    )
-
-    assert tool_calls is not None
-    assert tool_calls[0].function.name == "bash"
-    args = json.loads(tool_calls[0].function.arguments)
-    assert "pkg.scripts.test = \"vitest run\"" in args["command"]
-    assert "pkg.devDependencies.vitest" in args["command"]
-    assert "npm install" in args["command"]
-
-
-def test_agentic_forced_snake_scaffold_tool_call_uses_bash():
-    tool_calls = _agentic_forced_snake_scaffold_tool_call(
-        [{"type": "function", "function": {"name": "bash"}}],
-        [{"role": "tool", "content": "No test files found"}],
-    )
-
-    assert tool_calls is not None
-    assert tool_calls[0].function.name == "bash"
-    args = json.loads(tool_calls[0].function.arguments)
-    assert "src/features/snake/snake.ts" in args["command"]
-    assert "src/features/snake/snake.test.ts" in args["command"]
-    assert "src/features/snake/SnakeGame.tsx" in args["command"]
-    assert "vite.config.ts" in args["command"]
-    assert "RAPID_MLX_AGENTIC_SNAKE_SCAFFOLD_DONE" in args["command"]
-
-
-def test_agentic_snake_scaffold_runs_after_package_repair():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append(
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "bash",
-                        "arguments": '{"command": "echo RAPID_MLX_AGENTIC_PACKAGE_REPAIR_DONE"}',
-                    }
-                }
-            ],
-        }
-    )
-
-    assert _agentic_should_force_snake_scaffold(messages)
-
-
-def test_agentic_snake_scaffold_not_repeated_after_requested():
-    messages = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "bash",
-                        "arguments": '{"command": "echo RAPID_MLX_AGENTIC_SNAKE_SCAFFOLD_DONE"}',
-                    }
-                }
-            ],
-        },
-        {"role": "tool", "content": ""},
-    ]
-
-    assert not _agentic_should_force_snake_scaffold(messages)
-
-
-def test_agentic_package_repair_not_repeated_after_requested():
-    messages = [
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "bash",
-                        "arguments": '{"command": "echo RAPID_MLX_AGENTIC_PACKAGE_REPAIR_DONE"}',
-                    }
-                }
-            ],
-        },
-        {"role": "tool", "content": ""},
-    ]
-
-    assert not _agentic_should_force_package_repair(messages)
-
-
-def test_agentic_missing_tests_stops_after_successful_test_write():
-    assert not _agentic_missing_tests_present(
-        [
-            {"role": "tool", "content": "No test files found"},
-            {
                 "role": "tool",
-                "content": (
-                    "Successfully wrote 800 bytes to "
-                    "snake-game/src/features/snake/snake.test.ts"
-                ),
-            },
-        ]
-    )
-
-
-def test_agentic_missing_tests_returns_when_validation_still_fails_later():
-    assert _agentic_missing_tests_present(
-        [
-            {"role": "tool", "content": "No test files found"},
-            {
-                "role": "tool",
-                "content": (
-                    "Successfully wrote 800 bytes to "
-                    "snake-game/src/features/snake/snake.test.ts"
-                ),
-            },
-            {"role": "tool", "content": "No test files found"},
+                "content": "Missing script: \"test\"",
+            }
         ]
     )
 
@@ -353,7 +498,7 @@ def test_agentic_failed_validation_ignores_failures_before_latest_write():
         [
             {
                 "role": "tool",
-                "content": "npm test\nnpm run build\nnpm run lint failed",
+                "content": "validation failed",
             },
             {
                 "role": "tool",
@@ -361,78 +506,46 @@ def test_agentic_failed_validation_ignores_failures_before_latest_write():
             },
             {
                 "role": "tool",
-                "content": "npm test\nnpm run build\nnpm run lint passed",
+                "content": "validation passed",
             },
         ]
     )
 
 
-def test_agentic_forced_verification_tool_call_uses_bash():
-    tool_calls = _agentic_forced_verification_tool_call(
-        [{"type": "function", "function": {"name": "bash"}}]
+def test_agentic_failed_validation_persists_after_write_until_validation_passes():
+    assert _agentic_failed_validation_present(
+        [
+            {
+                "role": "tool",
+                "content": "VALIDATION_FAILED: no test files found",
+            },
+            {
+                "role": "tool",
+                "content": "Successfully wrote 20 bytes to src/main.ts",
+            },
+        ]
     )
 
-    assert tool_calls is not None
-    assert tool_calls[0].function.name == "bash"
-    args = json.loads(tool_calls[0].function.arguments)
-    assert "npm test" in args["command"]
-    assert "npm run build" in args["command"]
-    assert "npm run lint" in args["command"]
-    assert "VALIDATION_FAILED" in args["command"]
-    assert _AGENTIC_VERIFICATION_MARKER in args["command"]
+
+def test_agentic_failed_validation_persists_after_plain_success_exit_code():
+    assert _agentic_failed_validation_present(
+        [
+            {
+                "role": "tool",
+                "content": "VALIDATION_FAILED: no tests found",
+            },
+            {
+                "role": "tool",
+                "content": "Command exited with code 0",
+            },
+        ]
+    )
 
 
 def test_agentic_force_verification_after_tool_results_without_validation():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    assert _agentic_should_force_verification(messages)
-
-
-def test_agentic_force_verification_waits_on_explicit_failure_without_validation():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append({"role": "tool", "content": "No package.json found"})
-    assert not _agentic_should_force_verification(messages)
-
-
-def test_agentic_force_verification_runs_marker_verifier_after_validation_passes():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append(
-        {"role": "tool", "content": "npm test\nnpm run build\nnpm run lint passed"}
+    assert _agentic_completion_needs_verification(
+        [{"role": "user", "content": "build the project and validate it"}]
     )
-    assert _agentic_should_force_verification(messages)
-
-
-def test_agentic_force_verification_waits_when_latest_validation_failed():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append(
-        {"role": "tool", "content": "npm test\nnpm run build\nnpm run lint failed"}
-    )
-    assert not _agentic_should_force_verification(messages)
-
-
-def test_agentic_force_verification_requires_all_validation_commands():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append({"role": "tool", "content": "npm run build\nnpm run lint passed"})
-    assert _agentic_should_force_verification(messages)
-
-
-def test_agentic_force_verification_waits_when_tool_call_runs_full_validation():
-    messages = [{"role": "tool", "content": "wrote file"} for _ in range(8)]
-    messages.append(
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "bash",
-                        "arguments": (
-                            '{"command": "npm test && npm run build && npm run lint"}'
-                        ),
-                    }
-                }
-            ],
-        }
-    )
-    assert _agentic_should_force_verification(messages)
 
 
 def test_stream_idle_timeout_does_not_wait_forever_on_close():

@@ -206,7 +206,27 @@ class TestQwen3CoderToolParser:
     def parser(self):
         return Qwen3CoderToolParser()
 
-    def test_parameter_xml_format_from_pi(self, parser):
+    @pytest.fixture
+    def bash_tool_request(self):
+        return {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string"},
+                                "timeout": {"type": "number"},
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+
+    def test_parameter_xml_format_from_pi(self, parser, bash_tool_request):
         text = """I'll inspect the directory.
 
 <tool_call>
@@ -217,29 +237,47 @@ ls -la
 </function>
 </tool_call>"""
 
-        result = parser.extract_tool_calls(
-            text,
-            {
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "bash",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"command": {"type": "string"}},
-                            },
-                        },
-                    }
-                ]
-            },
-        )
+        result = parser.extract_tool_calls(text, bash_tool_request)
 
         assert result.tools_called
         assert result.content == "I'll inspect the directory.\n\n"
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "bash"
-        assert json.loads(result.tool_calls[0]["arguments"]) == {"command": "ls -la"}
+        assert json.loads(result.tool_calls[0]["arguments"]) == {
+            "command": "ls -la",
+            "timeout": 120,
+        }
+
+    def test_streaming_bash_tool_adds_default_timeout(self, parser, bash_tool_request):
+        chunks = [
+            "<tool_call>\n<function=bash>\n",
+            "<parameter=command>\nbun add slow-package\n</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        current = ""
+        events = []
+        for chunk in chunks:
+            previous = current
+            current += chunk
+            event = parser.extract_tool_calls_streaming(
+                previous,
+                current,
+                chunk,
+                request=bash_tool_request,
+            )
+            if event:
+                events.append(event)
+
+        argument_fragments = [
+            event["tool_calls"][0]["function"]["arguments"]
+            for event in events
+            if event.get("tool_calls")
+            and "arguments" in event["tool_calls"][0].get("function", {})
+        ]
+        assert "".join(argument_fragments) == (
+            '{"command": "bun add slow-package", "timeout": 120}'
+        )
 
 
 class TestGenericToolCallParsing:

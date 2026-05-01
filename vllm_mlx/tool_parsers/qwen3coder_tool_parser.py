@@ -29,6 +29,8 @@ from .abstract_tool_parser import (
 )
 
 logger = logging.getLogger(__name__)
+_DEFAULT_SHELL_TOOL_TIMEOUT_SECONDS = 120
+_SHELL_TOOL_NAMES = {"bash", "shell", "exec", "run_command"}
 
 
 def _generate_tool_id() -> str:
@@ -51,6 +53,14 @@ def _get_arguments_config(func_name: str, tools: list[dict] | None) -> dict:
                 return params
             return {}
     return {}
+
+
+def _should_add_default_timeout(func_name: str, param_config: dict, args: dict) -> bool:
+    return (
+        func_name in _SHELL_TOOL_NAMES
+        and "timeout" in param_config
+        and "timeout" not in args
+    )
 
 
 def _decode_json_like(value: Any) -> Any:
@@ -233,6 +243,8 @@ class Qwen3CoderToolParser(ToolParser):
             param_dict[p_name] = _convert_param_value(
                 p_value, p_name, param_config, function_name
             )
+        if _should_add_default_timeout(function_name, param_config, param_dict):
+            param_dict["timeout"] = _DEFAULT_SHELL_TOOL_TIMEOUT_SECONDS
         return {
             "id": _generate_tool_id(),
             "name": function_name,
@@ -509,8 +521,6 @@ class Qwen3CoderToolParser(ToolParser):
                 if pv.endswith("\n"):
                     pv = pv[:-1]
 
-                self.accumulated_params[current_param_name] = pv
-
                 # Type conversion
                 tools = None
                 if self._streaming_request:
@@ -528,6 +538,7 @@ class Qwen3CoderToolParser(ToolParser):
                     param_config,
                     self.current_function_name or "",
                 )
+                self.accumulated_params[current_param_name] = converted
                 serialized = json.dumps(converted, ensure_ascii=False)
 
                 if self.param_count == 0:
@@ -578,12 +589,27 @@ class Qwen3CoderToolParser(ToolParser):
                         pass
 
                 self.in_function = False
+                final_arguments = "}"
+                param_config = _get_arguments_config(
+                    self.current_function_name or "",
+                    tools,
+                )
+                if _should_add_default_timeout(
+                    self.current_function_name or "",
+                    param_config,
+                    self.accumulated_params,
+                ):
+                    prefix = ", " if self.param_count else ""
+                    final_arguments = (
+                        f'{prefix}"timeout": '
+                        f"{_DEFAULT_SHELL_TOOL_TIMEOUT_SECONDS}" + "}"
+                    )
                 self.accumulated_params = {}
                 return {
                     "tool_calls": [
                         {
                             "index": self.current_tool_index,
-                            "function": {"arguments": "}"},
+                            "function": {"arguments": final_arguments},
                         }
                     ]
                 }

@@ -26,12 +26,14 @@ from ..api.models import (
     TopLogProb,
     Usage,
 )
-from ..api.tool_calling import parse_tool_calls
+from ..api.tool_calling import _serialize_tool_arguments, parse_tool_calls
 from ..config import get_config
 from ..engine import BaseEngine, GenerationOutput
 from ..tool_parsers import ToolParserManager
 
 logger = logging.getLogger(__name__)
+_DEFAULT_SHELL_TOOL_TIMEOUT_SECONDS = 120
+_SHELL_TOOL_NAMES = {"bash", "shell", "exec", "run_command"}
 
 # ── Fallback defaults ──────────────────────────────────────────────
 _FALLBACK_TEMPERATURE = 0.7
@@ -294,10 +296,15 @@ def _parse_tool_calls_with_parser(
                             )
                             for tc in result.tool_calls
                         ]
+                        _normalize_tool_call_arguments(tool_calls, request_dict)
+                        _apply_default_tool_call_timeouts(tool_calls, request_dict)
                         return result.content or "", tool_calls
                 except Exception as e:
                     logger.debug(f"Auto-infer tool parser failed: {e}")
-        return parse_tool_calls(output_text, request_dict)
+        cleaned_text, tool_calls = parse_tool_calls(output_text, request_dict)
+        _normalize_tool_call_arguments(tool_calls, request_dict)
+        _apply_default_tool_call_timeouts(tool_calls, request_dict)
+        return cleaned_text, tool_calls
 
     # Per-call parser instance (not cfg.tool_parser_instance singleton)
     try:
@@ -305,7 +312,10 @@ def _parse_tool_calls_with_parser(
         parser = parser_cls(tokenizer)
     except Exception as e:
         logger.warning(f"Failed to create tool parser '{cfg.tool_call_parser}': {e}")
-        return parse_tool_calls(output_text, request_dict)
+        cleaned_text, tool_calls = parse_tool_calls(output_text, request_dict)
+        _normalize_tool_call_arguments(tool_calls, request_dict)
+        _apply_default_tool_call_timeouts(tool_calls, request_dict)
+        return cleaned_text, tool_calls
 
     try:
         parser.reset()
@@ -322,12 +332,156 @@ def _parse_tool_calls_with_parser(
                 )
                 for tc in result.tool_calls
             ]
+            _normalize_tool_call_arguments(tool_calls, request_dict)
+            _apply_default_tool_call_timeouts(tool_calls, request_dict)
             return result.content or "", tool_calls
         else:
-            return parse_tool_calls(output_text, request_dict)
+            cleaned_text, tool_calls = parse_tool_calls(output_text, request_dict)
+            _normalize_tool_call_arguments(tool_calls, request_dict)
+            _apply_default_tool_call_timeouts(tool_calls, request_dict)
+            return cleaned_text, tool_calls
     except Exception as e:
         logger.warning(f"Tool parser error: {e}")
-        return parse_tool_calls(output_text, request_dict)
+        cleaned_text, tool_calls = parse_tool_calls(output_text, request_dict)
+        _normalize_tool_call_arguments(tool_calls, request_dict)
+        _apply_default_tool_call_timeouts(tool_calls, request_dict)
+        return cleaned_text, tool_calls
+
+
+def _tool_schema_has_timeout(tool_name: str, request_dict: dict | None) -> bool:
+    if not request_dict:
+        return False
+    for tool in request_dict.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") or {}
+        if function.get("name") != tool_name:
+            continue
+        parameters = function.get("parameters") or {}
+        if not isinstance(parameters, dict):
+            return False
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            return "timeout" in properties
+        return "timeout" in parameters
+    return False
+
+
+def _tool_schema_for_name(tool_name: str, request_dict: dict | None) -> dict | None:
+    if not request_dict:
+        return None
+    for tool in request_dict.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") or {}
+        if function.get("name") != tool_name:
+            continue
+        parameters = function.get("parameters") or {}
+        return parameters if isinstance(parameters, dict) else None
+    return None
+
+
+def _prune_argument_value_to_schema(value, schema):
+    if not isinstance(schema, dict):
+        return value
+
+    schema_type = schema.get("type")
+    if schema_type == "object" or isinstance(schema.get("properties"), dict):
+        if not isinstance(value, dict):
+            return value
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return value
+        allow_additional = schema.get("additionalProperties") is True
+        pruned = {}
+        for key, item in value.items():
+            if key in properties:
+                pruned[key] = _prune_argument_value_to_schema(item, properties[key])
+            elif allow_additional:
+                pruned[key] = item
+        return pruned
+
+    if schema_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            return value
+        return [_prune_argument_value_to_schema(item, item_schema) for item in value]
+
+    return value
+
+
+def _prune_tool_arguments_to_schema(
+    serialized_arguments: str, tool_name: str, request_dict: dict | None
+) -> str:
+    schema = _tool_schema_for_name(tool_name, request_dict)
+    if not schema:
+        return serialized_arguments
+    try:
+        parsed = json.loads(serialized_arguments)
+    except Exception:
+        return serialized_arguments
+    pruned = _prune_argument_value_to_schema(parsed, schema)
+    if pruned == parsed:
+        return serialized_arguments
+    return json.dumps(pruned)
+
+
+def _normalize_tool_call_arguments(tool_calls: list | None, request_dict: dict | None) -> None:
+    if not tool_calls:
+        return
+
+    for tool_call in tool_calls:
+        function = (
+            tool_call.function
+            if hasattr(tool_call, "function")
+            else tool_call.get("function", {})
+        )
+        name = function.name if hasattr(function, "name") else function.get("name", "")
+        arguments = (
+            function.arguments
+            if hasattr(function, "arguments")
+            else function.get("arguments", {})
+        )
+        serialized = _serialize_tool_arguments(arguments, name, request_dict)
+        serialized = _prune_tool_arguments_to_schema(serialized, name, request_dict)
+        if hasattr(function, "arguments"):
+            function.arguments = serialized
+        else:
+            function["arguments"] = serialized
+
+
+def _apply_default_tool_call_timeouts(tool_calls: list | None, request_dict: dict | None) -> None:
+    if not tool_calls:
+        return
+
+    for tool_call in tool_calls:
+        function = (
+            tool_call.function
+            if hasattr(tool_call, "function")
+            else tool_call.get("function", {})
+        )
+        name = function.name if hasattr(function, "name") else function.get("name", "")
+        if name not in _SHELL_TOOL_NAMES or not _tool_schema_has_timeout(name, request_dict):
+            continue
+
+        arguments = (
+            function.arguments
+            if hasattr(function, "arguments")
+            else function.get("arguments", "{}")
+        )
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(parsed, dict) or "timeout" in parsed:
+            continue
+
+        parsed["timeout"] = _DEFAULT_SHELL_TOOL_TIMEOUT_SECONDS
+        serialized = json.dumps(parsed, ensure_ascii=False)
+        if hasattr(function, "arguments"):
+            function.arguments = serialized
+        else:
+            function["arguments"] = serialized
 
 
 def _validate_tool_call_params(tool_calls: list, tools: list) -> None:

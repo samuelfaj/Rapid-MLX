@@ -3,13 +3,19 @@
 
 from unittest.mock import MagicMock
 
+from vllm_mlx.api.models import FunctionCall, ToolCall
 from vllm_mlx.api.tool_calling import (
     _is_tool_call_json,
     _parse_raw_json_tool_calls,
+    _serialize_tool_arguments,
     convert_tools_for_template,
     format_tool_call_for_message,
     parse_tool_calls,
     validate_json_schema,
+)
+from vllm_mlx.service.helpers import (
+    _apply_default_tool_call_timeouts,
+    _normalize_tool_call_arguments,
 )
 
 
@@ -217,6 +223,173 @@ class TestParseToolCalls:
 
         assert tool_calls is not None
         assert len(tool_calls) == 2
+
+
+class TestDefaultToolTimeouts:
+    def test_serializes_raw_string_argument_as_json_string(self):
+        assert _serialize_tool_arguments("hello") == '"hello"'
+
+    def test_maps_raw_string_to_single_schema_parameter(self):
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+
+        assert _serialize_tool_arguments("hello", "echo", request) == (
+            '{"message": "hello"}'
+        )
+
+    def test_normalizes_parser_tool_call_arguments_before_timeout(self):
+        tool_calls = [
+            ToolCall(
+                id="call_1",
+                type="function",
+                function=FunctionCall(name="echo", arguments="hello"),
+            )
+        ]
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                        },
+                    },
+                }
+            ]
+        }
+
+        _normalize_tool_call_arguments(tool_calls, request)
+
+        assert tool_calls[0].function.arguments == '{"message": "hello"}'
+
+    def test_prunes_unknown_nested_arguments_from_schema(self):
+        tool_calls = [
+            ToolCall(
+                id="call_1",
+                type="function",
+                function=FunctionCall(
+                    name="edit",
+                    arguments=(
+                        '{"path": "a.ts", "edits": ['
+                        '{"oldText": "a", "newText": "b", "replace_all": true}'
+                        '], "unexpected": true}'
+                    ),
+                ),
+            )
+        ]
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "edits": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "oldText": {"type": "string"},
+                                            "newText": {"type": "string"},
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+
+        _normalize_tool_call_arguments(tool_calls, request)
+
+        assert tool_calls[0].function.arguments == (
+            '{"path": "a.ts", "edits": [{"oldText": "a", "newText": "b"}]}'
+        )
+
+    def test_adds_timeout_when_shell_tool_schema_supports_it(self):
+        tool_calls = [
+            ToolCall(
+                id="call_1",
+                type="function",
+                function=FunctionCall(
+                    name="bash",
+                    arguments='{"command": "bun add slow-package"}',
+                ),
+            )
+        ]
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string"},
+                                "timeout": {"type": "number"},
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+
+        _apply_default_tool_call_timeouts(tool_calls, request)
+
+        assert tool_calls[0].function.arguments == (
+            '{"command": "bun add slow-package", "timeout": 120}'
+        )
+
+    def test_leaves_timeout_when_model_provides_it(self):
+        tool_calls = [
+            ToolCall(
+                id="call_1",
+                type="function",
+                function=FunctionCall(
+                    name="bash",
+                    arguments='{"command": "bun install", "timeout": 30}',
+                ),
+            )
+        ]
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"timeout": {"type": "number"}},
+                        },
+                    },
+                }
+            ]
+        }
+
+        _apply_default_tool_call_timeouts(tool_calls, request)
+
+        assert tool_calls[0].function.arguments == (
+            '{"command": "bun install", "timeout": 30}'
+        )
 
     def test_no_tool_calls(self):
         """Test text with no tool calls returns None."""

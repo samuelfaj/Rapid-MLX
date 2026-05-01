@@ -132,12 +132,15 @@ def _normalize_tool_arguments(
 ) -> Any:
     """Normalize parsed tool arguments before OpenAI serialization."""
     arguments = _decode_json_like(arguments)
+    param_config = _get_tool_param_config(tool_name, request)
     if isinstance(arguments, dict):
-        param_config = _get_tool_param_config(tool_name, request)
         return {
             key: _coerce_schema_value(value, param_config.get(key))
             for key, value in arguments.items()
         }
+    if isinstance(arguments, str) and len(param_config) == 1:
+        param_name, param_schema = next(iter(param_config.items()))
+        return {param_name: _coerce_schema_value(arguments, param_schema)}
     return arguments
 
 
@@ -148,12 +151,6 @@ def _serialize_tool_arguments(
 ) -> str:
     """Serialize tool arguments as a valid OpenAI function.arguments JSON string."""
     arguments = _normalize_tool_arguments(arguments, tool_name, request)
-    if isinstance(arguments, str):
-        decoded = _decode_json_like(arguments)
-        if decoded is not arguments:
-            arguments = decoded
-    if isinstance(arguments, str):
-        return arguments
     return json.dumps(arguments, ensure_ascii=False)
 
 
@@ -258,9 +255,9 @@ def _is_tool_call_json(obj: dict) -> bool:
     if not isinstance(obj["name"], str) or not obj["name"].strip():
         return False
 
-    # "arguments" must be JSON-like
+    # "arguments" must be OpenAI function-call compatible.
     args = obj["arguments"]
-    if not isinstance(args, (dict, list, str)):
+    if not isinstance(args, (dict, str)):
         return False
 
     return True

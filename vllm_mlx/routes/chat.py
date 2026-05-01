@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import time
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
@@ -51,6 +53,7 @@ from ..service.helpers import (
     _TOOL_CONTINUATION_RETRY_PROMPT,
     _TOOL_USE_SYSTEM_SUFFIX,
     _append_tool_continuation_prompt,
+    _assistant_tool_call_path_signature,
     _build_usage,
     _disconnect_guard,
     _extract_token_logprob,
@@ -77,65 +80,82 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _REPETITION_WORD_RE = re.compile(r"[A-Za-z0-9_'-]+")
+_AGENTIC_VALIDATION_COMMAND_RE = re.compile(
+    r"(^|[;&|()\s])("
+    r"bun\s+(run\s+)?test|"
+    r"npm\s+(run\s+)?(test|lint|build|typecheck)|"
+    r"pnpm\s+(run\s+)?(test|lint|build|typecheck)|"
+    r"yarn\s+(run\s+)?(test|lint|build|typecheck)|"
+    r"pytest|python\s+-m\s+pytest|"
+    r"go\s+test|cargo\s+test|mvn\s+test|gradle(w)?\s+test|"
+    r"tsc(\s|$)|eslint|ruff|mypy"
+    r")\b",
+    re.IGNORECASE,
+)
 _TOOL_TEXT_REPETITION_MIN_WORDS = 32
 _TOOL_TEXT_REPETITION_MIN_COUNT = 24
 _TOOL_TEXT_REPETITION_RATIO = 0.60
 _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 4096
-_TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 8192
+_AGENTIC_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 20000
+_TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 65536
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
+_AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 8
+_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 6
+_AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 3
+_AGENTIC_RETRY_MAX_TOKENS = 4096
+_AGENTIC_NO_TOOL_RETRY_MAX_TOKENS = _AGENTIC_RETRY_MAX_TOKENS
 _PARTIAL_TOOL_PATH_RE = re.compile(
     r'"(?:filePath|filepath|file_path|path)"\s*:\s*"((?:\\.|[^"\\])*)"',
 )
-_AGENTIC_MISSING_TEST_PATH_RE = re.compile(
-    r"no test files found under (?P<path>\S+/src/features/snake|\./src/features/snake|src/features/snake)",
-    re.IGNORECASE,
-)
 _AGENTIC_COMPLETION_KEYWORDS = (
-    "test driven",
-    "snake game",
-    "tailwind",
-    "feature oriented",
-    "src/features/snake",
-    "vitest",
-    "npm test",
-    "npm run build",
-    "npm run lint",
+    "create",
+    "implement",
+    "modify",
+    "edit",
+    "write",
+    "fix",
+    "build",
+    "test",
+    "validate",
+    "project",
 )
-_AGENTIC_REQUIRED_EVIDENCE = ("npm test", "npm run build", "npm run lint")
-_AGENTIC_VERIFICATION_MARKER = "RAPID_MLX_AGENTIC_VERIFICATION_PASS"
-_AGENTIC_PACKAGE_REPAIR_MARKER = "RAPID_MLX_AGENTIC_PACKAGE_REPAIR_DONE"
-_AGENTIC_SNAKE_SCAFFOLD_MARKER = "RAPID_MLX_AGENTIC_SNAKE_SCAFFOLD_DONE"
-_AGENTIC_FORCE_VERIFY_AFTER_TOOL_RESULTS = 8
-_AGENTIC_FORCE_PACKAGE_REPAIR_AFTER_TOOL_RESULTS = 8
 _AGENTIC_TOOL_USE_SYSTEM_SUFFIX = (
     "\n\nFor coding-agent tasks that require creating or modifying a project, "
-    "you MUST keep using tools until the project is complete. For React, "
-    "TypeScript, TailwindCSS, feature-oriented architecture, or TDD requests, "
-    "do not give a final answer until tool output proves npm test, npm run "
-    "build, and npm run lint all passed. If that proof is absent, your next "
-    "assistant response must be a tool call, not prose. Do not rerun the same "
-    "validation command after it fails. First fix the reported files with write "
-    "or edit. For this React/Tailwind/TDD workflow, create the config files the "
-    "tooling needs (tsconfig, vite config, eslint config, Tailwind setup), put "
-    "the app under src/features/snake, create index.html, src/main.tsx, and a "
-    "CSS file with Tailwind directives, remove default Vite placeholder UI, and "
-    "make tests pass before final. package.json must include a test script that "
-    "runs Vitest, and the project must include at least one *.test.ts or "
-    "*.test.tsx file under src/features/snake. Keep TypeScript tests type-safe: "
-    "annotate tuple arrays as [number, number][] instead of plain number[][]. "
-    "Use a valid ESLint config for the installed ESLint version."
+    "you MUST keep using tools until the requested work is complete. If the user "
+    "asked for validation, do not give a final answer until tool output shows the "
+    "requested validation succeeded. If validation fails, use the reported errors "
+    "to change files before running another diagnostic command. Do not answer with "
+    "prose when a required tool action remains."
 )
 _AGENTIC_REPAIR_USER_PROMPT = (
     "The previous validation/diagnostic tool output shows the project is still "
-    "broken. Do not run npm test, npm run build, npm run lint, or another "
+    "broken. Your entire next response must be one valid tool call only: write, "
+    "edit, or bash if a shell command is required to create directories, install "
+    "dependencies, or run a targeted repair command. Do not output markdown, "
+    "planning text, summaries, apologies, or any prose. Do not run the same "
     "diagnostic command again yet. Use write or edit now to fix the reported "
-    "missing config, unresolved imports, Tailwind setup, tests, or TypeScript "
-    "errors. For the React snake project, check index.html, src/main.tsx, "
-    "Tailwind CSS entry, tsconfig, vite config, package scripts, ESLint config, "
-    "Vitest dependency, test script, and tuple types in tests. If validation said "
-    "no test files found, create src/features/snake/*.test.ts or *.test.tsx before "
-    "any more bash commands. If npm says the test script is missing, add a "
-    "package.json test script that runs Vitest and install Vitest first. "
+    "files, configuration, dependencies, or test failures. "
+    "Fix the exact latest error before making unrelated changes. Do not expand scope "
+    "with new features, entities, files, or frameworks unless the user request or "
+    "the current validation error requires it. Read the latest tool output first; "
+    "if a write/edit failed or an expected file is missing from the diagnostic "
+    "inventory, create the missing parent directories or correct the path before "
+    "continuing. If an edit failed because exact text was not found or produced no "
+    "changes, use write with the complete corrected file content instead of "
+    "guessing another oldText block. If validation reports that no tests were found, create test files "
+    "using the project's test naming convention before running validation again. "
+    "If the diagnostic inventory contains only manifests or root documentation "
+    "while the requested task requires implementation files, create the missing "
+    "source and test directory structure now. For module-not-found/import errors, "
+    "calculate imports relative to the file being edited and the files that actually "
+    "exist on disk; do not guess from the repository root. If validation says a "
+    "package cannot be found and the manifest already lists that dependency, run "
+    "the package manager install command instead of editing tests to mock the "
+    "missing dependency. For named import/export "
+    "errors, only import symbols confirmed to exist in the dependency and remove or "
+    "replace any invalid symbol usages. Do not leave duplicate class fields, "
+    "duplicate functions, or duplicate declarations after edits. For missing runtime "
+    "packages, update the project manifest or install the package before retrying. "
     "Only after changing files may you run validation again."
 )
 _AGENTIC_REPEATED_TOOL_PROMPT = (
@@ -144,357 +164,80 @@ _AGENTIC_REPEATED_TOOL_PROMPT = (
     "a write or edit tool call that changes the project files needed to fix the "
     "failure. Do not call bash again until after a file change."
 )
-_AGENTIC_VERIFY_COMMAND = (
-    'project="."; '
-    'if [ ! -f package.json ]; then '
-    'project="$(find . -maxdepth 3 -name package.json -not -path '
-    "'*/node_modules/*' -print | head -n 1 | xargs dirname)\"; "
-    "fi; "
-    'if [ -z "$project" ] || [ ! -f "$project/package.json" ]; then '
-    'echo "VALIDATION_FAILED: No package.json found; project is not complete."; '
-    "exit 1; "
-    "fi; "
-    'cd "$project" || exit 1; '
-    'test_file="$(find src/features/snake src -type f \\( -name '
-    "'*.test.ts' -o -name '*.test.tsx' -o -name '*.spec.ts' -o -name "
-    "'*.spec.tsx' \\) 2>/dev/null | head -n 1)\"; "
-    'if [ -z "$test_file" ]; then '
-    'echo "VALIDATION_FAILED: No test files found under $project/src/features/snake."; '
-    "exit 1; "
-    "fi; "
-    'echo "RUNNING: npm test"; '
-    'npm test || { status="$?"; echo "VALIDATION_FAILED: npm test exited with code '
-    '$status"; exit "$status"; }; '
-    'echo "RUNNING: npm run build"; '
-    'npm run build || { status="$?"; echo "VALIDATION_FAILED: npm run build exited '
-    'with code $status"; exit "$status"; }; '
-    'echo "RUNNING: npm run lint"; '
-    'npm run lint || { status="$?"; echo "VALIDATION_FAILED: npm run lint exited '
-    'with code $status"; exit "$status"; }; '
-    f'echo {_AGENTIC_VERIFICATION_MARKER}'
+_AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
+    "You repeatedly changed the same path after validation or diagnostic output "
+    "still showed the project was incomplete or broken. That is a loop. Use the "
+    "latest diagnostic output and file inventory. Your next response must be one "
+    "valid tool call only. Do not edit the same path again unless the latest "
+    "validation error explicitly names that path. If required implementation or "
+    "test files are missing from the inventory, create those missing files now. "
+    "If the latest error names a different file, edit that file. If you cannot "
+    "identify the next file to change, run a targeted validation command that "
+    "prints the exact failing file and error."
 )
-_AGENTIC_PACKAGE_REPAIR_COMMAND = f"""set -e
-project="."
-if [ ! -f package.json ]; then
-  project="$(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -print | head -n 1 | xargs dirname)"
-fi
-if [ -z "$project" ] || [ ! -f "$project/package.json" ]; then
-  echo "VALIDATION_FAILED: No package.json found; project is not complete."
-  exit 1
-fi
-cd "$project"
-node <<'NODE'
-const fs = require("fs");
-const path = "package.json";
-const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
-pkg.scripts = pkg.scripts || {{}};
-if (!pkg.scripts.test) {{
-  pkg.scripts.test = "vitest run";
-}}
-pkg.devDependencies = pkg.devDependencies || {{}};
-if (!pkg.devDependencies.vitest && !(pkg.dependencies && pkg.dependencies.vitest)) {{
-  pkg.devDependencies.vitest = "^4.0.0";
-}}
-fs.writeFileSync(path, `${{JSON.stringify(pkg, null, 2)}}\\n`);
-NODE
-npm install
-echo {_AGENTIC_PACKAGE_REPAIR_MARKER}
-"""
-_AGENTIC_SNAKE_SCAFFOLD_COMMAND = """set -e
-project="."
-if [ ! -f package.json ]; then
-  project="$(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -print | head -n 1 | xargs dirname)"
-fi
-if [ -z "$project" ] || [ ! -f "$project/package.json" ]; then
-  echo "VALIDATION_FAILED: No package.json found; project is not complete."
-  exit 1
-fi
-cd "$project"
-node <<'NODE'
-const fs = require("fs");
-const path = "package.json";
-const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
-pkg.scripts = pkg.scripts || {};
-if (!pkg.scripts.test) {
-  pkg.scripts.test = "vitest run";
-}
-pkg.devDependencies = pkg.devDependencies || {};
-if (!pkg.devDependencies.vitest && !(pkg.dependencies && pkg.dependencies.vitest)) {
-  pkg.devDependencies.vitest = "^4.0.0";
-}
-fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\\n");
-NODE
-if [ -f vite.config.ts ]; then
-  cat > vite.config.ts <<'EOF'
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-
-export default defineConfig({
-  plugins: [react()],
-});
-EOF
-fi
-mkdir -p src/features/snake
-cat > src/features/snake/snake.ts <<'EOF'
-export type Direction = "up" | "down" | "left" | "right";
-
-export type Point = {
-  x: number;
-  y: number;
-};
-
-export type SnakeState = {
-  snake: Point[];
-  food: Point;
-  direction: Direction;
-  score: number;
-  gameOver: boolean;
-  gridSize: number;
-};
-
-export function createInitialState(gridSize = 20): SnakeState {
-  const middle = Math.floor(gridSize / 2);
-  return {
-    snake: [{ x: middle, y: middle }],
-    food: { x: Math.min(middle + 4, gridSize - 1), y: middle },
-    direction: "right",
-    score: 0,
-    gameOver: false,
-    gridSize,
-  };
-}
-
-export function nextHead(head: Point, direction: Direction): Point {
-  if (direction === "up") return { x: head.x, y: head.y - 1 };
-  if (direction === "down") return { x: head.x, y: head.y + 1 };
-  if (direction === "left") return { x: head.x - 1, y: head.y };
-  return { x: head.x + 1, y: head.y };
-}
-
-export function turn(current: Direction, next: Direction): Direction {
-  const opposites: Record<Direction, Direction> = {
-    up: "down",
-    down: "up",
-    left: "right",
-    right: "left",
-  };
-  return opposites[current] === next ? current : next;
-}
-
-function samePoint(a: Point, b: Point): boolean {
-  return a.x === b.x && a.y === b.y;
-}
-
-function nextFood(current: Point, gridSize: number): Point {
-  return {
-    x: (current.x + 7) % gridSize,
-    y: (current.y + 11) % gridSize,
-  };
-}
-
-export function advance(state: SnakeState): SnakeState {
-  if (state.gameOver) return state;
-
-  const head = nextHead(state.snake[0], state.direction);
-  const hitWall =
-    head.x < 0 || head.y < 0 || head.x >= state.gridSize || head.y >= state.gridSize;
-  const hitSelf = state.snake.some((segment) => samePoint(segment, head));
-  if (hitWall || hitSelf) {
-    return { ...state, gameOver: true };
-  }
-
-  const ateFood = samePoint(head, state.food);
-  const snake = [head, ...state.snake];
-  if (!ateFood) {
-    snake.pop();
-  }
-
-  return {
-    ...state,
-    snake,
-    food: ateFood ? nextFood(state.food, state.gridSize) : state.food,
-    score: ateFood ? state.score + 1 : state.score,
-  };
-}
-EOF
-cat > src/features/snake/snake.test.ts <<'EOF'
-import { describe, expect, it } from "vitest";
-import {
-  advance,
-  createInitialState,
-  nextHead,
-  turn,
-  type SnakeState,
-} from "./snake";
-
-describe("snake feature", () => {
-  it("moves the head in each direction", () => {
-    expect(nextHead({ x: 4, y: 4 }, "up")).toEqual({ x: 4, y: 3 });
-    expect(nextHead({ x: 4, y: 4 }, "down")).toEqual({ x: 4, y: 5 });
-    expect(nextHead({ x: 4, y: 4 }, "left")).toEqual({ x: 3, y: 4 });
-    expect(nextHead({ x: 4, y: 4 }, "right")).toEqual({ x: 5, y: 4 });
-  });
-
-  it("prevents reversing into itself", () => {
-    expect(turn("right", "left")).toBe("right");
-    expect(turn("right", "up")).toBe("up");
-  });
-
-  it("advances the snake and grows after eating food", () => {
-    const moving: SnakeState = {
-      ...createInitialState(12),
-      snake: [{ x: 2, y: 2 }],
-      direction: "right",
-      food: { x: 8, y: 8 },
-    };
-    expect(advance(moving).snake[0]).toEqual({ x: 3, y: 2 });
-
-    const eating: SnakeState = { ...moving, food: { x: 3, y: 2 } };
-    const next = advance(eating);
-    expect(next.score).toBe(1);
-    expect(next.snake).toHaveLength(2);
-  });
-});
-EOF
-cat > src/features/snake/SnakeGame.tsx <<'EOF'
-import { useEffect, useMemo, useState } from "react";
-import {
-  advance,
-  createInitialState,
-  turn,
-  type Direction,
-  type Point,
-} from "./snake";
-
-const keys: Record<string, Direction> = {
-  ArrowUp: "up",
-  ArrowDown: "down",
-  ArrowLeft: "left",
-  ArrowRight: "right",
-  w: "up",
-  s: "down",
-  a: "left",
-  d: "right",
-};
-
-function samePoint(a: Point, b: Point): boolean {
-  return a.x === b.x && a.y === b.y;
-}
-
-export function SnakeGame() {
-  const [state, setState] = useState(() => createInitialState());
-  const cells = useMemo(
-    () =>
-      Array.from({ length: state.gridSize * state.gridSize }, (_, index) => ({
-        x: index % state.gridSize,
-        y: Math.floor(index / state.gridSize),
-      })),
-    [state.gridSize],
-  );
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const next = keys[event.key];
-      if (next) {
-        setState((current) => ({ ...current, direction: turn(current.direction, next) }));
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setState((current) => advance(current)), 160);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  return (
-    <main className="min-h-screen bg-zinc-950 px-6 py-8 text-zinc-100">
-      <section className="mx-auto flex max-w-3xl flex-col gap-5">
-        <div className="flex items-center justify-between">
-          <h1 className="text-3xl font-semibold">Snake</h1>
-          <button
-            className="rounded bg-emerald-500 px-4 py-2 font-medium text-zinc-950"
-            onClick={() => setState(createInitialState())}
-            type="button"
-          >
-            Restart
-          </button>
-        </div>
-        <div className="flex items-center justify-between text-sm text-zinc-300">
-          <span>Score {state.score}</span>
-          <span>{state.gameOver ? "Game over" : "Use arrows or WASD"}</span>
-        </div>
-        <div
-          className="grid aspect-square w-full rounded border border-zinc-700 bg-zinc-900"
-          style={{ gridTemplateColumns: `repeat(${state.gridSize}, minmax(0, 1fr))` }}
-        >
-          {cells.map((cell) => {
-            const isSnake = state.snake.some((segment) => samePoint(segment, cell));
-            const isFood = samePoint(state.food, cell);
-            return (
-              <div
-                className={
-                  isSnake ? "bg-emerald-400" : isFood ? "bg-rose-400" : "bg-transparent"
-                }
-                key={`${cell.x}-${cell.y}`}
-              />
-            );
-          })}
-        </div>
-      </section>
-    </main>
-  );
-}
-EOF
-if [ -f src/App.tsx ]; then
-  cat > src/App.tsx <<'EOF'
-import { SnakeGame } from "./features/snake/SnakeGame";
-import "./App.css";
-
-export default function App() {
-  return <SnakeGame />;
-}
-EOF
-fi
-if [ ! -d node_modules/vitest ]; then
-  npm install
-fi
-echo RAPID_MLX_AGENTIC_SNAKE_SCAFFOLD_DONE
-"""
-_AGENTIC_MINIMAL_SNAKE_TEST = """import { describe, expect, it } from "vitest";
-
-type Direction = "up" | "down" | "left" | "right";
-type Point = readonly [number, number];
-
-function moveSnakeHead([x, y]: Point, direction: Direction): [number, number] {
-  switch (direction) {
-    case "up":
-      return [x, y - 1];
-    case "down":
-      return [x, y + 1];
-    case "left":
-      return [x - 1, y];
-    case "right":
-      return [x + 1, y];
-  }
-}
-
-describe("snake movement", () => {
-  const cases: [Point, Direction, [number, number]][] = [
-    [[4, 4], "up", [4, 3]],
-    [[4, 4], "down", [4, 5]],
-    [[4, 4], "left", [3, 4]],
-    [[4, 4], "right", [5, 4]],
-  ];
-
-  it.each(cases)("moves from %j toward %s", (start, direction, expected) => {
-    expect(moveSnakeHead(start, direction)).toEqual(expected);
-  });
-});
-"""
-
-
+_AGENTIC_MISSING_ARTIFACT_PROMPT = (
+    "Validation output now appears successful, but the original request named "
+    "artifact categories that are still absent from the file inventory or from "
+    "the paths you created. Your next response must be one valid tool call only. "
+    "Inspect the original request and the current file inventory, then create the "
+    "missing requested artifact files. Do not give a final answer yet. After "
+    "creating the missing artifacts, run validation again."
+)
+_AGENTIC_DIAGNOSTIC_COMMAND = (
+    "printf 'AGENTIC_DIAGNOSTIC\\n'; "
+    "pwd; "
+    "printf 'FILES\\n'; "
+    "find . -maxdepth 5 -path './node_modules' -prune -o -path './.git' -prune -o "
+    "-path './dist' -prune -o -path './build' -prune -o "
+    "-type f -print | sort | sed 's#^./##' | head -200; "
+    "printf 'MANIFESTS\\n'; "
+    "ls package.json pyproject.toml setup.py requirements.txt go.mod Cargo.toml "
+    "pom.xml build.gradle 2>/dev/null || true; "
+    "printf 'VALIDATION\\n'; status=0; "
+    "if [ -f package.json ]; then "
+    "if [ ! -d node_modules ]; then echo 'DEPENDENCIES_MISSING: node_modules not found; run the package manager install command before editing imports or tests'; fi; "
+    "if command -v bun >/dev/null 2>&1; then echo 'RUNNING_VALIDATION: bun test'; bun test || status=$?; "
+    "elif command -v npm >/dev/null 2>&1; then echo 'RUNNING_VALIDATION: npm test'; npm test || status=$?; "
+    "else echo 'VALIDATION_FAILED: no js package manager available'; status=1; fi; "
+    "elif [ -f pyproject.toml ] || [ -f setup.py ] || [ -f requirements.txt ]; then "
+    "if command -v pytest >/dev/null 2>&1; then echo 'RUNNING_VALIDATION: pytest'; pytest || status=$?; "
+    "elif command -v python >/dev/null 2>&1; then echo 'RUNNING_VALIDATION: python -m pytest'; python -m pytest || status=$?; "
+    "else echo 'VALIDATION_FAILED: no python test runner available'; status=1; fi; "
+    "elif [ -f go.mod ]; then echo 'RUNNING_VALIDATION: go test ./...'; go test ./... || status=$?; "
+    "elif [ -f Cargo.toml ]; then echo 'RUNNING_VALIDATION: cargo test'; cargo test || status=$?; "
+    "elif [ -f pom.xml ]; then echo 'RUNNING_VALIDATION: mvn test'; mvn test || status=$?; "
+    "elif [ -f build.gradle ]; then echo 'RUNNING_VALIDATION: ./gradlew test'; ./gradlew test || status=$?; "
+    "else echo 'VALIDATION_FAILED: no recognized project manifest'; status=1; "
+    "fi; "
+    "if [ \"$status\" -eq 0 ]; then echo 'VALIDATION_PASSED'; "
+    "else echo \"VALIDATION_FAILED: validation command exited with status $status\"; "
+    "echo 'NEXT_ACTION: use write or edit to fix the latest validation error before any more diagnostic or final answer'; "
+    "echo 'NEXT_ACTION: if required files are absent from FILES, create missing parent directories and files first'; "
+    "echo 'NEXT_ACTION: if validation says no tests were found, create correctly named test files before rerunning validation'; "
+    "fi; exit \"$status\""
+)
+_AGENTIC_DEPENDENCY_INSTALL_COMMAND = (
+    "status=0; "
+    "if [ -f package.json ]; then "
+    "if command -v bun >/dev/null 2>&1; then bun install || status=$?; "
+    "elif command -v npm >/dev/null 2>&1; then npm install || status=$?; "
+    "else echo 'VALIDATION_FAILED: no js package manager available'; status=1; fi; "
+    "elif [ -f requirements.txt ]; then python -m pip install -r requirements.txt || status=$?; "
+    "elif [ -f pyproject.toml ] || [ -f setup.py ]; then python -m pip install -e . || status=$?; "
+    "else echo 'VALIDATION_FAILED: no recognized dependency manifest'; status=1; fi; "
+    "if [ \"$status\" -eq 0 ]; then echo 'DEPENDENCIES_INSTALLED'; "
+    "else echo \"VALIDATION_FAILED: dependency install exited with status $status\"; fi"
+)
+_AGENTIC_EXTRA_JS_DEPENDENCY_INSTALL_COMMAND = (
+    "status=0; "
+    "if [ -f package.json ]; then "
+    "if command -v bun >/dev/null 2>&1; then bun add {package} || status=$?; "
+    "elif command -v npm >/dev/null 2>&1; then npm install {package} || status=$?; "
+    "else echo 'VALIDATION_FAILED: no js package manager available'; status=1; fi; "
+    "else echo 'VALIDATION_FAILED: package.json not found for js dependency install'; status=1; fi; "
+    "if [ \"$status\" -eq 0 ]; then echo 'DEPENDENCIES_INSTALLED'; "
+    "else echo \"VALIDATION_FAILED: dependency install exited with status $status\"; fi"
+)
 def _message_content_text(message) -> str:
     content = (
         message.get("content")
@@ -551,6 +294,107 @@ def _message_tool_call_text(message) -> str:
     return "\n".join(parts)
 
 
+def _agentic_message_role(message) -> str | None:
+    return (
+        message.get("role")
+        if isinstance(message, dict)
+        else getattr(message, "role", None)
+    )
+
+
+def _agentic_function_payload(function) -> tuple[str, object]:
+    if function is None:
+        return "", None
+    if isinstance(function, dict):
+        return str(function.get("name") or ""), function.get("arguments")
+    return str(getattr(function, "name", "") or ""), getattr(function, "arguments", None)
+
+
+def _agentic_tool_call_command_text(message) -> str:
+    tool_calls = (
+        message.get("tool_calls")
+        if isinstance(message, dict)
+        else getattr(message, "tool_calls", None)
+    )
+    if not tool_calls:
+        return ""
+
+    commands: list[str] = []
+    for tool_call in tool_calls:
+        function = (
+            tool_call.get("function")
+            if isinstance(tool_call, dict)
+            else getattr(tool_call, "function", None)
+        )
+        name, arguments = _agentic_function_payload(function)
+        if name not in {"bash", "shell", "exec", "run_command"}:
+            continue
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                command = decoded.get("command") or decoded.get("cmd")
+                if isinstance(command, str):
+                    commands.append(command)
+            else:
+                commands.append(arguments)
+        elif isinstance(arguments, dict):
+            command = arguments.get("command") or arguments.get("cmd")
+            if isinstance(command, str):
+                commands.append(command)
+    return "\n".join(commands)
+
+
+def _agentic_tool_result_has_successful_validation_command(
+    messages: list, tool_index: int
+) -> bool:
+    tool_text = _message_content_text(messages[tool_index]).lower()
+    has_success_evidence = bool(
+        re.search(r"command exited with code\s+0\b", tool_text)
+        or (
+            re.search(r"\b\d+\s+pass\b", tool_text)
+            and re.search(r"\b0\s+fail\b", tool_text)
+        )
+        or re.search(r"\b0\s+fail\b", tool_text)
+    )
+    if not has_success_evidence:
+        return False
+    for previous in reversed(messages[:tool_index]):
+        if _agentic_message_role(previous) != "assistant":
+            continue
+        command_text = _agentic_tool_call_command_text(previous)
+        return bool(_AGENTIC_VALIDATION_COMMAND_RE.search(command_text))
+    return False
+
+
+def _agentic_tool_result_has_failed_validation_command(
+    messages: list, tool_index: int
+) -> bool:
+    tool_text = _message_content_text(messages[tool_index]).lower()
+    has_failure_evidence = (
+        "validation_failed" in tool_text
+        or re.search(r"command exited with code\s+(?!0\b)\d+", tool_text)
+        or re.search(r"\b[1-9]\d*\s+fail\b", tool_text)
+        or "error:" in tool_text
+        or "referenceerror" in tool_text
+        or "couldn't find" in tool_text
+        or "cannot find" in tool_text
+        or "is not defined" in tool_text
+        or "no test files found" in tool_text
+        or "no tests found" in tool_text
+    )
+    if not has_failure_evidence:
+        return False
+    for previous in reversed(messages[:tool_index]):
+        if _agentic_message_role(previous) != "assistant":
+            continue
+        command_text = _agentic_tool_call_command_text(previous)
+        return bool(_AGENTIC_VALIDATION_COMMAND_RE.search(command_text))
+    return False
+
+
 def _agentic_message_text(message) -> str:
     return "\n".join(
         part
@@ -574,63 +418,144 @@ def _agentic_completion_needs_verification(messages: list) -> bool:
 
 
 def _agentic_verification_present(messages: list) -> bool:
-    transcript = "\n".join(
+    return _agentic_validation_evidence_present(messages)
+
+
+_AGENTIC_REQUESTED_ARTIFACT_TERMS = {
+    "migration": ("migration", "migrations"),
+    "seeder": ("seed", "seeder", "seeders", "seeds"),
+    "model": ("model", "models"),
+    "service": ("service", "services"),
+    "controller": ("controller", "controllers"),
+    "route": ("api", "endpoint", "endpoints", "rest", "route", "routes", "router"),
+    "middleware": ("middleware", "middlewares"),
+    "test": ("test", "tests", "spec", "specs"),
+    "vertical_slice": (
+        "feature slice",
+        "feature sliced",
+        "vertical slice",
+        "vertical sliced",
+        "vertically sliced",
+    ),
+}
+
+
+def _agentic_requested_artifact_terms(messages: list) -> set[str]:
+    text = "\n".join(
         _message_content_text(message)
         for message in messages
-        if (
-            message.get("role")
-            if isinstance(message, dict)
-            else getattr(message, "role", None)
-        )
-        == "tool"
+        if _agentic_message_role(message) == "user"
     ).lower()
-    return _AGENTIC_VERIFICATION_MARKER.lower() in transcript
+    requested: set[str] = set()
+    for term, variants in _AGENTIC_REQUESTED_ARTIFACT_TERMS.items():
+        if any(re.search(rf"\b{re.escape(variant)}\b", text) for variant in variants):
+            requested.add(term)
+    return requested
+
+
+def _agentic_created_artifact_paths(messages: list) -> list[str]:
+    paths: list[str] = []
+    for message in messages:
+        signature = _assistant_tool_call_path_signature(message)
+        if signature:
+            _, path = signature
+            paths.append(path.lower())
+
+        if _agentic_message_role(message) != "tool":
+            continue
+        content = _message_content_text(message)
+        for match in re.finditer(
+            r"(?:to|in)\s+([^\s]+(?:\.[A-Za-z0-9_./-]+)?)",
+            content,
+        ):
+            path = match.group(1).strip().rstrip(".:,;")
+            if "/" in path or "." in path:
+                paths.append(path.lower())
+    return paths
+
+
+def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
+    requested = _agentic_requested_artifact_terms(messages)
+    if not requested:
+        return set()
+    paths = _agentic_created_artifact_paths(messages)
+    missing: set[str] = set()
+    for term in requested:
+        if term == "vertical_slice":
+            if not any(
+                re.search(
+                    r"(?:^|/)src/(?:modules|features|domains|slices)/[^/]+/",
+                    path,
+                )
+                for path in paths
+            ):
+                missing.add(term)
+            continue
+        variants = _AGENTIC_REQUESTED_ARTIFACT_TERMS[term]
+        if not any(any(variant in path for variant in variants) for path in paths):
+            missing.add(term)
+    if "service" in requested and "test" in requested:
+        service_names = {
+            re.sub(r"(?:service|\.service)$", "", Path(path).stem).lower()
+            for path in paths
+            if "service" in path and "test" not in path and "spec" not in path
+        }
+        tested_names = {
+            re.sub(r"(?:service|\.service|test|spec)$", "", Path(path).stem).lower()
+            for path in paths
+            if ("test" in path or "spec" in path) and "service" in path
+        }
+        if service_names and not service_names.issubset(tested_names):
+            missing.add("test")
+    return missing
 
 
 def _agentic_validation_evidence_present(messages: list) -> bool:
-    transcript = "\n".join(
-        _agentic_message_text(message)
-        for message in messages
-        if (
-            message.get("role")
-            if isinstance(message, dict)
-            else getattr(message, "role", None)
-        )
-        not in {"system", "developer"}
-    ).lower()
-    return all(evidence in transcript for evidence in _AGENTIC_REQUIRED_EVIDENCE)
+    success_markers = (
+        "validation_passed",
+        "validation passed",
+        "all checks passed",
+        "tests passed",
+        "build passed",
+        "lint passed",
+    )
+    latest_validation_success: bool | None = None
+    for index, message in enumerate(messages):
+        if _agentic_message_role(message) != "tool":
+            continue
+        tool_text = _message_content_text(message).lower()
+        if _agentic_tool_result_has_failed_validation_command(messages, index):
+            latest_validation_success = False
+            continue
+        if _agentic_tool_result_has_successful_validation_command(messages, index):
+            latest_validation_success = True
+            continue
+        if any(marker in tool_text for marker in success_markers):
+            latest_validation_success = True
+    return latest_validation_success is True
 
 
 def _agentic_failed_validation_present(messages: list) -> bool:
     transcript = _agentic_transcript(messages).lower()
-    last_mutation_index = max(
-        transcript.rfind("successfully wrote"),
-        transcript.rfind("successfully edited"),
-        transcript.rfind("successfully modified"),
+    latest_success_index = max(
+        transcript.rfind("validation_passed"),
+        transcript.rfind("validation passed"),
+        transcript.rfind("all checks passed"),
+        transcript.rfind("tests passed"),
+        transcript.rfind("build passed"),
+        transcript.rfind("lint passed"),
     )
-    if last_mutation_index != -1:
-        transcript = transcript[last_mutation_index:]
+    if latest_success_index != -1:
+        transcript = transcript[latest_success_index:]
     explicit_failure_markers = (
         "validation_failed",
-        "no package.json",
-        "no test files found",
         "missing script",
         "no test script",
-        "vitest: not found",
-        "cannot find package 'vitest'",
-        "cannot find module 'vitest'",
+        "no test files found",
+        "no tests found",
     )
     if any(marker in transcript for marker in explicit_failure_markers):
         return True
-    verifier_requested = _AGENTIC_VERIFICATION_MARKER.lower() in transcript
-    if (
-        verifier_requested
-        and not _agentic_verification_present(messages)
-        and not any(evidence in transcript for evidence in _AGENTIC_REQUIRED_EVIDENCE)
-    ):
-        return True
-    if not any(evidence in transcript for evidence in _AGENTIC_REQUIRED_EVIDENCE):
-        return False
     failure_markers = (
         "validation_failed",
         "command exited with code",
@@ -645,6 +570,7 @@ def _agentic_failed_validation_present(messages: list) -> bool:
         "unknown option",
         "missing script",
         "no test files found",
+        "no tests found",
         "no package.json",
     )
     return any(marker in transcript for marker in failure_markers)
@@ -663,29 +589,6 @@ def _agentic_transcript(messages: list) -> str:
     )
 
 
-def _agentic_missing_tests_present(messages: list) -> bool:
-    transcript = _agentic_transcript(messages).lower()
-    missing_index = transcript.rfind("no test files found")
-    if missing_index == -1:
-        return False
-
-    wrote_index = transcript.rfind("successfully wrote")
-    test_path_index = transcript.rfind("snake.test.ts")
-    return not (wrote_index > missing_index and test_path_index > missing_index)
-
-
-def _agentic_missing_test_write_path(messages: list) -> str:
-    transcript = _agentic_transcript(messages)
-    matches = list(_AGENTIC_MISSING_TEST_PATH_RE.finditer(transcript))
-    if not matches:
-        return "src/features/snake/snake.test.ts"
-
-    directory = matches[-1].group("path")
-    if directory.startswith("./"):
-        directory = directory[2:]
-    return f"{directory.rstrip('/')}/snake.test.ts"
-
-
 def _agentic_tool_result_count(messages: list) -> int:
     return sum(
         1
@@ -699,178 +602,246 @@ def _agentic_tool_result_count(messages: list) -> int:
     )
 
 
-def _agentic_package_repair_requested(messages: list) -> bool:
-    return _AGENTIC_PACKAGE_REPAIR_MARKER.lower() in _agentic_transcript(
-        messages
-    ).lower()
+def _agentic_tool_result_is_diagnostic(text: str) -> bool:
+    return "agentic_diagnostic" in text
 
 
-def _agentic_snake_scaffold_requested(messages: list) -> bool:
-    return _AGENTIC_SNAKE_SCAFFOLD_MARKER.lower() in _agentic_transcript(
-        messages
-    ).lower()
-
-
-def _agentic_should_force_snake_scaffold(messages: list) -> bool:
-    if _agentic_verification_present(messages):
-        return False
-    if _agentic_snake_scaffold_requested(messages):
-        return False
-    if _agentic_missing_tests_present(messages):
-        return True
-    if (
-        _agentic_package_repair_requested(messages)
-        and _agentic_tool_result_count(messages)
-        >= _AGENTIC_FORCE_PACKAGE_REPAIR_AFTER_TOOL_RESULTS
-        and not _agentic_validation_evidence_present(messages)
-    ):
-        return True
+def _last_tool_result_is_agentic_diagnostic(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        return _agentic_tool_result_is_diagnostic(
+            _message_content_text(message).lower()
+        )
     return False
 
 
-def _agentic_should_force_package_repair(messages: list) -> bool:
-    if _agentic_verification_present(messages):
-        return False
-    if _agentic_package_repair_requested(messages):
-        return False
-    if _agentic_missing_tests_present(messages):
-        return False
-
-    transcript = _agentic_transcript(messages).lower()
-    package_setup_markers = (
-        "missing script",
-        "no test script",
-        "vitest: not found",
-        "cannot find package 'vitest'",
-        "cannot find module 'vitest'",
-    )
-    if any(marker in transcript for marker in package_setup_markers):
-        return True
-    if _agentic_failed_validation_present(messages):
-        return False
-    return (
-        _agentic_tool_result_count(messages)
-        >= _AGENTIC_FORCE_PACKAGE_REPAIR_AFTER_TOOL_RESULTS
-        and not _agentic_validation_evidence_present(messages)
-    )
-
-
-def _agentic_should_force_verification(messages: list) -> bool:
-    if _agentic_verification_present(messages):
-        return False
-    if _agentic_tool_result_count(messages) < _AGENTIC_FORCE_VERIFY_AFTER_TOOL_RESULTS:
-        return False
-    if _agentic_failed_validation_present(messages):
-        return False
-    if _agentic_validation_evidence_present(messages):
-        return True
-    return True
-
-
-def _tool_definition_name(tool) -> str | None:
-    if hasattr(tool, "function"):
-        function = tool.function
-    elif isinstance(tool, dict):
-        function = tool.get("function", tool)
-    else:
-        return None
-    if isinstance(function, dict):
-        name = function.get("name")
-    else:
-        name = getattr(function, "name", None)
-    return str(name) if name else None
-
-
-def _agentic_forced_verification_tool_call(tools) -> list[ToolCall] | None:
-    if not tools or not any(_tool_definition_name(tool) == "bash" for tool in tools):
-        return None
-    return [
-        ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name="bash",
-                arguments=json.dumps(
-                    {"command": _AGENTIC_VERIFY_COMMAND, "timeout": 180}
-                ),
-            ),
+def _last_tool_result_missing_dependency(messages: list) -> str | None:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
         )
-    ]
-
-
-def _agentic_forced_package_repair_tool_call(
-    tools,
-    messages: list,
-) -> list[ToolCall] | None:
-    if (
-        not tools
-        or not _agentic_should_force_package_repair(messages)
-        or not any(_tool_definition_name(tool) == "bash" for tool in tools)
-    ):
-        return None
-    return [
-        ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name="bash",
-                arguments=json.dumps(
-                    {"command": _AGENTIC_PACKAGE_REPAIR_COMMAND, "timeout": 180}
-                ),
-            ),
+        if role != "tool":
+            continue
+        text = _message_content_text(message)
+        lower_text = text.lower()
+        if "dependencies_missing" in lower_text or "cannot find package" in lower_text:
+            return ""
+        package_hint = re.search(
+            r"install\s+([@a-z0-9_.\-/]+)\s+(?:package|module|dependency)",
+            lower_text,
         )
-    ]
-
-
-def _agentic_forced_snake_scaffold_tool_call(
-    tools,
-    messages: list,
-) -> list[ToolCall] | None:
-    if (
-        not tools
-        or not _agentic_should_force_snake_scaffold(messages)
-        or not any(_tool_definition_name(tool) == "bash" for tool in tools)
-    ):
-        return None
-    return [
-        ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name="bash",
-                arguments=json.dumps(
-                    {"command": _AGENTIC_SNAKE_SCAFFOLD_COMMAND, "timeout": 180}
-                ),
-            ),
+        if not package_hint:
+            package_hint = re.search(
+                r"install\s+(?:the\s+)?(?:package|module|dependency)"
+                r"(?:\s+manually)?\s*:\s*([@a-z0-9_.\-/]+)",
+                lower_text,
+            )
+        if package_hint:
+            return package_hint.group(1)
+        if "module_not_found" in lower_text:
+            return ""
+        module_match = re.search(
+            r"cannot find module\s+['\"]([^'\"]+)['\"]", lower_text
         )
-    ]
-
-
-def _agentic_forced_missing_tests_tool_call(
-    tools,
-    messages: list,
-) -> list[ToolCall] | None:
-    if (
-        not tools
-        or not _agentic_missing_tests_present(messages)
-        or not any(_tool_definition_name(tool) == "write" for tool in tools)
-    ):
+        if module_match:
+            module_name = module_match.group(1)
+            if module_name.startswith((".", "/")) or module_name.startswith("file:"):
+                return None
+            return module_name
+        if re.search(r"install\s+(?:the\s+)?(?:package|module|dependency)", lower_text):
+            return ""
         return None
-    return [
-        ToolCall(
-            id=f"call_{uuid.uuid4().hex[:8]}",
-            type="function",
-            function=FunctionCall(
-                name="write",
-                arguments=json.dumps(
-                    {
-                        "path": _agentic_missing_test_write_path(messages),
-                        "content": _AGENTIC_MINIMAL_SNAKE_TEST,
-                    }
-                ),
-            ),
+    return None
+
+
+def _last_tool_result_needs_dependency_install(messages: list) -> bool:
+    return _last_tool_result_missing_dependency(messages) is not None
+
+
+def _latest_tool_result_mentions_path(messages: list, path: str | None) -> bool:
+    if not path:
+        return False
+    normalized_path = path.lower()
+    basename = Path(path).name.lower()
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
         )
-    ]
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return normalized_path in text or bool(basename and basename in text)
+    return False
+
+
+def _agentic_tool_result_count_since_latest_failure(messages: list) -> int:
+    count = 0
+    seen_failure = False
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if _agentic_tool_result_is_diagnostic(text):
+            if "validation_failed" in text:
+                seen_failure = True
+                break
+            continue
+        if any(
+            marker in text
+            for marker in (
+                "validation_failed",
+                "command exited with code",
+                "failed",
+                " fail",
+                "error:",
+                "referenceerror",
+                "couldn't find",
+                "cannot find",
+                "is not defined",
+                "never used",
+                "unknown option",
+                "missing script",
+                "no test files found",
+                "no tests found",
+                "no package.json",
+            )
+        ):
+            seen_failure = True
+            break
+        count += 1
+    return count if seen_failure else 0
+
+
+def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
+    counts: dict[tuple[str, str], int] = {}
+    seen_failure = False
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role == "tool":
+            text = _message_content_text(message).lower()
+            if _agentic_tool_result_is_diagnostic(text):
+                if "validation_failed" in text:
+                    seen_failure = True
+                    break
+                continue
+            if any(
+                marker in text
+                for marker in (
+                    "validation_failed",
+                    "failed",
+                    " fail",
+                    "error:",
+                    "referenceerror",
+                    "couldn't find",
+                    "cannot find",
+                    "is not defined",
+                    "never used",
+                    "unknown option",
+                    "missing script",
+                    "no test files found",
+                    "no tests found",
+                    "no package.json",
+                )
+            ):
+                seen_failure = True
+                continue
+            continue
+        signature = _assistant_tool_call_path_signature(message)
+        if signature:
+            counts[signature] = counts.get(signature, 0) + 1
+    return max(counts.values(), default=0) if seen_failure else 0
+
+
+def _agentic_max_same_command_tools_since_latest_failure(messages: list) -> int:
+    counts: dict[str, int] = {}
+    seen_failure = False
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role == "tool":
+            text = _message_content_text(message).lower()
+            if _agentic_tool_result_is_diagnostic(text):
+                if "validation_failed" in text:
+                    seen_failure = True
+                    break
+                continue
+            if any(
+                marker in text
+                for marker in (
+                    "validation_failed",
+                    "failed",
+                    " fail",
+                    "error:",
+                    "referenceerror",
+                    "couldn't find",
+                    "cannot find",
+                    "is not defined",
+                    "never used",
+                    "unknown option",
+                    "missing script",
+                    "no test files found",
+                    "no tests found",
+                    "no package.json",
+                )
+            ):
+                seen_failure = True
+                continue
+            continue
+        if role != "assistant":
+            continue
+        command_text = _agentic_tool_call_command_text(message).strip()
+        if command_text:
+            counts[command_text] = counts.get(command_text, 0) + 1
+    return max(counts.values(), default=0) if seen_failure else 0
+
+
+def _last_tool_result_indicates_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return any(
+            marker in text
+            for marker in (
+                "validation_failed",
+                "failed",
+                "error:",
+                "cannot find",
+                "not found",
+                "no such file",
+                "oldtext",
+                "exit code 1",
+                "exited with code 1",
+            )
+        )
+    return False
 
 
 def _tool_choice_requires_tool_call(tool_choice) -> bool:
@@ -884,6 +855,57 @@ def _tool_choice_requires_tool_call(tool_choice) -> bool:
             return False
         return True
     return False
+
+
+def _tool_names(tools) -> set[str]:
+    names: set[str] = set()
+    for tool in tools or []:
+        if hasattr(tool, "model_dump"):
+            tool = tool.model_dump(exclude_none=True)
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _agentic_diagnostic_tool_call() -> ToolCall:
+    return ToolCall(
+        id=f"call_{uuid.uuid4().hex[:8]}",
+        function=FunctionCall(
+            name="bash",
+            arguments=json.dumps(
+                {
+                    "command": _AGENTIC_DIAGNOSTIC_COMMAND,
+                    "timeout": 120,
+                }
+            ),
+        ),
+    )
+
+
+def _agentic_dependency_install_tool_call(package_name: str | None = None) -> ToolCall:
+    command = _AGENTIC_DEPENDENCY_INSTALL_COMMAND
+    if package_name:
+        command = _AGENTIC_EXTRA_JS_DEPENDENCY_INSTALL_COMMAND.format(
+            package=shlex.quote(package_name)
+        )
+    return ToolCall(
+        id=f"call_{uuid.uuid4().hex[:8]}",
+        function=FunctionCall(
+            name="bash",
+            arguments=json.dumps(
+                {
+                    "command": command,
+                    "timeout": 120,
+                }
+            ),
+        ),
+    )
 
 
 def _is_repetitive_tool_text(text: str) -> bool:
@@ -1292,6 +1314,19 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     logger.debug(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
     cfg = get_config()
+    if cfg.agentic_guard:
+        for idx, message in enumerate(request.messages):
+            role = getattr(message, "role", None)
+            if role != "tool":
+                continue
+            content = getattr(message, "content", "")
+            tool_call_id = getattr(message, "tool_call_id", None)
+            logger.info(
+                "[AGENTIC-TOOL-RESULT] index=%d tool_call_id=%r content=%s",
+                idx,
+                tool_call_id,
+                content if isinstance(content, str) else str(content),
+            )
 
     # Save original messages (clean dicts) for cloud routing BEFORE
     # local mutations (extract_multimodal_content, developer→system, suffix injection).
@@ -1647,52 +1682,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser. In non-streaming
-    # local-agent mode, reject premature text-only "done" answers until the
-    # transcript shows the requested verification commands.
+    # local-agent mode, retry premature text-only answers for tool workflows.
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
     if (
         agentic_verification_required
         and not _agentic_verification_present(messages)
     ):
         retry_messages = list(messages)
-        snake_scaffold_tool_calls = _agentic_forced_snake_scaffold_tool_call(
-            request.tools,
-            messages,
-        )
-        if snake_scaffold_tool_calls:
-            logger.info("[agentic-guard] forcing snake feature scaffold repair")
-            cleaned_text = ""
-            tool_calls = snake_scaffold_tool_calls
-
-        missing_test_tool_calls = _agentic_forced_missing_tests_tool_call(
-            request.tools,
-            messages,
-        )
-        if not tool_calls and missing_test_tool_calls:
-            logger.info(
-                "[agentic-guard] forcing missing-test repair write tool call"
-            )
-            cleaned_text = ""
-            tool_calls = missing_test_tool_calls
-
-        package_repair_tool_calls = _agentic_forced_package_repair_tool_call(
-            request.tools,
-            messages,
-        )
-        if not tool_calls and package_repair_tool_calls:
-            logger.info("[agentic-guard] forcing package test setup repair")
-            cleaned_text = ""
-            tool_calls = package_repair_tool_calls
-
-        if not tool_calls:
-            forced_tool_calls = _agentic_forced_verification_tool_call(request.tools)
-            if forced_tool_calls:
-                logger.info(
-                    "[agentic-guard] replacing premature final text with "
-                    "verification tool call"
-                )
-                cleaned_text = ""
-                tool_calls = forced_tool_calls
 
         for retry_attempt in range(6):
             if tool_calls:
@@ -1708,14 +1704,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     "content": (
                         _AGENTIC_REPAIR_USER_PROMPT
                         if _agentic_failed_validation_present(messages)
-                        else (
-                            "You are not finished. Use tools now. The task "
-                            "requires React, TypeScript, TailwindCSS, "
-                            "feature-oriented architecture, and TDD. Before "
-                            "final response, create or fix files and run npm "
-                            "test, npm run build, and npm run lint successfully. "
-                            "Do not answer with prose until those commands pass."
-                        )
+                        else "You are not finished. Use the next required tool now."
                     ),
                 }
             ]
@@ -1736,23 +1725,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             cleaned_text, tool_calls = _parse_tool_calls_with_parser(
                 output.text, request
             )
-            if not tool_calls:
-                forced_tool_calls = _agentic_forced_snake_scaffold_tool_call(
-                    request.tools,
-                    messages,
-                ) or _agentic_forced_package_repair_tool_call(
-                    request.tools,
-                    messages,
-                ) or _agentic_forced_verification_tool_call(
-                    request.tools
-                )
-                if forced_tool_calls:
-                    logger.info(
-                        "[agentic-guard] retry remained text-only; forcing "
-                        "verification tool call"
-                    )
-                    cleaned_text = ""
-                    tool_calls = forced_tool_calls
 
     # Validate tool call parameter values against schemas
     if tool_calls and request.tools:
@@ -1969,69 +1941,169 @@ async def stream_chat_completion(
             cfg.agentic_guard
             and bool(request.tools)
             and _agentic_completion_needs_verification(messages)
+            and (
+                not _agentic_verification_present(messages)
+                or bool(_agentic_requested_artifacts_missing(messages))
+            )
+        )
+        agentic_missing_requested_artifacts = (
+            agentic_stream_guard
+            and _agentic_verification_present(messages)
+            and bool(_agentic_requested_artifacts_missing(messages))
+        )
+        agentic_repair_mode = (
+            agentic_stream_guard and _agentic_failed_validation_present(messages)
+        )
+        agentic_tool_results_since_failure = (
+            _agentic_tool_result_count_since_latest_failure(messages)
+        )
+        agentic_same_path_tools_since_failure = (
+            _agentic_max_same_path_tools_since_latest_failure(messages)
+        )
+        agentic_same_command_tools_since_failure = (
+            _agentic_max_same_command_tools_since_latest_failure(messages)
+        )
+        agentic_repeated_path_repair_mode = (
+            agentic_stream_guard
+            and max(
+                agentic_same_path_tools_since_failure,
+                agentic_same_command_tools_since_failure,
+            )
+            >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+            and not _last_tool_result_is_agentic_diagnostic(messages)
+        )
+        agentic_missing_dependency = (
+            _last_tool_result_missing_dependency(messages)
+            if agentic_stream_guard and "bash" in _tool_names(request.tools)
+            else None
+        )
+        agentic_dependency_install_needed = agentic_missing_dependency is not None
+        if agentic_dependency_install_needed:
+            logger.info("[agentic-guard] forcing dependency install after tool result")
+            yield _format_forced_tool_call(
+                [_agentic_dependency_install_tool_call(agentic_missing_dependency)],
+                None,
+            )
+            if include_usage:
+                usage_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_resolve_model_name(request.model),
+                    choices=[],
+                    usage=Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
+                )
+                yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        agentic_diagnostic_needed = (
+            cfg.agentic_guard
+            and bool(request.tools)
             and not _agentic_verification_present(messages)
-        )
-        snake_scaffold_tool_calls = (
-            _agentic_forced_snake_scaffold_tool_call(request.tools, messages)
-            if agentic_stream_guard
-            else None
-        )
-        if snake_scaffold_tool_calls:
-            logger.info("[agentic-guard] forcing snake feature scaffold repair")
-            yield _format_forced_tool_call(snake_scaffold_tool_calls, None)
-            yield "data: [DONE]\n\n"
-            return
-
-        missing_test_tool_calls = (
-            _agentic_forced_missing_tests_tool_call(request.tools, messages)
-            if agentic_stream_guard
-            else None
-        )
-        if missing_test_tool_calls:
-            logger.info(
-                "[agentic-guard] forcing missing-test repair write tool call"
+            and not _last_tool_result_is_agentic_diagnostic(messages)
+            and "bash" in _tool_names(request.tools)
+            and (
+                (
+                    not _agentic_failed_validation_present(messages)
+                    and _agentic_tool_result_count(messages)
+                    >= _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC
+                )
+                or (
+                    agentic_tool_results_since_failure
+                    >= _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+                )
+                or (
+                    not agentic_repeated_path_repair_mode
+                    and (
+                        max(
+                            agentic_same_path_tools_since_failure,
+                            agentic_same_command_tools_since_failure,
+                        )
+                        >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+                    )
+                )
             )
-            yield _format_forced_tool_call(missing_test_tool_calls, None)
-            yield "data: [DONE]\n\n"
-            return
-
-        package_repair_tool_calls = (
-            _agentic_forced_package_repair_tool_call(request.tools, messages)
-            if agentic_stream_guard
-            else None
         )
-        if package_repair_tool_calls:
-            logger.info("[agentic-guard] forcing package test setup repair")
-            yield _format_forced_tool_call(package_repair_tool_calls, None)
-            yield "data: [DONE]\n\n"
-            return
-
-        forced_tool_calls = (
-            _agentic_forced_verification_tool_call(request.tools)
-            if agentic_stream_guard and _agentic_should_force_verification(messages)
-            else None
-        )
-        if forced_tool_calls:
+        if (
+            agentic_diagnostic_needed
+        ):
             logger.info(
-                "[agentic-guard] forcing verification after %d tool results "
-                "without validation evidence",
+                "[agentic-guard] forcing diagnostic after %d tool results without "
+                "validation evidence (%d since latest failure, %d same-path, "
+                "%d same-command)",
                 _agentic_tool_result_count(messages),
+                agentic_tool_results_since_failure,
+                agentic_same_path_tools_since_failure,
+                agentic_same_command_tools_since_failure,
             )
-            yield _format_forced_tool_call(forced_tool_calls, None)
+            yield _format_forced_tool_call([_agentic_diagnostic_tool_call()], None)
+            if include_usage:
+                usage_chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_resolve_model_name(request.model),
+                    choices=[],
+                    usage=Usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                    ),
+                )
+                yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
             yield "data: [DONE]\n\n"
             return
         retry_attempts = 0
         active_messages = (
-            list(messages) + [{"role": "user", "content": _AGENTIC_REPAIR_USER_PROMPT}]
-            if agentic_stream_guard and _agentic_failed_validation_present(messages)
+            list(messages)
+            + [
+                {
+                    "role": "user",
+                    "content": (
+                        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+                        if agentic_repeated_path_repair_mode
+                        else _AGENTIC_MISSING_ARTIFACT_PROMPT
+                        if agentic_missing_requested_artifacts
+                        else _AGENTIC_REPAIR_USER_PROMPT
+                    ),
+                }
+            ]
+            if (
+                agentic_repair_mode
+                or agentic_repeated_path_repair_mode
+                or agentic_missing_requested_artifacts
+            )
             else messages
         )
-        active_kwargs = kwargs
+        active_kwargs = (
+            {
+                **kwargs,
+                "enable_thinking": False,
+                "structured_cot": False,
+                "max_tokens": min(
+                    int(kwargs.get("max_tokens") or _AGENTIC_RETRY_MAX_TOKENS),
+                    _AGENTIC_RETRY_MAX_TOKENS,
+                ),
+            }
+            if (
+                agentic_repair_mode
+                or agentic_repeated_path_repair_mode
+                or agentic_missing_requested_artifacts
+            )
+            else kwargs
+        )
         tools_disabled_for_retry = False
         repeated_tool_retry_active = False
         recent_tool_call_signature = _last_assistant_tool_call_signature(messages)
         recent_tool_call_path_signature = _last_assistant_tool_call_path_signature(
             messages
+        )
+        latest_result_mentions_recent_path = (
+            bool(recent_tool_call_path_signature)
+            and _latest_tool_result_mentions_path(
+                messages,
+                recent_tool_call_path_signature[1],
+            )
         )
         last_message = active_messages[-1] if active_messages else {}
         last_content = (
@@ -2043,14 +2115,22 @@ async def stream_chat_completion(
             tool_continuation_retry
             and last_content == _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
         )
+        agentic_task_complete = (
+            cfg.agentic_guard
+            and bool(request.tools)
+            and _agentic_completion_needs_verification(messages)
+            and _agentic_verification_present(messages)
+            and not _agentic_requested_artifacts_missing(messages)
+        )
         structured_agentic_continuation = (
             (
                 tool_continuation_retry
                 or agentic_stream_guard
             )
-            and cfg.structured_cot_tools
+            and (cfg.structured_cot_tools or agentic_stream_guard)
             and bool(request.tools)
             and not repeated_tool_continuation
+            and not agentic_task_complete
         )
         tool_retries_enabled = (
             bool(request.tools)
@@ -2061,34 +2141,64 @@ async def stream_chat_completion(
             and not repeated_tool_continuation
         )
         max_tool_continuation_retries = (
-            6
+            2
+            if agentic_stream_guard
+            else 6
             if structured_agentic_continuation
             else (2 if tool_retries_enabled else 0)
         )
-        max_repeated_tool_retries = 2 if tool_continuation_retry else 0
+        max_repeated_tool_retries = (
+            2 if tool_continuation_retry or agentic_missing_requested_artifacts else 0
+        )
         retry_prompt = (
             _TOOL_CONTINUATION_RETRY_PROMPT
             if tool_continuation_retry
             else _TOOL_CALL_REQUIRED_RETRY_PROMPT
         )
+        if agentic_stream_guard:
+            text_before_tool_call_max_chars = _AGENTIC_TEXT_BEFORE_TOOL_CALL_MAX_CHARS
+        else:
+            text_before_tool_call_max_chars = _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS
         configured_timeout = request.timeout or cfg.default_timeout
         stream_idle_timeout = min(configured_timeout, _STREAM_IDLE_TIMEOUT_SECONDS)
 
         while True:
+            agentic_task_active = (
+                cfg.agentic_guard
+                and bool(request.tools)
+                and _agentic_completion_needs_verification(messages)
+                and not agentic_task_complete
+            )
             active_tool_retries_enabled = (
                 tool_retries_enabled
                 and not tools_disabled_for_retry
                 and not repeated_tool_retry_active
             )
             repeat_tool_detection_enabled = (
-                (tool_continuation_retry or agentic_stream_guard)
+                tool_continuation_retry
+                and not cfg.agentic_guard
+                and not agentic_repair_mode
+                and not _last_tool_result_indicates_failure(messages)
                 and bool(
                     recent_tool_call_signature or recent_tool_call_path_signature
                 )
                 and not tools_disabled_for_retry
             )
+            agentic_repeated_path_detection_enabled = (
+                agentic_repeated_path_repair_mode
+                and bool(recent_tool_call_path_signature)
+                and not tools_disabled_for_retry
+            )
+            agentic_repeated_inspection_detection_enabled = (
+                agentic_missing_requested_artifacts
+                and bool(recent_tool_call_signature)
+                and not tools_disabled_for_retry
+            )
             tool_call_buffering_enabled = (
-                active_tool_retries_enabled or repeat_tool_detection_enabled
+                active_tool_retries_enabled
+                or repeat_tool_detection_enabled
+                or agentic_repeated_path_detection_enabled
+                or agentic_repeated_inspection_detection_enabled
             )
             tool_call_buffering_active = tool_call_buffering_enabled
             # Initialize post-processor
@@ -2144,7 +2254,6 @@ async def stream_chat_completion(
 
                     retry_window = (
                         active_tool_retries_enabled
-                        and retry_attempts < max_tool_continuation_retries
                         and not emitted_tool_call
                     )
 
@@ -2154,16 +2263,19 @@ async def stream_chat_completion(
                             buffered_text = _buffered_stream_text(buffered_events)
                             if (
                                 len(buffered_text)
-                                > _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS
+                                > text_before_tool_call_max_chars
                             ):
                                 retry_reason = "too much text before tool call"
                                 logger.info(
                                     "[tool-continuation] buffered text exceeded %d "
                                     "chars before tool call; aborting current stream",
-                                    _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS,
+                                    text_before_tool_call_max_chars,
                                 )
                                 break
-                            if _is_repetitive_tool_text(buffered_text):
+                            if (
+                                not agentic_stream_guard
+                                and _is_repetitive_tool_text(buffered_text)
+                            ):
                                 retry_reason = "repetitive text before tool call"
                                 logger.info(
                                     "[tool-continuation] detected repetitive text "
@@ -2191,7 +2303,11 @@ async def stream_chat_completion(
                         if tool_call_buffering_active and event.type == "tool_call":
                             buffered_tool_call_events.append((event, output))
                             if (
-                                repeat_tool_detection_enabled
+                                (
+                                    repeat_tool_detection_enabled
+                                    or agentic_repeated_path_detection_enabled
+                                )
+                                and not latest_result_mentions_recent_path
                                 and _buffered_tool_call_repeats_recent_path(
                                     buffered_tool_call_events,
                                     recent_tool_call_path_signature,
@@ -2290,16 +2406,27 @@ async def stream_chat_completion(
 
             if not retry_reason and buffered_tool_call_events:
                 if _buffered_tool_calls_complete(buffered_tool_call_events):
-                    if tool_continuation_retry and (
-                        _buffered_tool_call_repeats_recent(
+                    buffered_repeats_recent_tool = (
+                        (
+                            repeat_tool_detection_enabled
+                            or agentic_repeated_inspection_detection_enabled
+                        )
+                        and _buffered_tool_call_repeats_recent(
                             buffered_tool_call_events,
                             recent_tool_call_signature,
                         )
-                        or _buffered_tool_call_repeats_recent_path(
+                    )
+                    buffered_repeats_recent_path = (
+                        (
+                            repeat_tool_detection_enabled
+                            or agentic_repeated_path_detection_enabled
+                        )
+                        and _buffered_tool_call_repeats_recent_path(
                             buffered_tool_call_events,
                             recent_tool_call_path_signature,
                         )
-                    ):
+                    )
+                    if buffered_repeats_recent_tool or buffered_repeats_recent_path:
                         retry_reason = "repeated tool call"
                     else:
                         emitted_tool_call = True
@@ -2379,30 +2506,55 @@ async def stream_chat_completion(
                     **kwargs,
                     "enable_thinking": False,
                     "structured_cot": False,
-                    "max_tokens": min(int(kwargs.get("max_tokens") or 512), 512),
+                    "max_tokens": min(
+                        int(
+                            kwargs.get("max_tokens")
+                            or (
+                                _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS
+                                if retry_reason
+                                == "stream exhausted without tool call"
+                                else _AGENTIC_RETRY_MAX_TOKENS
+                            )
+                        ),
+                        (
+                            _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS
+                            if retry_reason == "stream exhausted without tool call"
+                            else _AGENTIC_RETRY_MAX_TOKENS
+                        ),
+                    )
+                    if agentic_stream_guard
+                    else min(int(kwargs.get("max_tokens") or 512), 512),
                 }
                 tools_disabled_for_retry = False
-                repeated_tool_retry_active = retry_reason == "repeated tool call"
+                repeated_tool_retry_active = (
+                    retry_reason == "repeated tool call" and not agentic_stream_guard
+                )
                 continue
 
-            forced_tool_calls = None
-            if retry_reason and agentic_stream_guard:
-                forced_tool_calls = _agentic_forced_snake_scaffold_tool_call(
-                    request.tools,
-                    messages,
-                ) or _agentic_forced_package_repair_tool_call(
-                    request.tools,
-                    messages,
-                ) or _agentic_forced_verification_tool_call(request.tools)
-            if forced_tool_calls:
-                logger.info(
-                    "[agentic-guard] stream retry budget exhausted; forcing "
-                    "verification tool call"
+            if (
+                retry_reason
+                and agentic_stream_guard
+                and "bash" in _tool_names(request.tools)
+            ):
+                if buffered_events or buffered_tool_call_events:
+                    logger.warning(
+                        "[tool-continuation] suppressing buffered %s after retry "
+                        "budget exhausted",
+                        retry_reason,
+                    )
+                    buffered_events.clear()
+                    buffered_tool_call_events.clear()
+                    deferred_finish = None
+                else:
+                    logger.warning(
+                        "[tool-continuation] forcing diagnostic after %s retry "
+                        "budget exhausted with no buffered output",
+                        retry_reason,
+                    )
+                yield _format_forced_tool_call(
+                    [_agentic_diagnostic_tool_call()],
+                    last_output,
                 )
-                buffered_events.clear()
-                buffered_tool_call_events.clear()
-                deferred_finish = None
-                yield _format_forced_tool_call(forced_tool_calls, last_output)
                 break
 
             if retry_reason and (buffered_events or buffered_tool_call_events):
@@ -2414,6 +2566,12 @@ async def stream_chat_completion(
                 buffered_events.clear()
                 buffered_tool_call_events.clear()
                 deferred_finish = None
+                fallback_text = (
+                    "I could not produce a valid tool call after retries."
+                )
+                _fallback_sse = _fast_sse_chunk(fallback_text, "content")
+                if _fallback_sse:
+                    yield _fallback_sse
                 finish_chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_resolve_model_name(request.model),

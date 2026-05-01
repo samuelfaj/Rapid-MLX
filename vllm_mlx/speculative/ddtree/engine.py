@@ -390,7 +390,10 @@ def generate_ddtree(
         "ngram_verify": 0.0,
         "tree_build": 0.0,
         "tree_verify": 0.0,
+        "tree_verify_attention": 0.0,
+        "tree_verify_linear": 0.0,
         "commit": 0.0,
+        "hidden_extraction": 0.0,
     }
     fast_path_count = 0
     ddtree_cycles_completed = 0
@@ -448,6 +451,9 @@ def generate_ddtree(
         + 32
     )
     stop_text_tail = ""
+    max_cycles = int(os.environ.get("DDTREE_MAX_CYCLES", str(max(16, max_new_tokens * 4))))
+    no_progress_cycles = 0
+    max_no_progress_cycles = int(os.environ.get("DDTREE_MAX_NO_PROGRESS_CYCLES", "2"))
 
     def apply_logits_processors(context_tokens: list[int], logits: mx.array) -> mx.array:
         processed = logits
@@ -557,10 +563,14 @@ def generate_ddtree(
 
             commit_started = time.perf_counter_ns()
             if ngram_draft_accepted == len(draft_tokens):
+                hidden_started = time.perf_counter_ns()
                 target_hidden = extract_context_feature_from_dict(
                     verify_hidden_raw,
                     list(draft_model.config.target_layer_ids),
                 )
+                phase_timings_us["hidden_extraction"] += (
+                    time.perf_counter_ns() - hidden_started
+                ) / 1_000.0
             else:
                 accepted_ids = mx.array([accepted_token_ids], dtype=mx.uint32)
                 _, committed_hidden_raw = slow_path_commit(
@@ -570,10 +580,14 @@ def generate_ddtree(
                     accepted_ids,
                     capture_layer_ids=capture_layer_ids,
                 )
+                hidden_started = time.perf_counter_ns()
                 target_hidden = extract_context_feature_from_dict(
                     committed_hidden_raw,
                     list(draft_model.config.target_layer_ids),
                 )
+                phase_timings_us["hidden_extraction"] += (
+                    time.perf_counter_ns() - hidden_started
+                ) / 1_000.0
             phase_timings_us["commit"] += (
                 time.perf_counter_ns() - commit_started
             ) / 1_000.0
@@ -620,12 +634,16 @@ def generate_ddtree(
 
             verify_started = time.perf_counter_ns()
             tree_cache_state: dict[str, Any] = {}
+            verify_profile: dict[str, Any] = {
+                "_detail": _env_bool("DDTREE_PROFILE_DETAIL", False)
+            }
             cache_snapshot = None if tree_aware_commit else snapshot_caches(target_cache)
             verify_logits, verify_hidden_raw = tree_verify_forward(
                 target_model,
                 compiled_tree=compiled_tree,
                 cache=target_cache,
                 capture_layer_ids=capture_layer_ids,
+                profile_timings=verify_profile,
                 tree_aware_linear=True,
                 tree_cache_state=tree_cache_state,
             )
@@ -643,6 +661,12 @@ def generate_ddtree(
             posterior_mx = greedy_tokens_with_mask(verify_logits_2d, suppress_mask)
             mx.eval(posterior_mx)
             phase_timings_us["tree_verify"] += (time.perf_counter_ns() - verify_started) / 1_000.0
+            phase_timings_us["tree_verify_attention"] += (
+                float(verify_profile.get("attention_ns", 0.0)) / 1_000.0
+            )
+            phase_timings_us["tree_verify_linear"] += (
+                float(verify_profile.get("linear_ns", 0.0)) / 1_000.0
+            )
 
             posterior_tokens = posterior_mx.tolist()
             accepted_indices, bonus_token = follow_verified_tree(tree.child_maps, posterior_tokens)
@@ -660,11 +684,15 @@ def generate_ddtree(
                     tree_cache_state=tree_cache_state,
                 )
                 accepted_idx_array = mx.array(accepted_indices, dtype=mx.int32)
+                hidden_started = time.perf_counter_ns()
                 target_hidden = _extract_context_feature_for_indices(
                     verify_hidden_raw,
                     list(draft_model.config.target_layer_ids),
                     accepted_idx_array,
                 )
+                phase_timings_us["hidden_extraction"] += (
+                    time.perf_counter_ns() - hidden_started
+                ) / 1_000.0
             else:
                 if cache_snapshot is None:
                     raise RuntimeError("DDTree slow-path commit missing cache snapshot")
@@ -676,10 +704,14 @@ def generate_ddtree(
                     accepted_ids,
                     capture_layer_ids=capture_layer_ids,
                 )
+                hidden_started = time.perf_counter_ns()
                 target_hidden = extract_context_feature_from_dict(
                     committed_hidden_raw,
                     list(draft_model.config.target_layer_ids),
                 )
+                phase_timings_us["hidden_extraction"] += (
+                    time.perf_counter_ns() - hidden_started
+                ) / 1_000.0
             phase_timings_us["commit"] += (time.perf_counter_ns() - commit_started) / 1_000.0
             if use_fast_path:
                 fast_path_count += 1
@@ -702,6 +734,13 @@ def generate_ddtree(
                 stop_hit = True
                 break
         generated_token_ids.extend(emitted)
+        if emitted:
+            no_progress_cycles = 0
+        else:
+            no_progress_cycles += 1
+            if no_progress_cycles >= max_no_progress_cycles:
+                cancelled = True
+                break
         if emitted:
             generated_hidden_chunks.append(target_hidden[:, : len(emitted), :])
         staged_first = mx.array([bonus_token], dtype=mx.uint32)
@@ -771,6 +810,9 @@ def generate_ddtree(
                     pass
 
         if stop_hit:
+            break
+        if cycles_completed >= max_cycles:
+            cancelled = True
             break
 
         if not used_ngram:

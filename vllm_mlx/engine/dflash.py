@@ -32,7 +32,12 @@ from .base import GenerationOutput
 from .batched import BatchedEngine
 
 logger = logging.getLogger(__name__)
-_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS = 60.0
+_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS = float(
+    os.environ.get("DFLASH_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS", "300")
+)
+_DDTREE_STOP_WAIT_SECONDS = float(
+    os.environ.get("DFLASH_DDTREE_STOP_WAIT_SECONDS", "2")
+)
 
 
 _TOOL_STOP_AFTER_STRINGS = (
@@ -87,6 +92,7 @@ class _ActiveRequest:
     ngram_tool_guard_cycles: int = 0
     cache_hit_type: str | None = None
     cached_tokens: int = 0
+    phase_timings_us: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -487,6 +493,30 @@ class DFlashEngine(BatchedEngine):
                 result.get("prefix_boundary_state"),
             )
 
+    def _should_enable_ngram_first(self, prompt: str) -> bool:
+        if not self._ngram_first_enabled:
+            return False
+        if _env_bool("DFLASH_NGRAM_FORCE", False):
+            return True
+        lowered = prompt.lower()
+        structured_markers = (
+            "json",
+            "xml",
+            "crud",
+            "schema",
+            "typescript type",
+            "interface ",
+            "tests",
+            "boilerplate",
+        )
+        if any(marker in lowered for marker in structured_markers):
+            return True
+        words = [word for word in lowered.replace("\n", " ").split(" ") if word]
+        if len(words) < 16:
+            return False
+        unique_ratio = len(set(words)) / len(words)
+        return unique_ratio <= 0.55
+
     def _run_ddtree_sync(
         self,
         prompt: str,
@@ -502,7 +532,14 @@ class DFlashEngine(BatchedEngine):
         from ..speculative.ddtree.engine import generate_ddtree, tokenize_prompt
 
         prompt_array = tokenize_prompt(self._tokenizer, prompt)
-        prompt_token_ids = prompt_array.tolist()
+        ngram_first_enabled = self._should_enable_ngram_first(prompt)
+        prompt_token_ids = []
+        if self._ddtree_capture_cache:
+            prompt_token_ids = (
+                prompt_array.tolist()
+                if hasattr(prompt_array, "tolist")
+                else list(prompt_array)
+            )
         cache_fetch = (
             self._ddtree_prefix_cache.fetch(prompt_token_ids)
             if self._ddtree_capture_cache
@@ -527,20 +564,20 @@ class DFlashEngine(BatchedEngine):
             ),
             prefix_boundary=prefix_boundary,
             ngram_num_draft_tokens=(
-                self._ngram_num_draft_tokens if self._ngram_first_enabled else None
+                self._ngram_num_draft_tokens if ngram_first_enabled else None
             ),
-            ngram_size=self._ngram_size if self._ngram_first_enabled else None,
+            ngram_size=self._ngram_size if ngram_first_enabled else None,
             ngram_min_matches=(
-                self._ngram_min_matches if self._ngram_first_enabled else None
+                self._ngram_min_matches if ngram_first_enabled else None
             ),
             ngram_disable_threshold=(
-                self._ngram_disable_threshold if self._ngram_first_enabled else None
+                self._ngram_disable_threshold if ngram_first_enabled else None
             ),
             ngram_disable_window=(
-                self._ngram_disable_window if self._ngram_first_enabled else None
+                self._ngram_disable_window if ngram_first_enabled else None
             ),
             ngram_disable_cooldown=(
-                self._ngram_disable_cooldown if self._ngram_first_enabled else None
+                self._ngram_disable_cooldown if ngram_first_enabled else None
             ),
             thinking_ngram_num_draft_tokens=self._thinking_ngram_num_draft_tokens,
             thinking_ngram_size=self._thinking_ngram_size,
@@ -629,11 +666,16 @@ class DFlashEngine(BatchedEngine):
         try:
             while True:
                 try:
-                    item = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS,
-                    )
+                    if _DDTREE_STREAM_IDLE_TIMEOUT_SECONDS > 0:
+                        item = await asyncio.wait_for(
+                            queue.get(),
+                            timeout=_DDTREE_STREAM_IDLE_TIMEOUT_SECONDS,
+                        )
+                    else:
+                        item = await queue.get()
                 except TimeoutError:
+                    if future.done():
+                        continue
                     stop_event.set()
                     logger.warning(
                         "[DDTree] no stream events for %.1fs; aborting request",
@@ -679,10 +721,28 @@ class DFlashEngine(BatchedEngine):
                     ),
                     cache_hit_type=item.get("cache_hit_type"),
                     cached_tokens=int(item.get("cached_tokens") or 0),
+                    phase_timings_us=dict(item.get("ddtree_phase_timings_us") or {}),
                 )
-            await future
+            if future.done():
+                await future
+            else:
+                stop_event.set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(future),
+                        timeout=_DDTREE_STOP_WAIT_SECONDS,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "[DDTree] worker did not stop within %.1fs after abort; "
+                        "releasing stream request",
+                        _DDTREE_STOP_WAIT_SECONDS,
+                    )
+                except Exception:
+                    logger.exception("[DDTree] worker failed after abort")
         except BaseException:
             stop_event.set()
+            future.cancel()
             raise
 
     def _make_ddtree_logits_processors(
@@ -726,7 +786,8 @@ class DFlashEngine(BatchedEngine):
                     )
                     mode = (
                         "ddtree-ngram"
-                        if self._ngram_first_enabled or self._thinking_ngram_enabled
+                        if self._should_enable_ngram_first(prompt)
+                        or self._thinking_ngram_enabled
                         else "ddtree"
                     )
                     self._track_request_start(mode)
@@ -734,7 +795,8 @@ class DFlashEngine(BatchedEngine):
                         loop = asyncio.get_running_loop()
                         executor = self._executor
                         assert executor is not None, "DFlashEngine not started"
-                        result = await loop.run_in_executor(
+                        stop_event = threading.Event()
+                        future = loop.run_in_executor(
                             executor,
                             lambda: self._run_ddtree_sync(
                                 prompt=prompt,
@@ -743,11 +805,21 @@ class DFlashEngine(BatchedEngine):
                                 tools_requested=tools_requested,
                                 prefix_boundary=prefix_boundary,
                                 emit_step_text=False,
+                                should_stop=stop_event.is_set,
                                 logits_processors=self._make_ddtree_logits_processors(
                                     logits_processor_factories
                                 ),
                             ),
                         )
+                        try:
+                            result = await future
+                        except BaseException:
+                            stop_event.set()
+                            try:
+                                await asyncio.wait_for(asyncio.shield(future), timeout=2.0)
+                            except Exception:
+                                pass
+                            raise
                         resp = SimpleNamespace(
                             tokens=list(result.get("generated_token_ids", []) or []),
                             prompt_tokens=int(result.get("prompt_tokens") or 0),
@@ -780,6 +852,9 @@ class DFlashEngine(BatchedEngine):
                             ),
                             cache_hit_type=result.get("cache_hit_type"),
                             cached_tokens=int(result.get("cached_tokens") or 0),
+                            phase_timings_us=dict(
+                                result.get("ddtree_phase_timings_us") or {}
+                            ),
                         )
                         self._update_active(resp, new_text=result.get("text", ""))
                         return GenerationOutput(
@@ -851,7 +926,10 @@ class DFlashEngine(BatchedEngine):
                 mode = (
                     "ddtree-ngram"
                     if (
-                        (self._ngram_first_enabled or self._thinking_ngram_enabled)
+                        (
+                            self._should_enable_ngram_first(prompt)
+                            or self._thinking_ngram_enabled
+                        )
                         and greedy_request
                     )
                     else (
@@ -973,6 +1051,7 @@ class DFlashEngine(BatchedEngine):
         )
         a.cache_hit_type = getattr(resp, "cache_hit_type", None)
         a.cached_tokens = int(getattr(resp, "cached_tokens", 0) or 0)
+        a.phase_timings_us = dict(getattr(resp, "phase_timings_us", {}) or {})
         history = list(resp.block_size_history or ())
         if history:
             a.block_history = history
@@ -1042,6 +1121,7 @@ class DFlashEngine(BatchedEngine):
                     "ngram_tool_guard_cycles": self._active.ngram_tool_guard_cycles,
                     "cache_hit_type": self._active.cache_hit_type,
                     "cached_tokens": self._active.cached_tokens,
+                    "phase_timings_us": self._active.phase_timings_us,
                     "progress": 0.0,
                 }
             )
@@ -1093,6 +1173,9 @@ class DFlashEngine(BatchedEngine):
                 ),
                 "ddtree_last_generation_tps": self._ddtree_last.get(
                     "generation_tps", 0.0
+                ),
+                "ddtree_last_phase_timings_us": self._ddtree_last.get(
+                    "ddtree_phase_timings_us", {}
                 ),
                 "ngram_first_enabled": self._ngram_first_enabled,
                 "ngram_num_draft_tokens": self._ngram_num_draft_tokens,

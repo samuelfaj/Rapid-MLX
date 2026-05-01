@@ -5,10 +5,17 @@ import concurrent.futures
 import sys
 import types
 
+import numpy as np
 import pytest
 
 from vllm_mlx.engine.dflash import DFlashEngine
 from vllm_mlx.speculative.ddtree.engine import _looks_like_tool_call_draft
+from vllm_mlx.speculative.ddtree.tree import build_ddtree_tree_from_topk
+
+
+class FakeTokenArray(list):
+    def tolist(self):
+        return list(self)
 
 
 @pytest.mark.asyncio
@@ -35,10 +42,12 @@ async def test_dflash_engine_routes_to_ddtree(monkeypatch):
             "ddtree_fast_path_ratio": 1.0,
             "tree_budget": 4,
             "generation_tps": 123.0,
+            "ddtree_phase_timings_us": {"draft": 10.0, "tree_verify": 20.0},
         }
 
     fake_generate_ddtree.__name__ = "generate_ddtree"
     fake_engine.generate_ddtree = fake_generate_ddtree
+    fake_engine.tokenize_prompt = lambda tokenizer, prompt: FakeTokenArray([1, 2, 3])
     monkeypatch.setitem(
         sys.modules,
         "vllm_mlx.speculative.ddtree.engine",
@@ -80,6 +89,7 @@ async def test_dflash_engine_routes_to_ddtree(monkeypatch):
     assert stats["dflash"]["ddtree_budget"] == 4
     assert stats["dflash"]["ddtree_requests"] == 1
     assert stats["dflash"]["ddtree_last_generation_tps"] == 123.0
+    assert stats["dflash"]["ddtree_last_phase_timings_us"]["tree_verify"] == 20.0
 
 
 @pytest.mark.asyncio
@@ -114,9 +124,11 @@ async def test_dflash_engine_passes_ngram_first_config(monkeypatch):
             "ngram_cycles_completed": 3,
             "ngram_fallback_cycles": 2,
             "ngram_tool_guard_cycles": 1,
+            "ddtree_phase_timings_us": {"draft": 1.0, "tree_verify_linear": 2.0},
         }
 
     fake_engine.generate_ddtree = fake_generate_ddtree
+    fake_engine.tokenize_prompt = lambda tokenizer, prompt: FakeTokenArray([1, 2, 3])
     monkeypatch.setitem(
         sys.modules,
         "vllm_mlx.speculative.ddtree.engine",
@@ -145,7 +157,7 @@ async def test_dflash_engine_passes_ngram_first_config(monkeypatch):
     try:
         outputs = []
         async for output in engine.stream_generate(
-            "prompt",
+            "Create CRUD JSON tests for a schema.",
             max_tokens=8,
             temperature=0,
             top_p=1,
@@ -169,6 +181,33 @@ async def test_dflash_engine_passes_ngram_first_config(monkeypatch):
     assert stats["dflash"]["ngram_last_cycles"] == 3
     assert stats["dflash"]["ngram_last_fallback_cycles"] == 2
     assert stats["dflash"]["ngram_last_tool_guard_cycles"] == 1
+
+
+def test_ddtree_builder_preseeds_top1_chain(monkeypatch):
+    monkeypatch.delenv("DDTREE_CHAIN_PRESEED", raising=False)
+    top_token_ids = np.array(
+        [
+            [10, 11],
+            [20, 21],
+            [30, 31],
+            [40, 41],
+        ],
+        dtype=np.int64,
+    )
+    top_log_probs = np.array(
+        [
+            [-0.01, -0.02],
+            [-1.20, -1.21],
+            [-1.20, -1.21],
+            [-1.20, -1.21],
+        ],
+        dtype=np.float32,
+    )
+
+    tree = build_ddtree_tree_from_topk(top_token_ids, top_log_probs, budget=4)
+
+    assert tree.node_token_ids.tolist() == [10, 20, 30, 40]
+    assert tree.parents == [-1, 0, 1, 2, 3]
 
 
 def test_ddtree_ngram_tool_call_guard_detects_xml_markers():

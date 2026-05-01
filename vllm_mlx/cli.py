@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 
 
@@ -356,15 +357,17 @@ def serve_command(args):
     import socket
 
     _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         _sock.bind((args.host, args.port))
-        _sock.close()
     except OSError:
         print(f"\n  Error: Port {args.port} is already in use.")
         print(
             f"  Try a different port: rapid-mlx serve {args.model} --port {args.port + 1}"
         )
         sys.exit(1)
+    finally:
+        _sock.close()
 
     # Check disk space before downloading model
     _check_disk_space(args.model)
@@ -1152,8 +1155,8 @@ Examples:
     serve_parser.add_argument(
         "--max-tokens",
         type=int,
-        default=32768,
-        help="Default max tokens for generation (default: 32768)",
+        default=int(os.environ.get("RAPID_MLX_DEFAULT_MAX_TOKENS", "4096")),
+        help="Default max tokens for generation (default: 4096)",
     )
     serve_parser.add_argument(
         "--continuous-batching",

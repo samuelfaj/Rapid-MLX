@@ -9,6 +9,7 @@ search over per-position draft distributions under a fixed node budget.
 from __future__ import annotations
 
 import heapq
+import os
 from typing import NamedTuple
 
 import numpy as np
@@ -57,13 +58,16 @@ def build_ddtree_tree_from_topk(
     top_log_probs = np.asarray(top_log_probs, dtype=np.float32)
     topk = min(int(budget), int(top_token_ids.shape[1]))
     depth_limit = int(top_token_ids.shape[0])
+    preseed_chain = os.environ.get("DDTREE_CHAIN_PRESEED", "1").lower() not in (
+        "",
+        "0",
+        "false",
+        "off",
+    )
 
     # Best-first heap search (Algorithm 1)
     # Heap entries: (-logw, ranks_tuple, parent_index, depth, rank, logw)
-    first_logw = float(top_log_probs[0, 0])
-    heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [
-        (-first_logw, (0,), 0, 1, 0, first_logw)
-    ]
+    heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = []
 
     node_token_ids = np.empty(budget, dtype=np.int64)
     node_depths = np.empty(budget, dtype=np.int64)
@@ -71,6 +75,44 @@ def build_ddtree_tree_from_topk(
     parents[0] = -1
     child_maps: list[dict[int, int]] = [{}]
     node_count = 0
+
+    if preseed_chain:
+        chain_logw = 0.0
+        parent_index = 0
+        for depth in range(1, min(depth_limit, int(budget)) + 1):
+            rank = 0
+            chain_logw += float(top_log_probs[depth - 1, rank])
+            token_id = int(top_token_ids[depth - 1, rank])
+            current_index = node_count + 1
+            node_token_ids[node_count] = token_id
+            node_depths[node_count] = depth
+            parents[current_index] = parent_index
+            child_maps.append({})
+            child_maps[parent_index][token_id] = current_index
+            node_count += 1
+
+            if rank + 1 < topk:
+                sibling_logw = (
+                    chain_logw
+                    - float(top_log_probs[depth - 1, rank])
+                    + float(top_log_probs[depth - 1, rank + 1])
+                )
+                sibling_ranks = (0,) * (depth - 1) + (rank + 1,)
+                heapq.heappush(
+                    heap,
+                    (
+                        -sibling_logw,
+                        sibling_ranks,
+                        parent_index,
+                        depth,
+                        rank + 1,
+                        sibling_logw,
+                    ),
+                )
+            parent_index = current_index
+    else:
+        first_logw = float(top_log_probs[0, 0])
+        heapq.heappush(heap, (-first_logw, (0,), 0, 1, 0, first_logw))
 
     while heap and node_count < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)

@@ -98,13 +98,14 @@ def _resolve_model_name(request_model: str | None) -> str:
 def _resolve_max_tokens(
     request_value: int | None, enable_thinking: bool | None = None
 ) -> int:
-    """Resolve max_tokens with thinking budget for reasoning models."""
+    """Resolve max_tokens and cap client requests to the server default."""
     cfg = get_config()
-    base = request_value if request_value is not None else cfg.default_max_tokens
+    requested = request_value if request_value is not None else cfg.default_max_tokens
+    base = min(int(requested), int(cfg.default_max_tokens))
     if enable_thinking is False:
         return base
     if cfg.reasoning_parser_name and base > 0 and base < 4096:
-        return base + cfg.thinking_token_budget
+        return min(base + cfg.thinking_token_budget, int(cfg.default_max_tokens))
     return base
 
 
@@ -699,6 +700,7 @@ async def _disconnect_guard(
     generator: AsyncIterator[str],
     raw_request: Request,
     poll_interval: float = 0.5,
+    timeout: float | None = None,
 ) -> AsyncIterator[str]:
     """Wrap streaming generator to abort on client disconnect."""
     import time as _time
@@ -708,7 +710,9 @@ async def _disconnect_guard(
     def _elapsed():
         return f"{_time.monotonic() - _t0:.1f}s"
 
-    logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
+    logger.info(
+        f"[disconnect_guard] START poll_interval={poll_interval}s timeout={timeout}"
+    )
 
     async def _wait_disconnect():
         poll_count = 0
@@ -732,10 +736,52 @@ async def _disconnect_guard(
         disconnect_task = asyncio.create_task(_wait_disconnect())
         while True:
             anext_task = asyncio.ensure_future(aiter.__anext__())
-            done, _ = await asyncio.wait(
-                [anext_task, disconnect_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            while True:
+                remaining = None
+                if timeout is not None:
+                    remaining = timeout - (_time.monotonic() - _t0)
+                    if remaining <= 0:
+                        logger.warning(
+                            "[disconnect_guard] stream timed out after %s, "
+                            "%d chunks, elapsed=%s",
+                            timeout,
+                            chunk_count,
+                            _elapsed(),
+                        )
+                        anext_task.cancel()
+                        try:
+                            await asyncio.wait_for(anext_task, timeout=1.0)
+                        except (
+                            asyncio.CancelledError,
+                            StopAsyncIteration,
+                            TimeoutError,
+                            Exception,
+                        ):
+                            pass
+                        error_data = json.dumps(
+                            {
+                                "error": {
+                                    "message": (
+                                        f"Request timed out after {timeout:.1f} seconds"
+                                    ),
+                                    "type": "TimeoutError",
+                                }
+                            }
+                        )
+                        yield f"data: {error_data}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+
+                wait_timeout = poll_interval
+                if remaining is not None:
+                    wait_timeout = min(wait_timeout, max(remaining, 0.0))
+                done, _ = await asyncio.wait(
+                    [anext_task, disconnect_task],
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if done:
+                    break
             if disconnect_task in done:
                 logger.info(
                     f"[disconnect_guard] CLIENT DISCONNECTED after "

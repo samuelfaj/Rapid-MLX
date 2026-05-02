@@ -1148,7 +1148,7 @@ async def test_agentic_guard_forces_dependency_install_after_missing_dependency(
 
     assert engine.calls == 0
     assert any('"tool_calls"' in chunk for chunk in chunks)
-    assert any("bun install" in chunk for chunk in chunks)
+    assert any("bun add express" in chunk for chunk in chunks)
     assert _AGENTIC_DEPENDENCY_INSTALL_COMMAND
 
 

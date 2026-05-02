@@ -562,17 +562,6 @@ def _agentic_validation_evidence_present(messages: list) -> bool:
 
 
 def _agentic_failed_validation_present(messages: list) -> bool:
-    transcript = _agentic_transcript(messages).lower()
-    latest_success_index = max(
-        transcript.rfind("validation_passed"),
-        transcript.rfind("validation passed"),
-        transcript.rfind("all checks passed"),
-        transcript.rfind("tests passed"),
-        transcript.rfind("build passed"),
-        transcript.rfind("lint passed"),
-    )
-    if latest_success_index != -1:
-        transcript = transcript[latest_success_index:]
     explicit_failure_markers = (
         "validation_failed",
         "missing script",
@@ -580,8 +569,6 @@ def _agentic_failed_validation_present(messages: list) -> bool:
         "no test files found",
         "no tests found",
     )
-    if any(marker in transcript for marker in explicit_failure_markers):
-        return True
     failure_markers = (
         "validation_failed",
         "command exited with code",
@@ -606,6 +593,25 @@ def _agentic_failed_validation_present(messages: list) -> bool:
         "found 4 occurrences",
         "found 5 occurrences",
     )
+    success_markers = (
+        "validation_passed",
+        "validation passed",
+        "all checks passed",
+        "tests passed",
+        "build passed",
+        "lint passed",
+    )
+    for message in reversed(messages):
+        if _agentic_message_role(message) != "tool":
+            continue
+        tool_text = _message_content_text(message).lower()
+        if any(marker in tool_text for marker in explicit_failure_markers):
+            return True
+        if any(marker in tool_text for marker in failure_markers):
+            return True
+        if any(marker in tool_text for marker in success_markers):
+            return False
+    transcript = _agentic_transcript(messages).lower()
     return any(marker in transcript for marker in failure_markers)
 
 
@@ -665,7 +671,16 @@ def _last_tool_result_missing_dependency(messages: list) -> str | None:
             continue
         text = _message_content_text(message)
         lower_text = text.lower()
-        if "dependencies_missing" in lower_text or "cannot find package" in lower_text:
+        package_match = re.search(
+            r"cannot find package\s+['\"]([^'\"]+)['\"]",
+            lower_text,
+        )
+        if package_match:
+            package_name = package_match.group(1)
+            if package_name.startswith((".", "/")) or package_name.startswith("file:"):
+                return None
+            return package_name
+        if "dependencies_missing" in lower_text:
             return ""
         package_hint = re.search(
             r"install\s+([@a-z0-9_.\-/]+)\s+(?:package|module|dependency)",

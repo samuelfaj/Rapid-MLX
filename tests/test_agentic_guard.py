@@ -8,6 +8,7 @@ from vllm_mlx.routes.chat import (
     _agentic_requested_artifacts_missing,
     _agentic_task_terminal_ready,
     _agentic_verification_present,
+    _last_tool_result_missing_dependency,
 )
 from vllm_mlx.service.helpers import _disconnect_guard
 
@@ -622,6 +623,41 @@ def test_agentic_failed_validation_persists_after_plain_success_exit_code():
                 "content": "Command exited with code 0",
             },
         ]
+    )
+
+
+def test_agentic_failed_validation_failure_wins_over_same_output_success_marker():
+    assert _agentic_failed_validation_present(
+        [
+            {
+                "role": "tool",
+                "content": (
+                    "bun test v1.3.13\n"
+                    "error: Cannot find package 'sequelize-typescript'\n"
+                    "0 pass\n"
+                    "3 fail\n"
+                    "3 errors\n"
+                    "VALIDATION_PASSED"
+                ),
+            }
+        ]
+    )
+
+
+def test_agentic_missing_dependency_extracts_cannot_find_package_name():
+    assert (
+        _last_tool_result_missing_dependency(
+            [
+                {
+                    "role": "tool",
+                    "content": (
+                        "error: Cannot find package 'sequelize-typescript' "
+                        "from '/tmp/app/src/models/User.ts'"
+                    ),
+                }
+            ]
+        )
+        == "sequelize-typescript"
     )
 
 

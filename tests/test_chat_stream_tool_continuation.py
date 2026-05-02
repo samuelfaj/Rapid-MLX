@@ -1301,6 +1301,9 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "package module does not export a named symbol" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "prefer deleting that symbol usage or replacing it with plain local checks" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "fix every importer using that package consistently" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )

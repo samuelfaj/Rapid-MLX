@@ -109,7 +109,7 @@ class SpeculativePrefillCompressor:
                 "protected_floor",
             )
 
-        scores, draft_used = self._score_tokens(tokens, tokenizer)
+        scores, draft_used = self._score_tokens(prompt, tokens, tokenizer)
         keep = set(protected)
         candidates = [
             (scores[idx], idx)
@@ -160,19 +160,23 @@ class SpeculativePrefillCompressor:
         )
         return result
 
-    def _score_tokens(self, tokens: list[int], tokenizer: Any) -> tuple[list[float], bool]:
+    def _score_tokens(
+        self, prompt: str, tokens: list[int], tokenizer: Any
+    ) -> tuple[list[float], bool]:
         if self._score_fn is not None:
             scores = self._score_fn(tokens, tokenizer)
             if len(scores) == len(tokens):
                 return list(scores), False
 
-        draft_scores = self._draft_model_scores(tokens)
+        draft_scores = self._draft_model_scores(prompt, tokenizer, tokens)
         if draft_scores is not None:
             return draft_scores, True
 
         return self._lexical_scores(tokens, tokenizer), False
 
-    def _draft_model_scores(self, tokens: list[int]) -> list[float] | None:
+    def _draft_model_scores(
+        self, prompt: str, target_tokenizer: Any, target_tokens: list[int]
+    ) -> list[float] | None:
         cfg = self.config
         if not cfg.draft_model_path or self._draft_load_failed:
             return None
@@ -188,15 +192,16 @@ class SpeculativePrefillCompressor:
                     tokenizer_config={"trust_remote_code": True},
                 )
 
-            if len(tokens) < 2:
-                return [1.0] * len(tokens)
-            input_ids = mx.array([tokens[:-1]])
+            draft_tokens = _encode(self._draft_tokenizer, prompt)
+            if len(draft_tokens) < 2:
+                return [1.0] * len(target_tokens)
+            input_ids = mx.array([draft_tokens[:-1]])
             output = self._draft_model(input_ids)
             logits = output.logits if hasattr(output, "logits") else output
             logits = logits.astype(mx.float32)
             mx.eval(logits)
             logits_np = np.asarray(logits[0])
-            next_ids = np.asarray(tokens[1:], dtype=np.int64)
+            next_ids = np.asarray(draft_tokens[1:], dtype=np.int64)
             logits_np = logits_np - logits_np.max(axis=-1, keepdims=True)
             exp = np.exp(logits_np)
             probs = exp / exp.sum(axis=-1, keepdims=True)
@@ -204,7 +209,14 @@ class SpeculativePrefillCompressor:
             scores = [float(surprisal[0]) if len(surprisal) else 1.0]
             scores.extend(float(v) for v in surprisal)
             mx.clear_cache()
-            return scores[: len(tokens)]
+            return _align_token_scores(
+                prompt,
+                target_tokenizer,
+                target_tokens,
+                self._draft_tokenizer,
+                draft_tokens,
+                scores[: len(draft_tokens)],
+            )
         except Exception as exc:
             self._draft_load_failed = True
             logger.warning("[speculative-prefill] draft scorer disabled: %s", exc)
@@ -238,12 +250,7 @@ class SpeculativePrefillCompressor:
             return set()
 
         protected: set[int] = set()
-        cursor = 0
-        for idx, token in enumerate(tokens):
-            piece = _decode(tokenizer, [token])
-            start = cursor
-            end = cursor + len(piece)
-            cursor = end
+        for idx, (start, end) in enumerate(_token_char_spans(tokenizer, prompt, tokens)):
             if any(start < span_end and end > span_start for span_start, span_end in spans):
                 protected.add(idx)
         return protected
@@ -292,3 +299,62 @@ def _decode(tokenizer: Any, tokens: list[int]) -> str:
     if hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     return tokenizer.decode(tokens)
+
+
+def _token_char_spans(tokenizer: Any, text: str, tokens: list[int]) -> list[tuple[int, int]]:
+    raw_tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+    if callable(raw_tokenizer):
+        try:
+            encoded = raw_tokenizer(
+                text,
+                return_offsets_mapping=True,
+                add_special_tokens=False,
+            )
+            offsets = encoded.get("offset_mapping") if isinstance(encoded, dict) else None
+            if offsets and len(offsets) == len(tokens):
+                return [(int(start), int(end)) for start, end in offsets]
+        except Exception:
+            pass
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for token in tokens:
+        piece = _decode(tokenizer, [token])
+        start = cursor
+        end = min(len(text), start + len(piece))
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def _align_token_scores(
+    prompt: str,
+    target_tokenizer: Any,
+    target_tokens: list[int],
+    draft_tokenizer: Any,
+    draft_tokens: list[int],
+    draft_scores: list[float],
+) -> list[float]:
+    if not target_tokens:
+        return []
+    if not draft_tokens or len(draft_scores) != len(draft_tokens):
+        return [1.0] * len(target_tokens)
+
+    target_spans = _token_char_spans(target_tokenizer, prompt, target_tokens)
+    draft_spans = _token_char_spans(draft_tokenizer, prompt, draft_tokens)
+    aligned: list[float] = []
+    draft_idx = 0
+    for target_start, target_end in target_spans:
+        while draft_idx < len(draft_spans) and draft_spans[draft_idx][1] <= target_start:
+            draft_idx += 1
+        overlapping: list[float] = []
+        scan_idx = draft_idx
+        while scan_idx < len(draft_spans):
+            draft_start, draft_end = draft_spans[scan_idx]
+            if draft_start >= target_end:
+                break
+            if draft_start < target_end and draft_end > target_start:
+                overlapping.append(float(draft_scores[scan_idx]))
+            scan_idx += 1
+        aligned.append(max(overlapping) if overlapping else 1.0)
+    return aligned

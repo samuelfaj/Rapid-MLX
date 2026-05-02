@@ -310,6 +310,43 @@ _AGENTIC_REPEATED_TOOL_PROMPT = (
     "file once with a consistent export style, or change the related loader, "
     "registration, config, or importer that is actually enforcing the convention."
 )
+_AGENTIC_NO_CHANGE_REPAIR_PROMPT = (
+    "The previous tool result says the edit made no changes. That is not a "
+    "repair. Your entire next response must be one valid tool call only. Do "
+    "not use the same edit again. If the target file is still the file that "
+    "must change, use write with the complete corrected file content. If the "
+    "latest validation error points to a different file, edit or write that "
+    "different file instead. Do not run validation again until a file actually "
+    "changes."
+)
+_AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT = (
+    "The latest validation failure is a local import path error. Your entire "
+    "next response must be one valid write or edit tool call only. Do not "
+    "install a package for a relative path. Fix the import in the failing file "
+    "by calculating the path from that file's directory to the existing target "
+    "file. If the failing file already lives under src, do not import through "
+    "../src or ./src. Use ./ for same-directory modules and ../ only for real "
+    "parent directories. Do not run validation again until the import path has "
+    "changed."
+)
+_AGENTIC_BUN_TEST_REPAIR_PROMPT = (
+    "The latest validation failure is a Bun test using Jest APIs or Jest-only "
+    "types. Your entire next response must be one valid write or edit tool "
+    "call only. Do not install Jest to fix a Bun test. Replace jest.fn, "
+    "jest.clearAllMocks, jest.mock, and imports from jest with Bun-supported "
+    "test utilities from bun:test, such as mock, beforeEach, afterEach, "
+    "describe, expect, and test. Remove Jest-only type dependencies or globals "
+    "from the failing test files if they are only there for tests."
+)
+_AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT = (
+    "The latest tool output shows a Bun project installing or declaring Jest "
+    "test tooling. Your entire next response must be one valid write or edit "
+    "tool call only. Do not add new source features. Edit package.json to "
+    "remove jest, ts-jest, @types/jest, Jest scripts, and Jest config. Keep "
+    "Bun's test runner and bun:test types instead. If existing tests import "
+    "or call Jest APIs, update those tests to bun:test in the same file change "
+    "only when that file is the target."
+)
 _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT = (
     "Your previous shell tool call would delete source or generated project "
     "artifacts that are still needed for the requested implementation. Do not "
@@ -891,6 +928,8 @@ def _last_tool_result_missing_dependency(messages: list) -> str | None:
             package_name = package_match.group(1)
             if package_name.startswith((".", "/")) or package_name.startswith("file:"):
                 return None
+            if package_name == "jest" and "bun test" in lower_text:
+                return None
             return package_name
         if "dependencies_missing" in lower_text:
             return ""
@@ -950,7 +989,109 @@ def _last_tool_result_service_db_test_failure(messages: list) -> bool:
     return False
 
 
+def _last_tool_result_no_change(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return (
+            "no changes made" in text
+            or "replacement produced identical content" in text
+            or "oldtext was not found" in text
+            or "oldtext must be unique" in text
+        )
+    return False
+
+
+def _last_tool_result_local_import_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "cannot find module" not in text:
+            return False
+        module_match = re.search(r"cannot find module\s+['\"]([^'\"]+)['\"]", text)
+        if not module_match:
+            return False
+        module_name = module_match.group(1)
+        return (
+            module_name.startswith((".", "/"))
+            or "/src/" in module_name
+            or module_name.startswith("src/")
+        )
+    return False
+
+
+def _last_tool_result_bun_jest_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "bun test" not in text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "jest is not defined",
+                "jest.fn is not a function",
+                "jest.clearallmocks is not a function",
+                "cannot find package 'jest'",
+                'cannot find package "jest"',
+            )
+        )
+    return False
+
+
+def _last_tool_result_bun_jest_manifest(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "bun " not in text and "bun-types" not in text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "+ jest@",
+                "+ ts-jest@",
+                "+ @types/jest@",
+                '"jest"',
+                '"ts-jest"',
+                '"@types/jest"',
+            )
+        )
+    return False
+
+
 def _agentic_repair_prompt(messages: list) -> str:
+    if _last_tool_result_no_change(messages):
+        return _AGENTIC_NO_CHANGE_REPAIR_PROMPT
+    if _last_tool_result_local_import_failure(messages):
+        return _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT
+    if _last_tool_result_bun_jest_manifest(messages):
+        return _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT
+    if _last_tool_result_bun_jest_failure(messages):
+        return _AGENTIC_BUN_TEST_REPAIR_PROMPT
     if _last_tool_result_service_db_test_failure(messages):
         return _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
     return _AGENTIC_REPAIR_USER_PROMPT

@@ -5,6 +5,7 @@ from vllm_mlx.engine.batched import BatchedEngine
 from vllm_mlx.speculative.prefill import (
     SpeculativePrefillCompressor,
     SpeculativePrefillConfig,
+    _align_token_scores,
 )
 
 
@@ -33,6 +34,28 @@ class StableWordTokenizer:
 
     def decode(self, tokens):
         return " ".join(self._pieces[token] for token in tokens)
+
+
+class OffsetTokenizer:
+    def __init__(self, pieces):
+        self.pieces = pieces
+        self._ids = {piece: idx for idx, piece in enumerate(pieces)}
+
+    def __call__(self, text, return_offsets_mapping=False, add_special_tokens=False):
+        offsets = []
+        cursor = 0
+        for piece in self.pieces:
+            start = text.index(piece, cursor)
+            end = start + len(piece)
+            offsets.append((start, end))
+            cursor = end
+        return {"offset_mapping": offsets}
+
+    def encode(self, text):
+        return list(range(len(self.pieces)))
+
+    def decode(self, tokens):
+        return "".join(self.pieces[token] for token in tokens)
 
 
 def test_speculative_prefill_disabled_is_noop():
@@ -91,6 +114,23 @@ def test_speculative_prefill_preserves_protected_anchors():
 
     assert "https://example.com/api" in result.prompt
     assert "42" in result.prompt
+
+
+def test_draft_scores_align_between_different_tokenizers():
+    prompt = "alpha beta"
+    target = OffsetTokenizer(["alpha", " ", "beta"])
+    draft = OffsetTokenizer(["alpha", " beta"])
+
+    scores = _align_token_scores(
+        prompt,
+        target,
+        target.encode(prompt),
+        draft,
+        draft.encode(prompt),
+        [0.2, 9.0],
+    )
+
+    assert scores == [0.2, 9.0, 9.0]
 
 
 def test_batched_engine_compresses_only_last_user_message():

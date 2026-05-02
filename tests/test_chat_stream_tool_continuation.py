@@ -11,9 +11,12 @@ from vllm_mlx.api.models import ChatCompletionRequest
 from vllm_mlx.domain.events import StreamEvent
 from vllm_mlx.engine import GenerationOutput
 from vllm_mlx.routes.chat import (
+    _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT,
+    _AGENTIC_BUN_TEST_REPAIR_PROMPT,
     _AGENTIC_DEPENDENCY_INSTALL_COMMAND,
     _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT,
     _AGENTIC_DIAGNOSTIC_COMMAND,
+    _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT,
     _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC,
@@ -786,6 +789,54 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
     assert engine.calls == 1
     assert any("Thinking only." in chunk for chunk in chunks)
     assert not any('"tool_calls"' in chunk for chunk in chunks)
+
+
+def test_agentic_local_import_failure_uses_import_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "error: Cannot find module '../../src/modules/users/services/user.service' "
+                "from '/tmp/app/src/modules/users/services/user.service.test.ts'"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT
+
+
+def test_agentic_bun_jest_failure_uses_bun_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "ReferenceError: jest is not defined\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_BUN_TEST_REPAIR_PROMPT
+
+
+def test_agentic_bun_jest_install_uses_manifest_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "VALIDATION_FAILED\n"
+                "bun install v1.3.13\n"
+                "+ jest@29.7.0\n"
+                "+ ts-jest@29.4.9\n"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT
+    )
 
 
 @pytest.mark.asyncio

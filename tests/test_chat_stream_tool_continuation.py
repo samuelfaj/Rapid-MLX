@@ -1280,6 +1280,12 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "register the data models in a local disposable test instance" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "Do not import production database singletons into" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fresh instance per test or close it in suite cleanup" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "replace unsupported mock-runner calls with simple" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
@@ -1297,6 +1303,9 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     )
     assert "duplicate declarations" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no default export" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "expects either a default export or a named export matching" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "export named symbol was not found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "before initialization" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_DIAGNOSTIC_COMMAND

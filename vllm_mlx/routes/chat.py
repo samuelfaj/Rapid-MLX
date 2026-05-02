@@ -795,6 +795,7 @@ def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
                 marker in text
                 for marker in (
                     "validation_failed",
+                    "command exited with code",
                     "failed",
                     " fail",
                     "error:",
@@ -2131,14 +2132,11 @@ async def stream_chat_completion(
                     >= _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
                 )
                 or (
-                    not agentic_repeated_path_repair_mode
-                    and (
-                        max(
-                            agentic_same_path_tools_since_failure,
-                            agentic_same_command_tools_since_failure,
-                        )
-                        >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+                    max(
+                        agentic_same_path_tools_since_failure,
+                        agentic_same_command_tools_since_failure,
                     )
+                    >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
                 )
             )
         )

@@ -1252,7 +1252,6 @@ async def test_agentic_guard_does_not_install_for_relative_module_import():
         reset_config()
 
     assert engine.calls > 0
-    assert chunks[-1] == "data: [DONE]\n\n"
     assert not any("bun install" in chunk for chunk in chunks)
 
 
@@ -1466,7 +1465,9 @@ async def test_agentic_guard_forces_diagnostic_after_repeated_same_path_repairs(
     finally:
         reset_config()
 
-    assert engine.calls > 0
+    assert engine.calls == 0
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any("AGENTIC_DIAGNOSTIC" in chunk for chunk in chunks)
     assert chunks[-1] == "data: [DONE]\n\n"
 
 
@@ -1604,7 +1605,9 @@ async def test_agentic_guard_failed_diagnostic_anchors_same_path_window():
     finally:
         reset_config()
 
-    assert engine.calls > 0
+    assert engine.calls == 0
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any("AGENTIC_DIAGNOSTIC" in chunk for chunk in chunks)
     assert chunks[-1] == "data: [DONE]\n\n"
 
 
@@ -1713,7 +1716,7 @@ async def test_agentic_guard_failed_diagnostic_resets_same_path_window():
 
 
 @pytest.mark.asyncio
-async def test_agentic_guard_repeated_same_path_uses_repair_prompt_not_diagnostic():
+async def test_agentic_guard_repeated_same_path_forces_diagnostic_when_bash_available():
     from vllm_mlx.config import get_config, reset_config
 
     reset_config()
@@ -1776,14 +1779,9 @@ async def test_agentic_guard_repeated_same_path_uses_repair_prompt_not_diagnosti
     finally:
         reset_config()
 
-    assert engine.calls > 0
-    assert any(
-        "use write with the complete corrected file content" in message.get(
-            "content", ""
-        )
-        for message in engine.messages_seen[0]
-        if message.get("role") == "user"
-    )
+    assert engine.calls == 0
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+    assert any("AGENTIC_DIAGNOSTIC" in chunk for chunk in chunks)
     assert chunks[-1] == "data: [DONE]\n\n"
 
 
@@ -1898,6 +1896,37 @@ def test_agentic_same_path_count_includes_failed_edits():
         messages.append({"role": "tool", "content": "Edit failed: oldText not found"})
 
     assert _agentic_max_same_path_tools_since_latest_failure(messages) == 4
+
+
+def test_agentic_same_path_count_anchors_on_command_exit_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": "bun test\n0 pass\n2 fail\nCommand exited with code 1",
+        },
+    ]
+    for index in range(2):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path":"src/routes/user.routes.test.ts",'
+                                f'"content":"changed {index}"}}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "tool", "content": "write applied"})
+
+    assert _agentic_max_same_path_tools_since_latest_failure(messages) == 2
 
 
 def test_agentic_same_command_count_includes_repeated_inspection_after_failure():

@@ -1311,6 +1311,9 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     )
     assert "Count path segments when fixing imports" in _AGENTIC_REPAIR_USER_PROMPT
     assert "use ./serviceName, not ../../services" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "../models/modelName, not ../../models/modelName" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "Do not put ../src or ./src in a relative import" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )

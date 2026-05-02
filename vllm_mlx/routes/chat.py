@@ -171,6 +171,8 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "../../../config, and from a feature-root file to that same feature's routes "
     "or services use ./routes or ./services. From a test file inside a service "
     "directory to the service beside it, use ./serviceName, not ../../services. "
+    "From src/modules/<name>/services/*.test.ts to the same module's models, use "
+    "../models/modelName, not ../../models/modelName. "
     "Do not put ../src or ./src in a "
     "relative import from a file already under src; imports are relative to the "
     "current file, not to the project root. If the user asked for unit tests and "

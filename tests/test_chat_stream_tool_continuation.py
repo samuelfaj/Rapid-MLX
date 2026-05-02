@@ -1316,6 +1316,8 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "remove or replace those integration tests with isolated unit tests" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "do not call router" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "pass actual handler functions" in _AGENTIC_REPAIR_USER_PROMPT
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package module does not export a named symbol" in (
         _AGENTIC_REPAIR_USER_PROMPT

@@ -1309,6 +1309,12 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
         _AGENTIC_REPAIR_USER_PROMPT
     )
     assert "Count path segments when fixing imports" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "Do not put ../src or ./src in a relative import" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "remove or replace those integration tests with isolated unit tests" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package module does not export a named symbol" in (
         _AGENTIC_REPAIR_USER_PROMPT

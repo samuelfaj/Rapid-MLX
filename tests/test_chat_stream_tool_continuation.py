@@ -1295,6 +1295,12 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
         _AGENTIC_REPAIR_USER_PROMPT
     )
     assert "fix every affected test file in one pass" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "Do not leave imports pointing at files that are absent" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "create the complete missing sibling feature slice" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "ReferenceError" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package.json or install" not in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_REPAIR_USER_PROMPT

@@ -137,6 +137,10 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "planning text, summaries, apologies, or any prose. Do not run the same "
     "diagnostic command again yet. Use write or edit now to fix the reported "
     "files, configuration, dependencies, or test failures. "
+    "Keep the original user request in scope: if it named artifact categories "
+    "such as source modules, tests, migrations, seed data, routes, controllers, "
+    "or configuration, the file inventory must include those categories before "
+    "you give a final answer. "
     "Fix the exact latest error before making unrelated changes. Do not expand scope "
     "with new features, entities, files, or frameworks unless the user request or "
     "the current validation error requires it. Read the latest tool output first; "
@@ -155,13 +159,30 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "the package manager install command instead of editing tests to mock the "
     "missing dependency. For named import/export "
     "errors, only import symbols confirmed to exist in the dependency and remove or "
-    "replace any invalid symbol usages. Do not leave duplicate class fields, "
+    "replace any invalid symbol usages. If validation says a package module does "
+    "not export a named symbol, do not move that symbol to another package unless "
+    "the latest tool output confirms that package exports it. When the same "
+    "missing export appears in multiple files, fix every importer using that "
+    "package consistently instead of changing one file at a time. Do not leave "
+    "duplicate class fields, "
     "duplicate functions, or duplicate declarations after edits. For missing runtime "
     "packages, update the project manifest or install the package before retrying. "
+    "For unit tests, do not require real external services such as databases, "
+    "network APIs, queues, or servers unless the user explicitly asked for an "
+    "integration test. If validation shows connection refused, model not "
+    "initialized, or similar external setup failures, change the test setup to "
+    "mock the boundary or initialize a local disposable test instance. If "
+    "validation raises ReferenceError for a variable that is not defined, do "
+    "not assume globals; import it from an existing module or define it in the "
+    "failing file's setup. "
     "Only after changing files may you run validation again."
     " If a module loader says no default export is defined or an export does "
     "not satisfy a filename, fix the exporting module or explicit registration "
     "that the loader uses; do not keep changing unrelated tests. If validation "
+    "says an export named symbol was not found and suggests importing default, "
+    "inspect both the exporting file and all importers, then make the export "
+    "style consistent in one file change instead of toggling named and default "
+    "imports across retries. If validation "
     "reports a value cannot be accessed before initialization, inspect circular "
     "imports and move shared setup or lazy initialization to a module that does "
     "not import the dependent feature back."
@@ -188,6 +209,11 @@ _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "runtime configuration instead of the edited source logic, change the "
     "relevant config, manifest, or dependency setup rather than editing that "
     "same source file again. "
+    "If the same import/export mismatch repeats, stop alternating named and "
+    "default exports. Inspect the runtime loader convention and every importer, "
+    "then rewrite the exporting file and affected imports consistently. If an "
+    "edit failed because oldText was missing or edits overlapped, use write with "
+    "the complete corrected file content on the next attempt. "
     "If the latest error names a different file, edit that file. If you cannot "
     "identify the next file to change, run a targeted validation command that "
     "prints the exact failing file and error."
@@ -900,9 +926,13 @@ def _last_tool_result_indicates_failure(messages: list) -> bool:
                 "error:",
                 "typeerror",
                 "undefined is not an object",
-                "cannot find",
-                "not found",
-                "no such file",
+                    "cannot find",
+                    "not found",
+                    "export named",
+                    "no default export",
+                    "does not satisfy filename",
+                    "before initialization",
+                    "no such file",
                 "oldtext",
                 "exit code 1",
                 "exited with code 1",

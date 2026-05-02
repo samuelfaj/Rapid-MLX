@@ -1269,15 +1269,32 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "express" not in _AGENTIC_DIAGNOSTIC_COMMAND.lower()
     assert "sequelize" not in _AGENTIC_DIAGNOSTIC_COMMAND.lower()
     assert "Do not expand scope" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "migrations" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "seed data" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not require real external services" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "ReferenceError" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package.json or install" not in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "source and test directory structure" in _AGENTIC_REPAIR_USER_PROMPT
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "package module does not export a named symbol" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fix every importer using that package consistently" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "duplicate declarations" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no default export" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "export named symbol was not found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "before initialization" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_DIAGNOSTIC_COMMAND
     assert "runtime configuration" in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    assert "stop alternating named and default exports" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
+    assert "oldText was missing or edits overlapped" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
     assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
     assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
 
@@ -1322,6 +1339,21 @@ def test_agentic_guard_treats_typeerror_runtime_output_as_failure():
     assert _agentic_max_same_path_tools_since_latest_failure(messages) == (
         _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
     )
+
+
+def test_agentic_guard_treats_import_export_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "SyntaxError: Export named 'Order' not found in module "
+                "'/tmp/src/order.model.ts'. Did you mean to import default?"
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
 
 
 @pytest.mark.asyncio

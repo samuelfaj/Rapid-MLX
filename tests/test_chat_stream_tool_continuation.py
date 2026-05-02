@@ -1432,6 +1432,13 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "Do not import production database singletons into" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "service unit test fails with ECONNREFUSED" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not edit the production database config to make tests pass" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "register only the explicit model classes the service uses" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "fresh instance per test or close it in suite cleanup" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )

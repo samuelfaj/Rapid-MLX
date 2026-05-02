@@ -284,6 +284,22 @@ _AGENTIC_FINAL_USER_PROMPT = (
     "The requested work is complete and the latest validation passed. "
     "Do not call any tools. Answer with a concise final summary only."
 )
+_AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT = (
+    "The latest validation failure is a service unit test trying to connect to "
+    "a real database (ECONNREFUSED, ConnectionRefusedError, or closed "
+    "ConnectionManager). Your entire next response must be one valid write or "
+    "edit tool call only. Do not edit, write, or rewrite src/config/database.ts "
+    "or any production database configuration to make unit tests pass. Fix the "
+    "failing *.service.test.ts files instead. Rewrite every affected service "
+    "unit test so it avoids production config/database imports and either mocks "
+    "the ORM/model boundary or creates a local in-memory test Sequelize instance "
+    "inside that test file, registers only the explicit model classes used by "
+    "that service, syncs it during setup, and closes it only in suite cleanup. "
+    "Use correct relative imports from the service test directory: service "
+    "beside the test uses ./serviceName, same-module models use "
+    "../models/modelName, and src/config from a nested services directory uses "
+    "../../../config only if a config import is truly needed."
+)
 _AGENTIC_REPEATED_TOOL_PROMPT = (
     "You repeated a validation or diagnostic tool call without fixing files. "
     "That is a loop. Use the existing tool output. Your next response must be "
@@ -904,6 +920,40 @@ def _last_tool_result_missing_dependency(messages: list) -> str | None:
             return ""
         return None
     return None
+
+
+def _last_tool_result_service_db_test_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        has_db_failure = any(
+            marker in text
+            for marker in (
+                "econnrefused",
+                "connectionrefusederror",
+                "connection manager was closed",
+                "connectionmanager.getconnection",
+            )
+        )
+        has_service_test_context = (
+            ".service.test" in text
+            or "/services/" in text
+            or re.search(r"\b\w*service\s*>", text) is not None
+        )
+        return has_db_failure and has_service_test_context
+    return False
+
+
+def _agentic_repair_prompt(messages: list) -> str:
+    if _last_tool_result_service_db_test_failure(messages):
+        return _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    return _AGENTIC_REPAIR_USER_PROMPT
 
 
 def _last_tool_result_needs_dependency_install(messages: list) -> bool:
@@ -2078,7 +2128,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 {
                     "role": "user",
                     "content": (
-                        _AGENTIC_REPAIR_USER_PROMPT
+                        _agentic_repair_prompt(messages)
                         if _agentic_failed_validation_present(messages)
                         else "You are not finished. Use the next required tool now."
                     ),
@@ -2503,7 +2553,7 @@ async def stream_chat_completion(
                             agentic_missing_requested_artifacts
                             or agentic_missing_requested_artifacts_without_validation
                         )
-                        else _AGENTIC_REPAIR_USER_PROMPT
+                        else _agentic_repair_prompt(messages)
                     ),
                 }
             ]
@@ -2955,7 +3005,7 @@ async def stream_chat_completion(
                             _agentic_missing_artifact_prompt(messages)
                             if agentic_stream_guard
                             and bool(_agentic_requested_artifacts_missing(messages))
-                            else _AGENTIC_REPAIR_USER_PROMPT
+                            else _agentic_repair_prompt(messages)
                             if agentic_stream_guard
                             and _agentic_failed_validation_present(messages)
                             else retry_prompt

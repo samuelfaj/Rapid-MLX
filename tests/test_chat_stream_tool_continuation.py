@@ -22,11 +22,13 @@ from vllm_mlx.routes.chat import (
     _AGENTIC_REPAIR_USER_PROMPT,
     _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
     _AGENTIC_REPEATED_TOOL_PROMPT,
+    _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT,
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
     _agentic_max_same_path_tools_without_validation,
     _agentic_missing_artifact_prompt,
+    _agentic_repair_prompt,
     _agentic_requested_artifacts_missing,
     _last_tool_result_indicates_failure,
     stream_chat_completion,
@@ -1530,6 +1532,27 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "REST/API request with no route files" in _AGENTIC_MISSING_ARTIFACT_PROMPT
     assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
     assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
+
+
+def test_agentic_repair_prompt_prioritizes_service_db_test_failures():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "src/modules/tasks/services/task.service.test.ts:\n"
+                "SequelizeConnectionRefusedError: ECONNREFUSED\n"
+                "(fail) TaskService > create"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    assert "Do not edit, write, or rewrite src/config/database.ts" in (
+        _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    )
+    assert "Fix the failing *.service.test.ts files instead" in (
+        _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    )
 
 
 def test_agentic_guard_treats_typeerror_runtime_output_as_failure():

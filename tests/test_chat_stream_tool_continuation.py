@@ -20,6 +20,7 @@ from vllm_mlx.routes.chat import (
     _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS,
     _AGENTIC_REPAIR_USER_PROMPT,
     _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
+    _AGENTIC_REPEATED_TOOL_PROMPT,
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
@@ -1324,9 +1325,13 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "stop alternating named and default exports" in (
         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
     )
+    assert "register explicit model classes" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
     assert "oldText was missing or edits overlapped" in (
         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
     )
+    assert "stop toggling that file" in _AGENTIC_REPEATED_TOOL_PROMPT
     assert "feature-sliced architecture" in _AGENTIC_MISSING_ARTIFACT_PROMPT
     assert "regroup them under feature or domain directories" in (
         _AGENTIC_MISSING_ARTIFACT_PROMPT

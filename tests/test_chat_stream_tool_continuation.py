@@ -16,6 +16,7 @@ from vllm_mlx.routes.chat import (
     _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC,
+    _AGENTIC_MISSING_ARTIFACT_PROMPT,
     _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS,
     _AGENTIC_REPAIR_USER_PROMPT,
     _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
@@ -1315,6 +1316,10 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     )
     assert "oldText was missing or edits overlapped" in (
         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
+    assert "feature-sliced architecture" in _AGENTIC_MISSING_ARTIFACT_PROMPT
+    assert "regroup them under feature or domain directories" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
     )
     assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
     assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()

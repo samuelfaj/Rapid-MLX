@@ -243,7 +243,12 @@ _AGENTIC_MISSING_ARTIFACT_PROMPT = (
     "Inspect the original request and the current file inventory, then create the "
     "missing requested artifact files. If the request asked for unit tests for "
     "each service, create service-layer tests for every service, not only "
-    "controller, route, or model tests. Do not give a final answer yet. After "
+    "controller, route, or model tests. If the request asked for a vertical or "
+    "feature-sliced architecture and the inventory has root-level service, model, "
+    "route, controller, migration, or seed files, regroup them under feature or "
+    "domain directories so each feature owns its model/service/route/test and "
+    "related data setup instead of leaving shared root folders as the primary "
+    "structure. Do not give a final answer yet. After "
     "creating the missing artifacts, run validation again."
 )
 _AGENTIC_DIAGNOSTIC_COMMAND = (

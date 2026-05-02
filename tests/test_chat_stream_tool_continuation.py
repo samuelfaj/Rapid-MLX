@@ -1272,6 +1272,16 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "migrations" in _AGENTIC_REPAIR_USER_PROMPT
     assert "seed data" in _AGENTIC_REPAIR_USER_PROMPT
     assert "do not require real external services" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "static data-model methods that require registration" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "register the data models in a local disposable test instance" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "replace unsupported mock-runner calls with simple" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fix every affected test file in one pass" in _AGENTIC_REPAIR_USER_PROMPT
     assert "ReferenceError" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package.json or install" not in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_REPAIR_USER_PROMPT
@@ -1349,6 +1359,36 @@ def test_agentic_guard_treats_import_export_runtime_output_as_failure():
             "content": (
                 "SyntaxError: Export named 'Order' not found in module "
                 "'/tmp/src/order.model.ts'. Did you mean to import default?"
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_treats_uninitialized_model_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "Model not initialized: Member \"create\" cannot be called. "
+                "User needs to be added to a local instance."
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_treats_noop_edit_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "No changes made to src/service.test.ts. The replacement "
+                "produced identical content."
             ),
         },
     ]

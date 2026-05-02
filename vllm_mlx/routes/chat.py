@@ -170,11 +170,18 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "For unit tests, do not require real external services such as databases, "
     "network APIs, queues, or servers unless the user explicitly asked for an "
     "integration test. If validation shows connection refused, model not "
-    "initialized, or similar external setup failures, change the test setup to "
-    "mock the boundary or initialize a local disposable test instance. If "
+    "initialized, static data-model methods that require registration, or "
+    "similar external setup failures, change the test setup to mock the boundary "
+    "or initialize and register the data models in a local disposable test "
+    "instance before tests run. If "
     "validation raises ReferenceError for a variable that is not defined, do "
     "not assume globals; import it from an existing module or define it in the "
-    "failing file's setup. "
+    "failing file's setup. If validation shows mocked methods are undefined, "
+    "mock cleanup APIs do not exist, or response/request test doubles are "
+    "missing methods, replace unsupported mock-runner calls with simple "
+    "hand-written fakes or functions supported by the current test runner. When "
+    "the same test-double failure appears in multiple test files, fix every "
+    "affected test file in one pass. "
     "Only after changing files may you run validation again."
     " If a module loader says no default export is defined or an export does "
     "not satisfy a filename, fix the exporting module or explicit registration "
@@ -849,6 +856,8 @@ def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
                     "no test files found",
                     "no tests found",
                     "no package.json",
+                    "no changes made",
+                    "replacement produced identical content",
                 )
             ):
                 seen_failure = True
@@ -925,6 +934,7 @@ def _last_tool_result_indicates_failure(messages: list) -> bool:
                 "failed",
                 "error:",
                 "typeerror",
+                "model not initialized",
                 "undefined is not an object",
                     "cannot find",
                     "not found",
@@ -934,6 +944,8 @@ def _last_tool_result_indicates_failure(messages: list) -> bool:
                     "before initialization",
                     "no such file",
                 "oldtext",
+                "no changes made",
+                "replacement produced identical content",
                 "exit code 1",
                 "exited with code 1",
             )

@@ -2,9 +2,11 @@ import asyncio
 
 from vllm_mlx.routes.chat import _iterate_with_idle_timeout
 from vllm_mlx.routes.chat import (
+    _AGENTIC_TOOL_USE_SYSTEM_SUFFIX,
     _agentic_completion_needs_verification,
     _agentic_failed_validation_present,
     _agentic_requested_artifacts_missing,
+    _agentic_task_terminal_ready,
     _agentic_verification_present,
 )
 from vllm_mlx.service.helpers import _disconnect_guard
@@ -17,6 +19,73 @@ def test_agentic_verification_ignores_system_prompt_evidence():
                 "role": "system",
                 "content": "Run the requested validation and report success.",
             }
+        ]
+    )
+
+
+def test_agentic_tool_use_suffix_allows_final_after_success():
+    assert "latest validation succeeded" in _AGENTIC_TOOL_USE_SYSTEM_SUFFIX
+    assert "stop calling tools" in _AGENTIC_TOOL_USE_SYSTEM_SUFFIX
+
+
+def test_agentic_task_terminal_ready_requires_success_and_artifacts():
+    assert _agentic_task_terminal_ready(
+        [
+            {"role": "user", "content": "Create REST routes and tests."},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/routes/user.routes.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/user.test.ts"}',
+                        }
+                    },
+                ],
+            },
+            {"role": "tool", "content": "tests passed"},
+        ]
+    )
+
+
+def test_agentic_task_terminal_ready_rejects_latest_failure():
+    assert not _agentic_task_terminal_ready(
+        [
+            {"role": "user", "content": "Create REST routes and tests."},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/routes/user.routes.ts"}',
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path": "src/user.test.ts"}',
+                        }
+                    },
+                ],
+            },
+            {"role": "tool", "content": "bun test\n 1 fail"},
         ]
     )
 
@@ -285,7 +354,7 @@ def test_agentic_requested_artifacts_missing_detects_vertical_slice_and_rest_api
         [
             {
                 "role": "user",
-                "content": "Create a REST api that is vertical sliced.",
+                "content": "Create a REST api that is vertically sliced.",
             },
             {
                 "role": "assistant",
@@ -305,7 +374,7 @@ def test_agentic_requested_artifacts_missing_detects_vertical_slice_and_rest_api
         [
             {
                 "role": "user",
-                "content": "Create a REST api that is vertical sliced.",
+                "content": "Create a REST api that is vertically sliced.",
             },
             {
                 "role": "assistant",

@@ -23,12 +23,7 @@ ARTIFACT_ROOT = Path(os.environ.get("BENCH_ARTIFACT_DIR", "/tmp/rapid-mlx-bench"
 PI_AGENT_DIR = ARTIFACT_ROOT / "pi-agent"
 PORT = int(os.environ.get("BENCH_PORT", "8010"))
 
-PROMPT = (
-    "Create the snake game using react, typescript, tailwindcss. "
-    "Do not run npm run dev or vite dev. "
-    "Use test driven development. "
-    "Use react feature oriented architecture."
-)
+DEFAULT_PROMPT = os.environ.get("BENCH_PROMPT")
 
 MODEL_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
 DRAFTER_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-DFlash"
@@ -335,27 +330,72 @@ def count_files(path: Path, patterns: tuple[str, ...]) -> int:
     return total
 
 
-def validate_project(project_root: Path | None, run_dir: Path, timeout: int) -> dict[str, Any]:
+def package_manager(project_root: Path, package: dict[str, Any]) -> str:
+    declared = str(package.get("packageManager") or "").lower()
+    if declared.startswith("bun@") or (project_root / "bun.lockb").exists() or (project_root / "bun.lock").exists():
+        return "bun"
+    if declared.startswith("pnpm@") or (project_root / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if declared.startswith("yarn@") or (project_root / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def install_command(manager: str) -> list[str]:
+    if manager == "bun":
+        return ["bun", "install"]
+    if manager == "pnpm":
+        return ["pnpm", "install"]
+    if manager == "yarn":
+        return ["yarn", "install"]
+    return ["npm", "install", "--no-audit", "--no-fund"]
+
+
+def run_script_command(manager: str, script: str, extra: list[str] | None = None) -> list[str]:
+    extra = extra or []
+    if manager == "bun":
+        base = ["bun", "run", script]
+    elif manager == "pnpm":
+        base = ["pnpm", "run", script]
+    elif manager == "yarn":
+        base = ["yarn", script]
+    else:
+        base = ["npm", "run", script]
+    return base + extra
+
+
+def validation_requirements(prompt: str, scripts: dict[str, Any]) -> set[str]:
+    lowered = prompt.lower()
+    required = {"install"}
+    if any(term in lowered for term in ("test", "tests", "tdd", "unit")):
+        required.add("test")
+    if "build" in lowered and "build" in scripts:
+        required.add("build")
+    return required
+
+
+def validate_project(project_root: Path | None, run_dir: Path, timeout: int, prompt: str) -> dict[str, Any]:
     if project_root is None:
         return {"success": False, "reason": "no package.json found", "commands": [], "project": None}
     package = json.loads((project_root / "package.json").read_text())
     scripts = package.get("scripts", {})
-    commands: list[tuple[str, list[str]]] = [("install", ["npm", "install", "--no-audit", "--no-fund"])]
+    manager = package_manager(project_root, package)
+    commands: list[tuple[str, list[str]]] = [("install", install_command(manager))]
     if "test" in scripts:
-        test_cmd = ["npm", "test"]
+        test_cmd = run_script_command(manager, "test")
         if "vitest" in str(scripts["test"]).lower():
-            test_cmd = ["npm", "test", "--", "--run"]
+            test_cmd = run_script_command(manager, "test", ["--", "--run"])
         commands.append(("test", test_cmd))
     if "build" in scripts:
-        commands.append(("build", ["npm", "run", "build"]))
+        commands.append(("build", run_script_command(manager, "build")))
     if "lint" in scripts:
-        commands.append(("lint", ["npm", "run", "lint"]))
+        commands.append(("lint", run_script_command(manager, "lint")))
 
     results: list[dict[str, Any]] = []
     for name, cmd in commands:
         results.append(run_logged(cmd, project_root, run_dir / f"validation-{name}.log", timeout))
 
-    required = {"install", "test", "build"}
+    required = validation_requirements(prompt, scripts)
     passed = {name for name, _ in commands if any(r["command"] == _ and r["exit_code"] == 0 and not r["timeout"] for r in results)}
     success = required.issubset(passed) and all(not r["timeout"] and r["exit_code"] == 0 for r in results)
     return {
@@ -365,11 +405,10 @@ def validate_project(project_root: Path | None, run_dir: Path, timeout: int) -> 
         "project": {
             "root": str(project_root),
             "package_name": package.get("name"),
+            "package_manager": manager,
             "scripts": scripts,
             "file_count": count_files(project_root, ("*.ts", "*.tsx", "*.css", "*.json")),
             "test_file_count": count_files(project_root, ("*.test.ts", "*.test.tsx", "*.spec.ts", "*.spec.tsx")),
-            "feature_oriented": (project_root / "src" / "features").exists()
-            or (project_root / "src" / "features" / "snake").exists(),
         },
     }
 
@@ -399,7 +438,7 @@ def run_pi_once(profile: Profile, run_number: int, args: argparse.Namespace) -> 
             "--api-key",
             "local",
             "-p",
-            PROMPT,
+            args.prompt,
         ],
         work_dir,
         run_dir / "pi.log",
@@ -410,10 +449,10 @@ def run_pi_once(profile: Profile, run_number: int, args: argparse.Namespace) -> 
     after = request_entries()
     entries = merge_entries(diff_entries(before, after) + pi_result.pop("polled_request_entries", []))
     project_root = detect_project_root(work_dir)
-    validation = validate_project(project_root, run_dir, args.validation_timeout)
+    validation = validate_project(project_root, run_dir, args.validation_timeout, args.prompt)
     return {
         "run_number": run_number,
-        "prompt": PROMPT,
+        "prompt": args.prompt,
         "work_dir": str(work_dir),
         "pi": pi_result,
         "request_metrics": summarize_entries(entries),
@@ -490,9 +529,9 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
         "",
         "1/ Mesmo prompt, mesma maquina, mesma porta, pasta vazia por run.",
         "",
-        f"> Prompt: `{PROMPT}`",
+        f"> Prompt: `{args.prompt}`",
         "",
-        "2/ O teste nao mede so tokens/s. Mede comportamento agentico: criar projeto React + TypeScript + Tailwind, usar TDD, nao subir dev server, terminar sozinho, depois passar em validacao local.",
+        "2/ O teste nao mede so tokens/s. Mede comportamento agentico: criar o artefato pedido em pasta limpa, terminar sozinho, depois passar em validacao local.",
         "",
         "## Resultado curto",
         "",
@@ -534,7 +573,7 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
             "- Baseline: target model sem drafter, sem DDTree, sem ngram fallback, sem structured-cot tool guard.",
             "- Otimizado: target model + drafter DFlash pareado, DDTree budget 4, adaptive off, fallback ngram, thinking ngram, structured-cot e structured-cot-tools.",
             "- `pi` usa provider local OpenAI-compatible via `PI_CODING_AGENT_DIR`, `rapid-mlx` em `http://127.0.0.1:8010/v1`, `temperature=0`, `max_tokens=2048`.",
-            "- Validacao: `npm install --no-audit --no-fund`, `npm test -- --run` quando Vitest, `npm run build`, e `npm run lint` se existir.",
+            "- Validacao: instala dependencias com package manager detectado, roda `test` quando existir ou for pedido, roda `build`/`lint` quando existirem.",
             "- Tok/s e diagnostico de servidor, nao criterio de sucesso. Runs longos podem trocar entradas antigas do `/v1/requests`; `BENCHMARK.py` agora faz polling para novos reruns.",
             "",
             "## Perfis",
@@ -616,6 +655,7 @@ def run_profile(profile: Profile, args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--runs", type=int, default=int(os.environ.get("BENCH_RUNS", "3")))
     parser.add_argument("--pi-timeout", type=int, default=int(os.environ.get("BENCH_PI_TIMEOUT", "600")))
     parser.add_argument("--validation-timeout", type=int, default=int(os.environ.get("BENCH_VALIDATION_TIMEOUT", "180")))
@@ -632,6 +672,8 @@ def main() -> int:
         choices=[profile.key for profile in PROFILES],
     )
     args = parser.parse_args()
+    if not args.prompt:
+        parser.error("provide --prompt or BENCH_PROMPT")
 
     ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     write_pi_config()

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chat completion endpoints — /v1/chat/completions."""
 
-import gc
 import asyncio
+import gc
 import json
 import logging
 import re
@@ -125,7 +125,9 @@ _AGENTIC_TOOL_USE_SYSTEM_SUFFIX = (
     "asked for validation, do not give a final answer until tool output shows the "
     "requested validation succeeded. If validation fails, use the reported errors "
     "to change files before running another diagnostic command. Do not answer with "
-    "prose when a required tool action remains."
+    "prose when a required tool action remains. Once the requested work is complete "
+    "and the latest validation succeeded, stop calling tools and answer with a "
+    "concise final summary."
 )
 _AGENTIC_REPAIR_USER_PROMPT = (
     "The previous validation/diagnostic tool output shows the project is still "
@@ -157,6 +159,10 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "duplicate functions, or duplicate declarations after edits. For missing runtime "
     "packages, update the project manifest or install the package before retrying. "
     "Only after changing files may you run validation again."
+)
+_AGENTIC_FINAL_USER_PROMPT = (
+    "The requested work is complete and the latest validation passed. "
+    "Do not call any tools. Answer with a concise final summary only."
 )
 _AGENTIC_REPEATED_TOOL_PROMPT = (
     "You repeated a validation or diagnostic tool call without fixing files. "
@@ -434,9 +440,12 @@ _AGENTIC_REQUESTED_ARTIFACT_TERMS = {
         "feature slice",
         "feature sliced",
         "vertical slice",
-        "vertical sliced",
         "vertically sliced",
     ),
+}
+
+_AGENTIC_REQUESTED_ARTIFACT_PATTERNS = {
+    "vertical_slice": (r"\bvertical\s+sliced\b",),
 }
 
 
@@ -448,7 +457,14 @@ def _agentic_requested_artifact_terms(messages: list) -> set[str]:
     ).lower()
     requested: set[str] = set()
     for term, variants in _AGENTIC_REQUESTED_ARTIFACT_TERMS.items():
-        if any(re.search(rf"\b{re.escape(variant)}\b", text) for variant in variants):
+        exact_match = any(
+            re.search(rf"\b{re.escape(variant)}\b", text) for variant in variants
+        )
+        pattern_match = any(
+            re.search(pattern, text)
+            for pattern in _AGENTIC_REQUESTED_ARTIFACT_PATTERNS.get(term, ())
+        )
+        if exact_match or pattern_match:
             requested.add(term)
     return requested
 
@@ -508,6 +524,15 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
         if service_names and not service_names.issubset(tested_names):
             missing.add("test")
     return missing
+
+
+def _agentic_task_terminal_ready(messages: list) -> bool:
+    return (
+        _agentic_completion_needs_verification(messages)
+        and _agentic_verification_present(messages)
+        and not _agentic_failed_validation_present(messages)
+        and not _agentic_requested_artifacts_missing(messages)
+    )
 
 
 def _agentic_validation_evidence_present(messages: list) -> bool:
@@ -1386,6 +1411,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             else:
                 m.role = "system"
 
+    agentic_terminal_ready = bool(
+        cfg.agentic_guard and request.tools and _agentic_task_terminal_ready(messages)
+    )
+    if agentic_terminal_ready:
+        logger.info(
+            "[agentic-guard] disabling tools after completed task and successful "
+            "validation so the agent can finalize"
+        )
+        request.tools = None
+        request.tool_choice = None
+        messages = list(messages) + [{"role": "user", "content": _AGENTIC_FINAL_USER_PROMPT}]
+
     # Auto-inject system prompt suffix for tool use and/or reasoning control
     _inject_suffix = None
     if request.tools and cfg.tool_call_parser:
@@ -1472,11 +1509,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Pass through enable_thinking if explicitly set by the client
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking
-    elif cfg.no_thinking or (
-        added_tool_continuation_prompt and cfg.tool_call_parser == "qwen3_coder_xml"
+    elif (
+        cfg.no_thinking
+        or (
+            added_tool_continuation_prompt
+            and cfg.tool_call_parser == "qwen3_coder_xml"
+        )
+        or agentic_verification_required
     ):
-        chat_kwargs["enable_thinking"] = False
-    elif agentic_verification_required:
         chat_kwargs["enable_thinking"] = False
 
     if (
@@ -1684,6 +1724,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Parse tool calls from output using configured parser. In non-streaming
     # local-agent mode, retry premature text-only answers for tool workflows.
     cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    if agentic_terminal_ready and tool_calls:
+        logger.info(
+            "[agentic-guard] ignoring parsed tool calls after terminal-ready "
+            "finalization"
+        )
+        cleaned_text = output.text
+        tool_calls = []
     if (
         agentic_verification_required
         and not _agentic_verification_present(messages)
@@ -1726,9 +1773,55 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 output.text, request
             )
 
-    # Validate tool call parameter values against schemas
-    if tool_calls and request.tools:
+    # Validate tool call parameter values against schemas. If the parser extracted
+    # an incomplete or malformed tool call, retry before returning it to clients.
+    tool_param_errors = (
         _validate_tool_call_params(tool_calls, request.tools)
+        if tool_calls and request.tools
+        else []
+    )
+    if tool_param_errors:
+        retry_messages = list(messages)
+        for retry_attempt in range(2):
+            logger.info(
+                "[tool-call] retrying invalid tool-call arguments "
+                "(attempt %d/2): %s",
+                retry_attempt + 1,
+                "; ".join(tool_param_errors[:3]),
+            )
+            retry_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        _TOOL_CALL_JSON_RETRY_PROMPT
+                        + "\nValidation errors:\n- "
+                        + "\n- ".join(tool_param_errors[:8])
+                    ),
+                }
+            ]
+            retry_kwargs = {
+                **chat_kwargs,
+                "enable_thinking": False,
+                "structured_cot": False,
+            }
+            retry_output = await _wait_with_disconnect(
+                engine.chat(messages=retry_messages, **retry_kwargs),
+                raw_request,
+                timeout=timeout,
+            )
+            if retry_output is None:
+                return Response(status_code=499)
+            output = retry_output
+            cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+                output.text, request
+            )
+            tool_param_errors = (
+                _validate_tool_call_params(tool_calls, request.tools)
+                if tool_calls and request.tools
+                else []
+            )
+            if not tool_param_errors:
+                break
 
     # Extract reasoning content FIRST.
     # Note: extract_reasoning() is stateless (pure regex on full text),

@@ -484,13 +484,24 @@ def _apply_default_tool_call_timeouts(tool_calls: list | None, request_dict: dic
             function["arguments"] = serialized
 
 
-def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
+def _validate_tool_call_params(tool_calls: list, tools: list) -> list[str]:
     """Validate tool call parameter values against their schemas (post-generation)."""
     from ..api.tool_logits import _extract_param_schemas, validate_param_value
 
     tool_defs = [t.model_dump() if hasattr(t, "model_dump") else t for t in tools]
     schemas = _extract_param_schemas(tool_defs)
+    required_by_tool: dict[str, set[str]] = {}
+    for tool_def in tool_defs:
+        if not isinstance(tool_def, dict):
+            continue
+        function = tool_def.get("function") or {}
+        tool_name = function.get("name")
+        parameters = function.get("parameters") or {}
+        required = parameters.get("required") if isinstance(parameters, dict) else None
+        if isinstance(tool_name, str) and isinstance(required, list):
+            required_by_tool[tool_name] = {str(item) for item in required}
 
+    errors: list[str] = []
     for tc in tool_calls:
         func = tc.function if hasattr(tc, "function") else tc.get("function", {})
         func_name = func.name if hasattr(func, "name") else func.get("name", "")
@@ -503,13 +514,22 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
         try:
             args = json.loads(args_str)
         except (json.JSONDecodeError, ValueError):
-            logger.warning(
-                f"Tool call '{func_name}': arguments is not valid JSON: {args_str!r}"
-            )
+            error = f"Tool call '{func_name}': arguments is not valid JSON"
+            logger.warning("%s: %r", error, args_str)
+            errors.append(error)
             continue
 
         if not isinstance(args, dict):
+            error = f"Tool call '{func_name}': arguments must be a JSON object"
+            logger.warning(error)
+            errors.append(error)
             continue
+
+        for required_param in sorted(required_by_tool.get(func_name, set())):
+            if required_param not in args or args.get(required_param) is None:
+                error = f"Tool call '{func_name}': missing required param '{required_param}'"
+                logger.warning(error)
+                errors.append(error)
 
         for param_name, param_value in args.items():
             schema_key = f"{func_name}.{param_name}"
@@ -518,7 +538,10 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
                 continue
             is_valid, error = validate_param_value(json.dumps(param_value), schema)
             if not is_valid:
-                logger.warning(f"Tool call '{func_name}' param '{param_name}': {error}")
+                full_error = f"Tool call '{func_name}' param '{param_name}': {error}"
+                logger.warning(full_error)
+                errors.append(full_error)
+    return errors
 
 
 # ── Message helpers ────────────────────────────────────────────────

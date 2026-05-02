@@ -543,6 +543,7 @@ class TestValidateToolCallParams:
                     "parameters": {
                         "type": "object",
                         "properties": properties,
+                        "required": list(properties.keys()),
                     },
                 },
             }
@@ -560,31 +561,33 @@ class TestValidateToolCallParams:
     def test_valid_args_no_error(self):
         from vllm_mlx.server import _validate_tool_call_params
 
-        _validate_tool_call_params(
+        assert _validate_tool_call_params(
             self._make_tool_calls(),
             self._make_tools(),
-        )
+        ) == []
 
     def test_invalid_json_no_crash(self):
         from vllm_mlx.server import _validate_tool_call_params
 
-        _validate_tool_call_params(
+        errors = _validate_tool_call_params(
             self._make_tool_calls(arguments="not json {"),
             self._make_tools(),
         )
+        assert errors
 
     def test_type_mismatch_no_crash(self):
         from vllm_mlx.server import _validate_tool_call_params
 
-        _validate_tool_call_params(
+        errors = _validate_tool_call_params(
             self._make_tool_calls(arguments='{"location": 123}'),
             self._make_tools(properties={"location": {"type": "string"}}),
         )
+        assert errors
 
     def test_enum_violation_no_crash(self):
         from vllm_mlx.server import _validate_tool_call_params
 
-        _validate_tool_call_params(
+        errors = _validate_tool_call_params(
             self._make_tool_calls(arguments='{"unit": "kelvin"}'),
             self._make_tools(
                 properties={
@@ -592,11 +595,21 @@ class TestValidateToolCallParams:
                 }
             ),
         )
+        assert errors
 
     def test_empty_tool_calls(self):
         from vllm_mlx.server import _validate_tool_call_params
 
-        _validate_tool_call_params([], self._make_tools())
+        assert _validate_tool_call_params([], self._make_tools()) == []
+
+    def test_missing_required_param_returns_error(self):
+        from vllm_mlx.server import _validate_tool_call_params
+
+        errors = _validate_tool_call_params(
+            self._make_tool_calls(arguments='{"other": "NYC"}'),
+            self._make_tools(),
+        )
+        assert any("missing required param 'location'" in error for error in errors)
 
     def test_pydantic_model_tools(self):
         """Test with Pydantic model tools (have model_dump)."""
@@ -619,10 +632,10 @@ class TestValidateToolCallParams:
                 }
             )
         ]
-        _validate_tool_call_params(
+        assert _validate_tool_call_params(
             self._make_tool_calls(),
             tools,
-        )
+        ) == []
 
 
 # ---------------------------------------------------------------------------

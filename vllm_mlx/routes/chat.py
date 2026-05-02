@@ -2576,7 +2576,10 @@ async def stream_chat_completion(
                                     repeat_tool_detection_enabled
                                     or agentic_repeated_path_detection_enabled
                                 )
-                                and not latest_result_mentions_recent_path
+                                and (
+                                    agentic_repeated_path_detection_enabled
+                                    or not latest_result_mentions_recent_path
+                                )
                                 and _buffered_tool_call_repeats_recent_path(
                                     buffered_tool_call_events,
                                     recent_tool_call_path_signature,

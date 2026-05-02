@@ -2111,7 +2111,12 @@ async def test_agentic_guard_blocks_repeated_same_path_after_repair_prompt(monke
                 ],
             }
         )
-        messages.append({"role": "tool", "content": "write applied"})
+        messages.append(
+            {
+                "role": "tool",
+                "content": "Successfully wrote src/main.tsx",
+            }
+        )
 
     engine = _EngineThatRepeatsToolThenAnswers()
     try:

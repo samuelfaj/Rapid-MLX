@@ -1308,6 +1308,7 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "import the service/model from the same feature first" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "Count path segments when fixing imports" in _AGENTIC_REPAIR_USER_PROMPT
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package module does not export a named symbol" in (
         _AGENTIC_REPAIR_USER_PROMPT

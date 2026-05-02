@@ -469,6 +469,20 @@ def test_agentic_failed_validation_detects_failed_npm_output():
     )
 
 
+def test_agentic_failed_validation_detects_failed_edit_output():
+    assert _agentic_failed_validation_present(
+        [
+            {
+                "role": "tool",
+                "content": (
+                    "Found 3 occurrences of edits[1] in src/service.test.ts. "
+                    "Each oldText must be unique."
+                ),
+            }
+        ]
+    )
+
+
 def test_agentic_failed_validation_reads_tool_call_arguments():
     assert _agentic_failed_validation_present(
         [

@@ -143,8 +143,8 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "if a write/edit failed or an expected file is missing from the diagnostic "
     "inventory, create the missing parent directories or correct the path before "
     "continuing. If an edit failed because exact text was not found or produced no "
-    "changes, use write with the complete corrected file content instead of "
-    "guessing another oldText block. If validation reports that no tests were found, create test files "
+    "changes, or because oldText was not unique, use write with the complete "
+    "corrected file content instead of guessing another oldText block. If validation reports that no tests were found, create test files "
     "using the project's test naming convention before running validation again. "
     "If the diagnostic inventory contains only manifests or root documentation "
     "while the requested task requires implementation files, create the missing "
@@ -597,6 +597,13 @@ def _agentic_failed_validation_present(messages: list) -> bool:
         "no test files found",
         "no tests found",
         "no package.json",
+        "no changes made to",
+        "oldtext must be unique",
+        "oldtext was not found",
+        "found 2 occurrences",
+        "found 3 occurrences",
+        "found 4 occurrences",
+        "found 5 occurrences",
     )
     return any(marker in transcript for marker in failure_markers)
 

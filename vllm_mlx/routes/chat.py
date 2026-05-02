@@ -563,13 +563,21 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
     missing: set[str] = set()
     for term in requested:
         if term == "vertical_slice":
-            if not any(
+            has_feature_owned_path = any(
                 re.search(
                     r"(?:^|/)src/(?:modules|features|domains|slices)/[^/]+/",
                     path,
                 )
                 for path in paths
-            ):
+            )
+            has_root_architecture_path = any(
+                re.search(
+                    r"(?:^|/)src/(?:models|services|routes|controllers|repositories)/",
+                    path,
+                )
+                for path in paths
+            )
+            if not has_feature_owned_path or has_root_architecture_path:
                 missing.add(term)
             continue
         variants = _AGENTIC_REQUESTED_ARTIFACT_TERMS[term]

@@ -23,6 +23,7 @@ from vllm_mlx.routes.chat import (
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
+    _agentic_requested_artifacts_missing,
     _last_tool_result_indicates_failure,
     stream_chat_completion,
 )
@@ -1416,6 +1417,41 @@ def test_agentic_guard_treats_noop_edit_output_as_failure():
     ]
 
     assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_keeps_vertical_slice_missing_for_root_architecture_files():
+    messages = [
+        {
+            "role": "user",
+            "content": "Create a vertical sliced API with models, services, and tests.",
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/features/user/routes/user.routes.ts"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/models/user.model.ts"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    assert "vertical_slice" in _agentic_requested_artifacts_missing(messages)
 
 
 @pytest.mark.asyncio

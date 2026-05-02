@@ -1285,6 +1285,7 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "register the data models in a local disposable test instance" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "including createdAt and updatedAt" in _AGENTIC_REPAIR_USER_PROMPT
     assert "Do not import production database singletons into" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )

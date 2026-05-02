@@ -228,9 +228,11 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "feature/module file cannot be found, either create the complete missing "
     "sibling feature slice if it is part of the current requested project, or "
     "remove the optional association/import and make the current feature "
-    "self-contained. Do not keep tests blocked by an import to a feature "
-    "directory that has no model, service, route, migration, seed, and tests of "
-    "its own. "
+    "self-contained. If validation says a config module such as config/database "
+    "cannot be found and the inventory has no matching config file, create the "
+    "missing config file instead of repeatedly changing relative import depth. "
+    "Do not keep tests blocked by an import to a feature directory that has no "
+    "model, service, route, migration, seed, and tests of its own. "
     "Only after changing files may you run validation again."
     " If a module loader says no default export is defined or an export does "
     "not satisfy a filename, fix the exporting module or explicit registration "
@@ -262,6 +264,14 @@ _AGENTIC_REPEATED_TOOL_PROMPT = (
     "initialization error, stop toggling that file. Either write the complete "
     "file once with a consistent export style, or change the related loader, "
     "registration, config, or importer that is actually enforcing the convention."
+)
+_AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT = (
+    "Your previous shell tool call would delete source or generated project "
+    "artifacts that are still needed for the requested implementation. Do not "
+    "delete or reset the project tree. Your next response must be one valid tool "
+    "call only: write or edit the specific missing or broken files, or run a "
+    "non-destructive command only if it is required to create directories, "
+    "install dependencies, or validate after a file change."
 )
 _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "You repeatedly changed the same path after validation or diagnostic output "
@@ -1297,6 +1307,83 @@ def _assembled_tool_call_path_signatures(
         if signature:
             signatures.append(signature)
     return signatures
+
+
+def _assembled_tool_call_functions(
+    buffered_events: list[tuple],
+) -> list[tuple[str, object]]:
+    calls: dict[int, dict[str, object]] = {}
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            index = _tool_call_value(tool_call, "index")
+            if not isinstance(index, int):
+                index = len(calls)
+            assembled = calls.setdefault(index, {"name": None, "arguments": ""})
+
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            name = _tool_call_value(function, "name")
+            if name:
+                assembled["name"] = str(name)
+
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                assembled["arguments"] = str(assembled["arguments"] or "") + str(
+                    arguments
+                )
+
+    return [
+        (str(assembled.get("name") or ""), assembled.get("arguments"))
+        for assembled in calls.values()
+        if assembled.get("name")
+    ]
+
+
+def _decoded_tool_arguments(arguments: object) -> object:
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except (TypeError, ValueError):
+            return arguments
+    return arguments
+
+
+def _command_removes_artifact_tree(command: str) -> bool:
+    lower_command = command.lower()
+    if not re.search(
+        r"(?:^|[;&|]\s*)rm\s+-[a-z]*r[a-z]*f?",
+        lower_command,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(^|[\s'\"])(?:\./)?src(?:/|[\s'\"]|$)|"
+            r"/src(?:/|[\s'\"]|$)|"
+            r"(^|[\s'\"])\.(?:[\s'\"]|$)",
+            lower_command,
+        )
+    )
+
+
+def _buffered_agentic_destructive_command(
+    buffered_events: list[tuple],
+    messages: list,
+) -> bool:
+    if not _agentic_created_artifact_paths(messages):
+        return False
+    for name, arguments in _assembled_tool_call_functions(buffered_events):
+        if name not in {"bash", "shell", "exec", "run_command"}:
+            continue
+        decoded = _decoded_tool_arguments(arguments)
+        command = ""
+        if isinstance(decoded, dict):
+            candidate = decoded.get("command") or decoded.get("cmd")
+            if isinstance(candidate, str):
+                command = candidate
+        elif isinstance(decoded, str):
+            command = decoded
+        if command and _command_removes_artifact_tree(command):
+            return True
+    return False
 
 
 def _partial_tool_path_signature(name: str | None, arguments: str) -> tuple[str, str] | None:
@@ -2734,7 +2821,21 @@ async def stream_chat_completion(
 
             if not retry_reason and buffered_tool_call_events:
                 if _buffered_tool_calls_complete(buffered_tool_call_events):
-                    buffered_repeats_recent_tool = (
+                    if (
+                        agentic_stream_guard
+                        and _buffered_agentic_destructive_command(
+                            buffered_tool_call_events,
+                            messages,
+                        )
+                    ):
+                        retry_reason = "destructive shell command"
+                        logger.info(
+                            "[agentic-guard] blocked destructive shell command "
+                            "against existing project artifacts"
+                        )
+                        buffered_tool_call_events.clear()
+                        deferred_finish = None
+                    elif (
                         (
                             repeat_tool_detection_enabled
                             or agentic_repeated_inspection_detection_enabled
@@ -2743,8 +2844,7 @@ async def stream_chat_completion(
                             buffered_tool_call_events,
                             recent_tool_call_signature,
                         )
-                    )
-                    buffered_repeats_recent_path = (
+                    ) or (
                         (
                             repeat_tool_detection_enabled
                             or agentic_repeated_path_detection_enabled
@@ -2753,8 +2853,7 @@ async def stream_chat_completion(
                             buffered_tool_call_events,
                             recent_tool_call_path_signature,
                         )
-                    )
-                    if buffered_repeats_recent_tool or buffered_repeats_recent_path:
+                    ):
                         retry_reason = "repeated tool call"
                     else:
                         emitted_tool_call = True
@@ -2813,6 +2912,10 @@ async def stream_chat_completion(
                     _TOOL_CALL_JSON_RETRY_PROMPT
                     if retry_reason == "incomplete tool call JSON"
                     else (
+                        _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT
+                        if agentic_stream_guard
+                        and retry_reason == "destructive shell command"
+                        else
                         (
                             _AGENTIC_REPEATED_TOOL_PROMPT
                             if agentic_stream_guard

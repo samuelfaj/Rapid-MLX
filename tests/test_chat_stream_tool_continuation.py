@@ -12,6 +12,7 @@ from vllm_mlx.domain.events import StreamEvent
 from vllm_mlx.engine import GenerationOutput
 from vllm_mlx.routes.chat import (
     _AGENTIC_DEPENDENCY_INSTALL_COMMAND,
+    _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT,
     _AGENTIC_DIAGNOSTIC_COMMAND,
     _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
@@ -210,6 +211,7 @@ class _FakeStreamingPostProcessor:
 class _FakeRepeatedWritePostProcessor(_FakeStreamingPostProcessor):
     def process_chunk(self, output):
         if self.index == 0:
+            self.index += 1
             return [
                 StreamEvent(
                     type="tool_call",
@@ -435,6 +437,68 @@ class _FakeAgenticLongTextThenToolPostProcessor(_FakeStreamingPostProcessor):
                         "function": {
                             "name": "bash",
                             "arguments": '{"command":"npm test"}',
+                        },
+                    }
+                ],
+                finish_reason="tool_calls",
+                tool_calls_detected=True,
+            )
+        ]
+
+
+class _FakeDestructiveBashThenWritePostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            if getattr(self, "_emitted_delete", False):
+                return []
+            self._emitted_delete = True
+            return [
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_delete_src",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "function": {
+                                "arguments": (
+                                    '{"command":"rm -rf '
+                                    '/tmp/generated-api/src"}'
+                                ),
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    tool_calls_detected=True,
+                ),
+            ]
+        if getattr(self, "_emitted_repair", False):
+            return []
+        self._emitted_repair = True
+        return [
+            StreamEvent(
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_repair_file",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path":"src/index.ts","content":"ok"}',
                         },
                     }
                 ],
@@ -891,6 +955,85 @@ async def test_agentic_guard_allows_long_text_before_tool_call(monkeypatch):
     assert engine.calls == 1
     assert not any('"content":"' + ("x" * 20) in chunk for chunk in chunks)
     assert any("call_after_agentic_long_text" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_agentic_guard_blocks_destructive_source_tree_delete(monkeypatch):
+    """Agentic guard should retry instead of streaming rm -rf for existing artifacts."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    cfg = get_config()
+    cfg.agentic_guard = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeDestructiveBashThenWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatStreamsTwoChunks()
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/index.ts","content":"ok"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "Successfully wrote src/index.ts"},
+    ]
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert (
+        engine.messages_seen[1][-1]["content"]
+        == _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT
+    )
+    assert not any("call_delete_src" in chunk for chunk in chunks)
+    assert any("call_repair_file" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio

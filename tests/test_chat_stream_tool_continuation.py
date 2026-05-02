@@ -1445,6 +1445,10 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "replace unsupported mock-runner calls with simple" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
+    assert "Bun reports jest is not defined" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "remove extra non-service tests that the user did not request" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "fix every affected test file in one pass" in _AGENTIC_REPAIR_USER_PROMPT
     assert "Do not leave imports pointing at files that are absent" in (
         _AGENTIC_REPAIR_USER_PROMPT
@@ -1462,6 +1466,9 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "Count path segments when fixing imports" in _AGENTIC_REPAIR_USER_PROMPT
     assert "use ./serviceName, not ../../services" in _AGENTIC_REPAIR_USER_PROMPT
     assert "../models/modelName, not ../../models/modelName" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "src/config, use ../../../config, not ../../config" in (
         _AGENTIC_REPAIR_USER_PROMPT
     )
     assert "Do not put ../src or ./src in a relative import" in (

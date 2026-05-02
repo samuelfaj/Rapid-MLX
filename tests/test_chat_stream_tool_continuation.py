@@ -1778,7 +1778,9 @@ async def test_agentic_guard_repeated_same_path_uses_repair_prompt_not_diagnosti
 
     assert engine.calls > 0
     assert any(
-        "Do not edit the same path again" in message.get("content", "")
+        "use write with the complete corrected file content" in message.get(
+            "content", ""
+        )
         for message in engine.messages_seen[0]
         if message.get("role") == "user"
     )

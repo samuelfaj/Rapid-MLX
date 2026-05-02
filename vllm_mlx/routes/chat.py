@@ -101,7 +101,7 @@ _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 65536
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 8
 _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 6
-_AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 3
+_AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 2
 _AGENTIC_RETRY_MAX_TOKENS = 4096
 _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS = _AGENTIC_RETRY_MAX_TOKENS
 _PARTIAL_TOOL_PATH_RE = re.compile(
@@ -174,9 +174,10 @@ _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "You repeatedly changed the same path after validation or diagnostic output "
     "still showed the project was incomplete or broken. That is a loop. Use the "
     "latest diagnostic output and file inventory. Your next response must be one "
-    "valid tool call only. Do not edit the same path again unless the latest "
-    "validation error explicitly names that path. If required implementation or "
-    "test files are missing from the inventory, create those missing files now. "
+    "valid tool call only. If the latest validation error still names that same "
+    "path, use write with the complete corrected file content; do not use edit "
+    "on that path again. If required implementation or test files are missing "
+    "from the inventory, create those missing files now. "
     "If the latest error names a different file, edit that file. If you cannot "
     "identify the next file to change, run a targeted validation command that "
     "prints the exact failing file and error."

@@ -23,6 +23,7 @@ from vllm_mlx.routes.chat import (
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
+    _agentic_missing_artifact_prompt,
     _agentic_requested_artifacts_missing,
     _last_tool_result_indicates_failure,
     stream_chat_completion,
@@ -1310,6 +1311,11 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     )
     assert "export named symbol was not found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "before initialization" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not use a read-only shell command" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "latest tool output is source file contents" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "model/ORM loader reports" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_DIAGNOSTIC_COMMAND
     assert "runtime configuration" in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
     assert "stop alternating named and default exports" in (
@@ -1328,6 +1334,11 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "seed files exist but migration files do not" in (
         _AGENTIC_MISSING_ARTIFACT_PROMPT
     )
+    assert "Add missing categories to the existing feature/domain slices" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "do not invent a new feature" in _AGENTIC_MISSING_ARTIFACT_PROMPT
+    assert "REST/API request with no route files" in _AGENTIC_MISSING_ARTIFACT_PROMPT
     assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
     assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
 
@@ -1452,6 +1463,72 @@ def test_agentic_guard_keeps_vertical_slice_missing_for_root_architecture_files(
     ]
 
     assert "vertical_slice" in _agentic_requested_artifacts_missing(messages)
+
+
+def test_agentic_guard_names_missing_requested_artifacts_in_repair_prompt():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Create services, migrations, seeders, and unit tests for each service."
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": (
+                            '{"path":"src/features/users/tests/users.test.ts",'
+                            '"content":"test"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "Successfully wrote "
+                "src/features/users/tests/users.test.ts"
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": (
+                            '{"path":"src/features/users/migrations/create-users.ts",'
+                            '"content":"migration"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "Successfully wrote "
+                "src/features/users/migrations/create-users.ts"
+            ),
+        },
+    ]
+
+    missing = _agentic_requested_artifacts_missing(messages)
+    prompt = _agentic_missing_artifact_prompt(messages)
+
+    assert "seeder" in missing
+    assert "service" in missing
+    assert "test" in missing
+    assert "Missing requested artifact categories:" in prompt
+    assert "seeder" in prompt
+    assert "service" in prompt
+    assert "test" in prompt
 
 
 @pytest.mark.asyncio

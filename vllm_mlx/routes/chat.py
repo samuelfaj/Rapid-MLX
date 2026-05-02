@@ -152,6 +152,11 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "changes, or because oldText was not unique, use write with the complete "
     "corrected file content instead of guessing another oldText block. If validation reports that no tests were found, create test files "
     "using the project's test naming convention before running validation again. "
+    "If validation already names the failing file, module, export, loader, or "
+    "initialization error, do not use a read-only shell command such as cat, sed, "
+    "ls, find, or grep as your next action unless the exact failing file is still "
+    "unknown. If the latest tool output is source file contents after a failed "
+    "validation, use write or edit to repair that file now. "
     "If the diagnostic inventory contains only manifests or root documentation "
     "while the requested task requires implementation files, create the missing "
     "source and test directory structure now. For module-not-found/import errors, "
@@ -203,7 +208,10 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "imports across retries. If validation "
     "reports a value cannot be accessed before initialization, inspect circular "
     "imports and move shared setup or lazy initialization to a module that does "
-    "not import the dependent feature back."
+    "not import the dependent feature back. If a model/ORM loader reports that a "
+    "file has no default export or no export matching its filename, rewrite that "
+    "model file so it exports a concrete class in the loader's expected style and "
+    "update related imports consistently."
 )
 _AGENTIC_FINAL_USER_PROMPT = (
     "The requested work is complete and the latest validation passed. "
@@ -251,9 +259,28 @@ _AGENTIC_MISSING_ARTIFACT_PROMPT = (
     "route, controller, migration, or seed files, regroup them under feature or "
     "domain directories so each feature owns its model/service/route/test and "
     "related data setup instead of leaving shared root folders as the primary "
-    "structure. Do not give a final answer yet. After "
+    "structure. Add missing categories to the existing feature/domain slices "
+    "first; do not invent a new feature, domain, entity, or resource only to "
+    "satisfy a missing category unless the original request named it or no "
+    "feature slice exists yet. For a REST/API request with no route files, create "
+    "route/router files and wire them to the existing feature service before "
+    "adding another model or test. Do not give a final answer yet. After "
     "creating the missing artifacts, run validation again."
 )
+
+
+def _agentic_missing_artifact_prompt(messages: list) -> str:
+    missing = sorted(_agentic_requested_artifacts_missing(messages))
+    if not missing:
+        return _AGENTIC_MISSING_ARTIFACT_PROMPT
+    missing_text = ", ".join(missing)
+    return (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+        + "\nMissing requested artifact categories: "
+        + missing_text
+        + ". Create files for one or more of these categories next, and do not "
+        "spend the next tool call on categories that are already present."
+    )
 _AGENTIC_DIAGNOSTIC_COMMAND = (
     "printf 'AGENTIC_DIAGNOSTIC\\n'; "
     "pwd; "
@@ -534,6 +561,14 @@ def _agentic_requested_artifact_terms(messages: list) -> set[str]:
     return requested
 
 
+def _agentic_user_request_text(messages: list) -> str:
+    return "\n".join(
+        _message_content_text(message)
+        for message in messages
+        if _agentic_message_role(message) == "user"
+    ).lower()
+
+
 def _agentic_created_artifact_paths(messages: list) -> list[str]:
     paths: list[str] = []
     for message in messages:
@@ -560,6 +595,7 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
     if not requested:
         return set()
     paths = _agentic_created_artifact_paths(messages)
+    user_request = _agentic_user_request_text(messages)
     missing: set[str] = set()
     for term in requested:
         if term == "vertical_slice":
@@ -595,6 +631,11 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
             if ("test" in path or "spec" in path) and "service" in path
         }
         if service_names and not service_names.issubset(tested_names):
+            missing.add("test")
+        if (
+            re.search(r"\btests?\s+for\s+each\s+service\b", user_request)
+            and not tested_names
+        ):
             missing.add("test")
     return missing
 
@@ -2274,7 +2315,7 @@ async def stream_chat_completion(
                     "content": (
                         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
                         if agentic_repeated_path_repair_mode
-                        else _AGENTIC_MISSING_ARTIFACT_PROMPT
+                        else _agentic_missing_artifact_prompt(messages)
                         if (
                             agentic_missing_requested_artifacts
                             or agentic_missing_requested_artifacts_without_validation
@@ -2709,7 +2750,10 @@ async def stream_chat_completion(
                         )
                         if retry_reason == "repeated tool call"
                         else (
-                            _AGENTIC_REPAIR_USER_PROMPT
+                            _agentic_missing_artifact_prompt(messages)
+                            if agentic_stream_guard
+                            and bool(_agentic_requested_artifacts_missing(messages))
+                            else _AGENTIC_REPAIR_USER_PROMPT
                             if agentic_stream_guard
                             and _agentic_failed_validation_present(messages)
                             else retry_prompt

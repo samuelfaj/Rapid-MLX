@@ -998,6 +998,21 @@ def _agentic_max_same_command_tools_since_latest_failure(messages: list) -> int:
     return max(counts.values(), default=0) if seen_failure else 0
 
 
+def _agentic_max_same_path_tools_without_validation(messages: list) -> int:
+    if _agentic_verification_present(messages) or _agentic_failed_validation_present(
+        messages
+    ):
+        return 0
+    counts: dict[tuple[str, str], int] = {}
+    for message in messages:
+        if _agentic_message_role(message) != "assistant":
+            continue
+        signature = _assistant_tool_call_path_signature(message)
+        if signature:
+            counts[signature] = counts.get(signature, 0) + 1
+    return max(counts.values(), default=0)
+
+
 def _last_tool_result_indicates_failure(messages: list) -> bool:
     for message in reversed(messages):
         role = (
@@ -2229,6 +2244,9 @@ async def stream_chat_completion(
         agentic_same_command_tools_since_failure = (
             _agentic_max_same_command_tools_since_latest_failure(messages)
         )
+        agentic_same_path_tools_without_validation = (
+            _agentic_max_same_path_tools_without_validation(messages)
+        )
         agentic_repeated_path_repair_mode = (
             agentic_stream_guard
             and max(
@@ -2285,6 +2303,11 @@ async def stream_chat_completion(
                         agentic_same_path_tools_since_failure,
                         agentic_same_command_tools_since_failure,
                     )
+                    >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+                )
+                or (
+                    not _agentic_failed_validation_present(messages)
+                    and agentic_same_path_tools_without_validation
                     >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
                 )
             )

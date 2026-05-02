@@ -24,6 +24,7 @@ from vllm_mlx.routes.chat import (
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
+    _agentic_max_same_path_tools_without_validation,
     _agentic_missing_artifact_prompt,
     _agentic_requested_artifacts_missing,
     _last_tool_result_indicates_failure,
@@ -2196,6 +2197,47 @@ def test_agentic_same_path_count_anchors_on_command_exit_failure():
         messages.append({"role": "tool", "content": "write applied"})
 
     assert _agentic_max_same_path_tools_since_latest_failure(messages) == 2
+
+
+def test_agentic_same_path_count_without_validation_catches_preflight_loops():
+    messages = [{"role": "user", "content": "Build the requested project."}]
+    for index in range(4):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path":"src/modules/users/tests/user.routes.test.ts",'
+                                f'"content":"changed {index}"}}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "content": (
+                    "Successfully wrote "
+                    "src/modules/users/tests/user.routes.test.ts"
+                ),
+            }
+        )
+
+    assert _agentic_max_same_path_tools_without_validation(messages) == 4
+
+    messages.append(
+        {
+            "role": "tool",
+            "content": "VALIDATION_FAILED: validation command exited with status 1",
+        }
+    )
+    assert _agentic_max_same_path_tools_without_validation(messages) == 0
 
 
 def test_agentic_same_command_count_includes_repeated_inspection_after_failure():

@@ -1271,6 +1271,8 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "Do not expand scope" in _AGENTIC_REPAIR_USER_PROMPT
     assert "migrations" in _AGENTIC_REPAIR_USER_PROMPT
     assert "seed data" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "unit tests for each service" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "not only controllers, routes, or models" in _AGENTIC_REPAIR_USER_PROMPT
     assert "do not require real external services" in _AGENTIC_REPAIR_USER_PROMPT
     assert "static data-model methods that require registration" in (
         _AGENTIC_REPAIR_USER_PROMPT
@@ -2229,6 +2231,92 @@ async def test_agentic_guard_keeps_working_when_requested_artifact_missing():
         },
         {"role": "tool", "content": "1 pass\n0 fail"},
     ]
+    engine = _EngineThatAlwaysNarrates()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert any(
+        "artifact categories that are still absent" in message.get("content", "")
+        for message in engine.messages_seen[0]
+        if message.get("role") == "user"
+    )
+    assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_agentic_guard_prioritizes_missing_artifacts_before_diagnostic_loop():
+    from vllm_mlx.config import get_config, reset_config
+
+    reset_config()
+    get_config().agentic_guard = True
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_choice="auto",
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Create services, migrations, seeders, and unit tests for each service.",
+        },
+    ]
+    for index in range(_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"path":"src/modules/users/services/'
+                                    f'user{index}.service.ts"}}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": (
+                        "Successfully wrote "
+                        f"src/modules/users/services/user{index}.service.ts"
+                    ),
+                },
+            ]
+        )
     engine = _EngineThatAlwaysNarrates()
 
     try:

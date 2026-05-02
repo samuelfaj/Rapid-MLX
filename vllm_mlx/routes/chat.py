@@ -140,7 +140,9 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "Keep the original user request in scope: if it named artifact categories "
     "such as source modules, tests, migrations, seed data, routes, controllers, "
     "or configuration, the file inventory must include those categories before "
-    "you give a final answer. "
+    "you give a final answer. If the request asked for unit tests for each "
+    "service, create tests that exercise each service layer, not only "
+    "controllers, routes, or models. "
     "Fix the exact latest error before making unrelated changes. Do not expand scope "
     "with new features, entities, files, or frameworks unless the user request or "
     "the current validation error requires it. Read the latest tool output first; "
@@ -226,11 +228,13 @@ _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "prints the exact failing file and error."
 )
 _AGENTIC_MISSING_ARTIFACT_PROMPT = (
-    "Validation output now appears successful, but the original request named "
-    "artifact categories that are still absent from the file inventory or from "
-    "the paths you created. Your next response must be one valid tool call only. "
+    "The original request named artifact categories that are still absent from "
+    "the file inventory or from the paths you created. Your next response must "
+    "be one valid tool call only. "
     "Inspect the original request and the current file inventory, then create the "
-    "missing requested artifact files. Do not give a final answer yet. After "
+    "missing requested artifact files. If the request asked for unit tests for "
+    "each service, create service-layer tests for every service, not only "
+    "controller, route, or model tests. Do not give a final answer yet. After "
     "creating the missing artifacts, run validation again."
 )
 _AGENTIC_DIAGNOSTIC_COMMAND = (
@@ -2131,6 +2135,14 @@ async def stream_chat_completion(
         agentic_repair_mode = (
             agentic_stream_guard and _agentic_failed_validation_present(messages)
         )
+        agentic_missing_requested_artifacts_without_validation = (
+            agentic_stream_guard
+            and not _agentic_verification_present(messages)
+            and bool(_agentic_requested_artifacts_missing(messages))
+            and _agentic_tool_result_count(messages)
+            >= _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+            and not _last_tool_result_is_agentic_diagnostic(messages)
+        )
         agentic_tool_results_since_failure = (
             _agentic_tool_result_count_since_latest_failure(messages)
         )
@@ -2202,6 +2214,7 @@ async def stream_chat_completion(
         )
         if (
             agentic_diagnostic_needed
+            and not agentic_missing_requested_artifacts_without_validation
         ):
             logger.info(
                 "[agentic-guard] forcing diagnostic after %d tool results without "
@@ -2237,7 +2250,10 @@ async def stream_chat_completion(
                         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
                         if agentic_repeated_path_repair_mode
                         else _AGENTIC_MISSING_ARTIFACT_PROMPT
-                        if agentic_missing_requested_artifacts
+                        if (
+                            agentic_missing_requested_artifacts
+                            or agentic_missing_requested_artifacts_without_validation
+                        )
                         else _AGENTIC_REPAIR_USER_PROMPT
                     ),
                 }
@@ -2246,6 +2262,7 @@ async def stream_chat_completion(
                 agentic_repair_mode
                 or agentic_repeated_path_repair_mode
                 or agentic_missing_requested_artifacts
+                or agentic_missing_requested_artifacts_without_validation
             )
             else messages
         )
@@ -2263,6 +2280,7 @@ async def stream_chat_completion(
                 agentic_repair_mode
                 or agentic_repeated_path_repair_mode
                 or agentic_missing_requested_artifacts
+                or agentic_missing_requested_artifacts_without_validation
             )
             else kwargs
         )

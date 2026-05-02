@@ -1299,6 +1299,9 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "package.json or install" not in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "source and test directory structure" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "import the service/model from the same feature first" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package module does not export a named symbol" in (
         _AGENTIC_REPAIR_USER_PROMPT

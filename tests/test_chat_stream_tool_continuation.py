@@ -1321,6 +1321,12 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "regroup them under feature or domain directories" in (
         _AGENTIC_MISSING_ARTIFACT_PROMPT
     )
+    assert "Do not rewrite or duplicate a category" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "seed files exist but migration files do not" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
     assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
     assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
 

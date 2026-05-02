@@ -193,6 +193,10 @@ _structured_cot: bool = False
 _structured_cot_tools: bool = False
 _agentic_guard: bool = False
 _structured_cot_token_budget: int = 256
+_speculative_prefill: bool = False
+_speculative_prefill_draft_model: str | None = None
+_speculative_prefill_ratio: float = 0.85
+_speculative_prefill_min_tokens: int = 128
 
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
@@ -475,6 +479,10 @@ def load_model(
     structured_cot_tools: bool = False,
     agentic_guard: bool = False,
     structured_cot_token_budget: int = 256,
+    speculative_prefill: bool = False,
+    speculative_prefill_draft_model: str | None = None,
+    speculative_prefill_ratio: float = 0.85,
+    speculative_prefill_min_tokens: int = 128,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -499,7 +507,11 @@ def load_model(
         _structured_cot, \
         _structured_cot_tools, \
         _agentic_guard, \
-        _structured_cot_token_budget
+        _structured_cot_token_budget, \
+        _speculative_prefill, \
+        _speculative_prefill_draft_model, \
+        _speculative_prefill_ratio, \
+        _speculative_prefill_min_tokens
 
     _default_max_tokens = max_tokens
     _model_path = model_name
@@ -509,6 +521,19 @@ def load_model(
     _structured_cot_tools = bool(structured_cot_tools)
     _agentic_guard = bool(agentic_guard)
     _structured_cot_token_budget = int(structured_cot_token_budget)
+    _speculative_prefill = bool(speculative_prefill)
+    _speculative_prefill_draft_model = speculative_prefill_draft_model
+    _speculative_prefill_ratio = float(speculative_prefill_ratio)
+    _speculative_prefill_min_tokens = int(speculative_prefill_min_tokens)
+
+    from .speculative.prefill import SpeculativePrefillConfig
+
+    speculative_prefill_config = SpeculativePrefillConfig(
+        enabled=_speculative_prefill,
+        draft_model_path=_speculative_prefill_draft_model,
+        target_token_ratio=_speculative_prefill_ratio,
+        min_prompt_tokens=_speculative_prefill_min_tokens,
+    )
 
     # Initialize cloud router if --cloud-model is set
     if cloud_model:
@@ -558,6 +583,7 @@ def load_model(
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
+            speculative_prefill_config=speculative_prefill_config,
         )
     else:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
@@ -567,6 +593,7 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
             gpu_memory_utilization=gpu_memory_utilization,
+            speculative_prefill_config=speculative_prefill_config,
         )
     logger.info(f"Model loaded: {model_name}")
 
@@ -712,6 +739,10 @@ def _sync_config() -> None:
     cfg.structured_cot_tools = _structured_cot_tools
     cfg.agentic_guard = _agentic_guard
     cfg.structured_cot_token_budget = _structured_cot_token_budget
+    cfg.speculative_prefill = _speculative_prefill
+    cfg.speculative_prefill_draft_model = _speculative_prefill_draft_model
+    cfg.speculative_prefill_ratio = _speculative_prefill_ratio
+    cfg.speculative_prefill_min_tokens = _speculative_prefill_min_tokens
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
@@ -922,6 +953,30 @@ Examples:
         default=256,
         help="Approximate token budget for structured CoT lines.",
     )
+    parser.add_argument(
+        "--speculative-prefill",
+        action="store_true",
+        default=False,
+        help="Enable conservative draft-scored prompt compression before target prefill.",
+    )
+    parser.add_argument(
+        "--speculative-prefill-draft-model",
+        type=str,
+        default=None,
+        help="Optional small MLX/HF model path for speculative prefill scoring.",
+    )
+    parser.add_argument(
+        "--speculative-prefill-ratio",
+        type=float,
+        default=0.85,
+        help="Target compressed prompt token ratio (default: 0.85).",
+    )
+    parser.add_argument(
+        "--speculative-prefill-min-tokens",
+        type=int,
+        default=128,
+        help="Minimum prompt tokens before speculative prefill may apply.",
+    )
     # Tool call parser options
     from .tool_parsers.abstract_tool_parser import ToolParserManager
 
@@ -1094,6 +1149,10 @@ Examples:
         structured_cot_tools=args.structured_cot_tools,
         agentic_guard=args.agentic_guard,
         structured_cot_token_budget=args.structured_cot_token_budget,
+        speculative_prefill=args.speculative_prefill,
+        speculative_prefill_draft_model=args.speculative_prefill_draft_model,
+        speculative_prefill_ratio=args.speculative_prefill_ratio,
+        speculative_prefill_min_tokens=args.speculative_prefill_min_tokens,
     )
 
     # Start server

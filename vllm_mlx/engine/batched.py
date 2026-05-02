@@ -17,6 +17,10 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..speculative.prefill import (
+    SpeculativePrefillCompressor,
+    SpeculativePrefillConfig,
+)
 from ..utils.chat_template import apply_chat_template as shared_apply_chat_template
 from .base import BaseEngine, GenerationOutput
 
@@ -148,6 +152,7 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        speculative_prefill_config: SpeculativePrefillConfig | None = None,
     ):
         """
         Initialize the batched engine.
@@ -170,6 +175,9 @@ class BatchedEngine(BaseEngine):
         self._tool_logits_processor_factory = None
         self._structured_cot_enabled = False
         self._structured_cot_token_budget = 256
+        self._speculative_prefill = SpeculativePrefillCompressor(
+            speculative_prefill_config
+        )
 
         self._model = None
         self._processor = None  # For MLLM
@@ -481,6 +489,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -559,6 +569,8 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
@@ -668,6 +680,8 @@ class BatchedEngine(BaseEngine):
             )
         )
 
+        messages = self._maybe_compress_last_user_message(messages, tools_requested=bool(tools))
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -696,6 +710,7 @@ class BatchedEngine(BaseEngine):
                 if structured_cot
                 else None
             ),
+            speculative_prefill_applied=self._speculative_prefill.config.enabled,
             **kwargs,
         )
 
@@ -800,6 +815,8 @@ class BatchedEngine(BaseEngine):
             )
         )
 
+        messages = self._maybe_compress_last_user_message(messages, tools_requested=bool(tools))
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -820,6 +837,8 @@ class BatchedEngine(BaseEngine):
             kwargs["logits_processor_factories"] = [
                 self._make_structured_cot_factory(prompt, structured_cot_token_budget)
             ]
+        if self._speculative_prefill.config.enabled:
+            kwargs["speculative_prefill_applied"] = True
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -849,6 +868,42 @@ class BatchedEngine(BaseEngine):
 
         return factory
 
+    def _maybe_compress_prompt(self, prompt: str, kwargs: dict[str, Any]) -> str:
+        if kwargs.pop("speculative_prefill_applied", False):
+            return prompt
+        if not self._speculative_prefill.config.enabled:
+            return prompt
+        result = self._speculative_prefill.compress(prompt, self.tokenizer)
+        return result.prompt
+
+    def _maybe_compress_last_user_message(
+        self, messages: list[dict[str, Any]], tools_requested: bool = False
+    ) -> list[dict[str, Any]]:
+        if not self._speculative_prefill.config.enabled:
+            return messages
+        if tools_requested:
+            self._speculative_prefill.last_result = None
+            return messages
+        last_user_idx = None
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+        if last_user_idx is None:
+            return messages
+        content = messages[last_user_idx].get("content")
+        if not isinstance(content, str):
+            return messages
+        result = self._speculative_prefill.compress(content, self.tokenizer)
+        if not result.applied:
+            return messages
+        compressed_messages = list(messages)
+        compressed_messages[last_user_idx] = {
+            **messages[last_user_idx],
+            "content": result.prompt,
+        }
+        return compressed_messages
+
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         stats = {
@@ -857,6 +912,22 @@ class BatchedEngine(BaseEngine):
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
+        }
+        prefill_result = self._speculative_prefill.last_result
+        stats["speculative_prefill"] = {
+            "enabled": self._speculative_prefill.config.enabled,
+            "last_applied": bool(prefill_result and prefill_result.applied),
+            "last_reason": prefill_result.reason if prefill_result else None,
+            "last_original_tokens": (
+                prefill_result.original_tokens if prefill_result else 0
+            ),
+            "last_compressed_tokens": (
+                prefill_result.compressed_tokens if prefill_result else 0
+            ),
+            "last_tokens_saved": prefill_result.tokens_saved if prefill_result else 0,
+            "last_draft_model_used": (
+                bool(prefill_result and prefill_result.draft_model_used)
+            ),
         }
 
         if self._mllm_scheduler:

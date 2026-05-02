@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..api.utils import clean_output_text
+from ..speculative.prefill import SpeculativePrefillConfig
 from .base import GenerationOutput
 from .batched import BatchedEngine
 
@@ -228,6 +229,7 @@ class DFlashEngine(BatchedEngine):
         stream_interval: int = 1,
         trust_remote_code: bool = True,
         gpu_memory_utilization: float = 0.90,
+        speculative_prefill_config: SpeculativePrefillConfig | None = None,
     ) -> None:
         super().__init__(
             model_name=model_name,
@@ -236,6 +238,7 @@ class DFlashEngine(BatchedEngine):
             stream_interval=stream_interval,
             force_mllm=False,
             gpu_memory_utilization=gpu_memory_utilization,
+            speculative_prefill_config=speculative_prefill_config,
         )
         if self._is_mllm:
             raise ValueError(
@@ -773,6 +776,7 @@ class DFlashEngine(BatchedEngine):
             await self.start()
         if images or videos:
             raise ValueError("DFlash mode does not support images or videos.")
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
 
         greedy_request = temperature in (0, 0.0)
         if self._ddtree_budget > 0 and greedy_request:
@@ -907,6 +911,7 @@ class DFlashEngine(BatchedEngine):
             await self.start()
         if images or videos:
             raise ValueError("DFlash mode does not support images or videos.")
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
 
         self._inflight += 1
         try:
@@ -1134,6 +1139,7 @@ class DFlashEngine(BatchedEngine):
 
         num_running = 1 if self._active is not None else 0
         num_waiting = max(0, self._inflight - num_running)
+        prefill_result = self._speculative_prefill.last_result
 
         return {
             "engine_type": "dflash",
@@ -1149,6 +1155,23 @@ class DFlashEngine(BatchedEngine):
             "metal_peak_memory_gb": peak_mem_gb,
             "metal_cache_memory_gb": cache_mem_gb,
             "requests": running_requests,
+            "speculative_prefill": {
+                "enabled": self._speculative_prefill.config.enabled,
+                "last_applied": bool(prefill_result and prefill_result.applied),
+                "last_reason": prefill_result.reason if prefill_result else None,
+                "last_original_tokens": (
+                    prefill_result.original_tokens if prefill_result else 0
+                ),
+                "last_compressed_tokens": (
+                    prefill_result.compressed_tokens if prefill_result else 0
+                ),
+                "last_tokens_saved": (
+                    prefill_result.tokens_saved if prefill_result else 0
+                ),
+                "last_draft_model_used": (
+                    bool(prefill_result and prefill_result.draft_model_used)
+                ),
+            },
             "dflash": {
                 "mode": (
                     "ddtree-ngram"

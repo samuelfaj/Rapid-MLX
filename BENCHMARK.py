@@ -9,14 +9,12 @@ import os
 import signal
 import statistics
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACT_ROOT = Path(os.environ.get("BENCH_ARTIFACT_DIR", "/tmp/rapid-mlx-bench"))
@@ -29,6 +27,7 @@ MODEL_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
 DRAFTER_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-DFlash"
 MODEL_27B = "/Users/samuelfajreldines/dev/models/Qwen3.6-27B-UD-Q4_K_XL-mlx"
 DRAFTER_27B = "/Users/samuelfajreldines/dev/models/Qwen3.6-27B-DFlash"
+SPEC_PREFILL_DRAFT = "/Users/samuelfajreldines/dev/models/Qwen3-1.7B-4bit-mlx"
 
 
 @dataclass(frozen=True)
@@ -120,6 +119,11 @@ def server_command(profile: Profile) -> list[str]:
                 "--structured-cot-tools",
                 "--agentic-guard",
                 "--pin-system-prompt",
+                "--speculative-prefill",
+                "--speculative-prefill-draft-model",
+                SPEC_PREFILL_DRAFT,
+                "--speculative-prefill-ratio",
+                "0.85",
             ]
         )
     cmd.extend(
@@ -571,7 +575,7 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
             f"- Timeout do agente: `{args.pi_timeout}s`.",
             f"- Timeout por comando de validacao: `{args.validation_timeout}s`.",
             "- Baseline: target model sem drafter, sem DDTree, sem ngram fallback, sem structured-cot tool guard.",
-            "- Otimizado: target model + drafter DFlash pareado, DDTree budget 4, adaptive off, fallback ngram, thinking ngram, structured-cot e structured-cot-tools.",
+            "- Otimizado: target model + drafter DFlash pareado, Speculative Prefill conservador com draft pequeno, DDTree budget 4, adaptive off, fallback ngram, thinking ngram, structured-cot e structured-cot-tools.",
             "- `pi` usa provider local OpenAI-compatible via `PI_CODING_AGENT_DIR`, `rapid-mlx` em `http://127.0.0.1:8010/v1`, `temperature=0`, `max_tokens=2048`.",
             "- Validacao: instala dependencias com package manager detectado, roda `test` quando existir ou for pedido, roda `build`/`lint` quando existirem.",
             "- Tok/s e diagnostico de servidor, nao criterio de sucesso. Runs longos podem trocar entradas antigas do `/v1/requests`; `BENCHMARK.py` agora faz polling para novos reruns.",
@@ -611,7 +615,10 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
 
 
 def run_profile(profile: Profile, args: argparse.Namespace) -> dict[str, Any]:
-    for path in [Path(profile.target), *( [Path(profile.drafter)] if profile.drafter else [] )]:
+    paths = [Path(profile.target), *([Path(profile.drafter)] if profile.drafter else [])]
+    if profile.optimized:
+        paths.append(Path(SPEC_PREFILL_DRAFT))
+    for path in paths:
         if not path.exists():
             raise FileNotFoundError(f"missing model path for {profile.key}: {path}")
 

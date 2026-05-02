@@ -11,16 +11,18 @@ from vllm_mlx.api.models import ChatCompletionRequest
 from vllm_mlx.domain.events import StreamEvent
 from vllm_mlx.engine import GenerationOutput
 from vllm_mlx.routes.chat import (
-    _AGENTIC_DIAGNOSTIC_COMMAND,
     _AGENTIC_DEPENDENCY_INSTALL_COMMAND,
-    _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
+    _AGENTIC_DIAGNOSTIC_COMMAND,
     _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
+    _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC,
     _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS,
     _AGENTIC_REPAIR_USER_PROMPT,
+    _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
+    _last_tool_result_indicates_failure,
     stream_chat_completion,
 )
 from vllm_mlx.service.helpers import (
@@ -1272,7 +1274,54 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "source and test directory structure" in _AGENTIC_REPAIR_USER_PROMPT
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
     assert "duplicate declarations" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "no default export" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "before initialization" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_DIAGNOSTIC_COMMAND
+    assert "runtime configuration" in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
+    assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
+
+
+def test_agentic_guard_treats_typeerror_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "TypeError: undefined is not an object "
+                "(evaluating 'Object.getOwnPropertyDescriptor(target, propertyName)')"
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+    for index in range(
+        _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+    ):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "edit",
+                            "arguments": (
+                                '{"path":"src/models/user.ts",'
+                                f'"edits":[{{"oldText":"a{index}",'
+                                f'"newText":"b{index}"}}]}}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "tool", "content": "edit applied"})
+
+    assert _agentic_max_same_path_tools_since_latest_failure(messages) == (
+        _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+    )
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,9 @@ class TestServerConfig:
         assert cfg.enable_auto_tool_choice is False
         assert cfg.structured_cot_tools is False
         assert cfg.agentic_guard is False
+        assert cfg.speculative_prefill is False
+        assert cfg.speculative_prefill_draft_model is None
+        assert cfg.speculative_prefill_ratio == 0.85
 
     def test_get_config_singleton(self):
         """get_config returns the same instance."""

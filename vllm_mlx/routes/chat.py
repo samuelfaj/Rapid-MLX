@@ -159,6 +159,12 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "duplicate functions, or duplicate declarations after edits. For missing runtime "
     "packages, update the project manifest or install the package before retrying. "
     "Only after changing files may you run validation again."
+    " If a module loader says no default export is defined or an export does "
+    "not satisfy a filename, fix the exporting module or explicit registration "
+    "that the loader uses; do not keep changing unrelated tests. If validation "
+    "reports a value cannot be accessed before initialization, inspect circular "
+    "imports and move shared setup or lazy initialization to a module that does "
+    "not import the dependent feature back."
 )
 _AGENTIC_FINAL_USER_PROMPT = (
     "The requested work is complete and the latest validation passed. "
@@ -178,6 +184,10 @@ _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "path, use write with the complete corrected file content; do not use edit "
     "on that path again. If required implementation or test files are missing "
     "from the inventory, create those missing files now. "
+    "If the latest stack trace points at compiler, transpiler, test runner, or "
+    "runtime configuration instead of the edited source logic, change the "
+    "relevant config, manifest, or dependency setup rather than editing that "
+    "same source file again. "
     "If the latest error names a different file, edit that file. If you cannot "
     "identify the next file to change, run a targeted validation command that "
     "prints the exact failing file and error."
@@ -757,7 +767,9 @@ def _agentic_tool_result_count_since_latest_failure(messages: list) -> int:
                 "failed",
                 " fail",
                 "error:",
+                "typeerror",
                 "referenceerror",
+                "undefined is not an object",
                 "couldn't find",
                 "cannot find",
                 "is not defined",
@@ -799,7 +811,9 @@ def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
                     "failed",
                     " fail",
                     "error:",
+                    "typeerror",
                     "referenceerror",
+                    "undefined is not an object",
                     "couldn't find",
                     "cannot find",
                     "is not defined",
@@ -843,7 +857,9 @@ def _agentic_max_same_command_tools_since_latest_failure(messages: list) -> int:
                     "failed",
                     " fail",
                     "error:",
+                    "typeerror",
                     "referenceerror",
+                    "undefined is not an object",
                     "couldn't find",
                     "cannot find",
                     "is not defined",
@@ -882,6 +898,8 @@ def _last_tool_result_indicates_failure(messages: list) -> bool:
                 "validation_failed",
                 "failed",
                 "error:",
+                "typeerror",
+                "undefined is not an object",
                 "cannot find",
                 "not found",
                 "no such file",

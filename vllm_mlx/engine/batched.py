@@ -12,6 +12,7 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -25,6 +26,18 @@ from ..utils.chat_template import apply_chat_template as shared_apply_chat_templ
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+_TOOL_RESULT_COMPACT_KEEP_LAST = 4
+_TOOL_RESULT_COMPACT_MAX_CHARS = 1200
+_TOOL_RESULT_FAILURE_MARKERS = (
+    "error",
+    "failed",
+    "failure",
+    "traceback",
+    "exception",
+    "cannot find",
+    "not found",
+    "validation_failed",
+)
 
 # Check for guided generation availability
 try:
@@ -609,10 +622,12 @@ class BatchedEngine(BaseEngine):
         logits_processor_factories = kwargs.pop("logits_processor_factories", None)
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        prefix_boundaries = kwargs.pop("prefix_boundaries", None)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            prefix_boundaries=prefix_boundaries,
             logits_processor_factories=logits_processor_factories,
         )
 
@@ -680,7 +695,10 @@ class BatchedEngine(BaseEngine):
             )
         )
 
-        messages = self._maybe_compress_last_user_message(messages, tools_requested=bool(tools))
+        messages = self._maybe_compress_last_user_message(
+            messages, tools_requested=bool(tools)
+        )
+        messages = self._maybe_compact_tool_results(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -765,6 +783,92 @@ class BatchedEngine(BaseEngine):
         except Exception:
             return 0
 
+    def _maybe_compact_tool_results(
+        self,
+        messages: list[dict[str, Any]],
+        keep_last: int = _TOOL_RESULT_COMPACT_KEEP_LAST,
+    ) -> list[dict[str, Any]]:
+        tool_indexes = [
+            idx for idx, message in enumerate(messages) if message.get("role") == "tool"
+        ]
+        if len(tool_indexes) <= keep_last:
+            return messages
+        keep = set(tool_indexes[-keep_last:])
+        changed = False
+        compacted = list(messages)
+        for idx in tool_indexes:
+            if idx in keep:
+                continue
+            message = messages[idx]
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if len(content) <= _TOOL_RESULT_COMPACT_MAX_CHARS:
+                continue
+            lowered = content.lower()
+            if any(marker in lowered for marker in _TOOL_RESULT_FAILURE_MARKERS):
+                continue
+            paths = re.findall(r"(?:<path>|filePath['\"]?:\s*['\"])([^'\"<>\n]+)", content)
+            title = ""
+            if "Wrote file successfully" in content:
+                title = "Wrote file successfully."
+            elif "no output" in lowered:
+                title = "(no output)"
+            elif "installed" in lowered or "saved lockfile" in lowered:
+                title = "Command completed; dependencies/log output compacted."
+            else:
+                title = "Tool output compacted."
+            path_text = ""
+            if paths:
+                path_text = "\nPaths: " + ", ".join(sorted(set(paths))[:8])
+            compacted[idx] = {
+                **message,
+                "content": f"{title}{path_text}\n[older successful tool output compacted]",
+            }
+            changed = True
+        return compacted if changed else messages
+
+    def _compute_prefix_boundaries(
+        self,
+        prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> list[int]:
+        try:
+            full_tokens = list(self.tokenizer.encode(prompt))
+        except Exception:
+            return []
+        if len(full_tokens) < 2:
+            return []
+
+        template_tools = convert_tools_for_template(tools) if tools else None
+        boundaries: list[int] = []
+        # Tool workflows repeatedly append assistant/tool pairs.  Cache every
+        # verified message boundary that is an actual token prefix of the full
+        # rendered prompt, so hybrid caches never need unsafe trimming.
+        for idx in range(1, len(messages)):
+            role = messages[idx - 1].get("role")
+            if role not in {"user", "assistant", "tool"}:
+                continue
+            try:
+                prefix_prompt = self._apply_chat_template(
+                    messages[:idx],
+                    template_tools,
+                    enable_thinking=enable_thinking,
+                )
+                prefix_tokens = list(self.tokenizer.encode(prefix_prompt))
+            except Exception:
+                continue
+            boundary = len(prefix_tokens)
+            if 0 < boundary < len(full_tokens) and full_tokens[:boundary] == prefix_tokens:
+                boundaries.append(boundary)
+
+        primary = self._compute_prefix_boundary(messages, tools)
+        if primary > 0:
+            boundaries.append(primary)
+        return sorted(set(boundaries))
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -815,7 +919,10 @@ class BatchedEngine(BaseEngine):
             )
         )
 
-        messages = self._maybe_compress_last_user_message(messages, tools_requested=bool(tools))
+        messages = self._maybe_compress_last_user_message(
+            messages, tools_requested=bool(tools)
+        )
+        messages = self._maybe_compact_tool_results(messages)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -832,6 +939,14 @@ class BatchedEngine(BaseEngine):
         prefix_boundary = self._compute_prefix_boundary(messages, tools)
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+        prefix_boundaries = self._compute_prefix_boundaries(
+            prompt,
+            messages,
+            tools,
+            enable_thinking,
+        )
+        if prefix_boundaries:
+            kwargs["prefix_boundaries"] = prefix_boundaries
         kwargs["tools_requested"] = bool(tools)
         if structured_cot:
             kwargs["logits_processor_factories"] = [
@@ -881,7 +996,8 @@ class BatchedEngine(BaseEngine):
     ) -> list[dict[str, Any]]:
         if not self._speculative_prefill.config.enabled:
             return messages
-        if tools_requested:
+        has_tool_result = any(message.get("role") == "tool" for message in messages)
+        if tools_requested and has_tool_result:
             self._speculative_prefill.last_result = None
             return messages
         last_user_idx = None

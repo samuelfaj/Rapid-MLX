@@ -161,7 +161,7 @@ def test_batched_engine_compresses_only_last_user_message():
     assert compressed[1]["content"] != messages[1]["content"]
 
 
-def test_batched_engine_does_not_compress_tool_requests_by_default():
+def test_batched_engine_compresses_initial_tool_request():
     engine = BatchedEngine(
         "dummy",
         speculative_prefill_config=SpeculativePrefillConfig(
@@ -178,6 +178,34 @@ def test_batched_engine_does_not_compress_tool_requests_by_default():
     )
     messages = [
         {"role": "user", "content": "alpha beta gamma delta epsilon zeta eta omega"},
+    ]
+
+    compressed = engine._maybe_compress_last_user_message(
+        messages, tools_requested=True
+    )
+
+    assert compressed != messages
+
+
+def test_batched_engine_does_not_compress_after_tool_result():
+    engine = BatchedEngine(
+        "dummy",
+        speculative_prefill_config=SpeculativePrefillConfig(
+            enabled=True,
+            target_token_ratio=0.5,
+            min_prompt_tokens=4,
+            preserve_first_tokens=1,
+            preserve_last_tokens=1,
+        ),
+    )
+    engine._tokenizer = StableWordTokenizer()
+    engine._speculative_prefill._score_fn = lambda tokens, _tokenizer: [0.1] * len(
+        tokens
+    )
+    messages = [
+        {"role": "user", "content": "alpha beta gamma delta epsilon zeta eta omega"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "tool", "content": "created files"},
     ]
 
     compressed = engine._maybe_compress_last_user_message(

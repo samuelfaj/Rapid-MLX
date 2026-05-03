@@ -1,127 +1,49 @@
-# Review: oportunidades aprendidas com Lucebox DFlash
+# REVIEW
 
-## Resumo
+Status: objetivo 35B concluido; 27B replicado com perfil otimizado validado.
 
-Rapid-MLX ja faz a arquitetura geral: DFlash + DDTree, motor dedicado, CLI com `--drafter`, tree verify em MLX/Metal, n-gram fallback e metricas. Nada de Lucebox parece plug-and-play, porque Lucebox e C++/CUDA/ggml/GGUF/NVIDIA, enquanto Rapid-MLX e Python/MLX/Metal/Apple Silicon.
+## O que foi implementado
 
-Mesmo assim, Lucebox mostra oportunidades reais para Rapid-MLX: reduzir sync CPU, garantir chain pre-seed, baratear commit/rollback, reavaliar budget depois de otimizar verify, medir com benchmark limpo AR vs DDTree, e tratar n-gram como modo especifico de workload.
+- Speculative prefill pode atuar no primeiro request com tools, mas e desativado depois de `role=tool` para preservar resultados de ferramenta.
+- Tool results antigos e grandes agora sao compactados antes do chat template, mantendo os ultimos resultados e preservando falhas/diagnosticos.
+- O prompt do chat agora calcula multiplos `prefix_boundaries` seguros a partir dos prefixes reais do template.
+- `Request`, `EngineCore` e `Scheduler` carregam `prefix_boundaries`.
+- Scheduler ganhou hook nativo para `mlx-lm 0.31+`, salvando cache prompt-only e caches de segmentos mesmo sem a antiga API interna `_process_prompts`.
+- Stream de chat ganhou heartbeat SSE com delta vazio enquanto aguarda chunks.
+- Retry de stream agora cobre `length` sem tool call.
+- `structured-cot-tools` pode atuar desde o primeiro request com tools, mas agora para de forcar continuação quando ja existe evidencia de validacao e artefatos pedidos.
+- Agentic guard diagnostica mais cedo e o modo de uma tool-call por resposta fica restrito a repair/missing, porque limitar desde o inicio degradou scaffold.
+- Script `scripts/run_opencode_bench3_once.sh` registra runs opencode reproduziveis em `/tmp/rapid-mlx-bench3`.
 
-## O que Lucebox fez
+## O que funcionou
 
-- DFlash + DDTree para Qwen3.5-27B GGUF Q4_K_M com draft BF16.
-- Custom ops CUDA/ggml para SSM/tree:
-  - `ggml_ssm_conv_tree`
-  - `ggml_gated_delta_net_tree`
-  - `ggml_gated_delta_net_tree_persist`
-- Tree verify com budget 22, rollback rapido, KV quantizado e target feature ring.
-- Resultado reportado:
-  - HumanEval: 37.78 -> 129.52 tok/s
-  - Math500: 37.71 -> 110.51 tok/s
-  - GSM8K: 37.65 -> 96.15 tok/s
+O ganho decisivo veio de prefix-cache segmentado + compaction de tool results. No 35B, baseline sem prefix-cache levou 472.24s; o perfil otimizado levou 207.25s. Ambos finalizaram opencode e passaram `bun test`, entao o speedup fim-a-fim valido foi 2.28x.
 
-## O que Rapid-MLX ja tem
+O cache realmente entrou no caminho critico: no 35B otimizado houve 24 cache hits, TTFT mediano caiu de 6.178s para 2.973s, e TPS efetivo mediano subiu de 18.96 para 54.44.
 
-- Motor DFlash em `vllm_mlx/engine/dflash.py`.
-- DDTree MLX em `vllm_mlx/speculative/ddtree/engine.py`.
-- Verify tree-aware e kernels Metal em:
-  - `vllm_mlx/speculative/ddtree/verify.py`
-  - `vllm_mlx/speculative/ddtree/kernels.py`
-- CLI/docs com:
-  - `--drafter`
-  - `--dflash-ddtree-budget`
-  - `--dflash-fallback-mode ngram`
-- Bench local ja medido:
-  - Prose TCP/UDP pure DDTree budget 4: 23.8 tok/s
-  - CRUD pure DDTree budget 4: 29.8 tok/s
-  - CRUD n-gram size 2 draft 4 + DDTree: 35.2 tok/s
+O 27B tambem validou no perfil otimizado. O baseline 27B sem prefix-cache bateu timeout e falhou `bun test`; o perfil com prefix-cache, compaction e `structured-cot-tools` curto finalizou opencode em 629s e passou `bun test`.
 
-## Oportunidades concretas
+## O que nao virou perfil vencedor
 
-### 1. Garantir chain pre-seed
+DFlash/DDTree/n-gram funcionaram tecnicamente quando a flag correta `--drafter` foi usada. A flag antiga `--draft-model` nao ativa DFlash.
 
-Lucebox aponta que chain pre-seed no `build_ddtree` foi critico. Sem isso, a arvore ficava "bushy" e rasa sob ruido de quantizacao, com acceptance length perto de 4. Com seed da chain top-1, acceptance length voltou perto de 9.
+No fluxo opencode 35B, DFlash/DDTree/n-gram forcados ficaram lentos: o run com `DFLASH_AGENTIC_TARGET_FALLBACK=0`, DDTree budget 4 e fallback n-gram bateu timeout de 900s e ficou em ~11.3 TPS efetivo mediano. Para este workload, o custo de draft/verify nao compensou o padrao de tool calls, contexto crescente e prefill dominante.
 
-Acao possivel: auditar builder Rapid-MLX para confirmar se sempre preserva cadeia greedy top-1 antes de gastar budget em siblings. Se nao preservar, implementar e medir.
+Limitar o agente a uma tool-call por resposta desde o inicio removeu alguns timeouts, mas deixou o scaffold lento e incompleto. A regra ficou limitada a modos de reparo/missing.
 
-### 2. Tirar CPU sync do loop DDTree
+## Insights
 
-Lucebox ganhou removendo roundtrip GPU->CPU->GPU em `target_feat`. Rapid-MLX ainda tem sinais de custo Python/CPU:
+Agentic coding longo nao e dominado por decode puro. O gargalo principal foi refazer prefill de um historico com muitas tools. Por isso DDTree/DFlash, que atacam decode, perderam para prefix-cache segmentado.
 
-- `.tolist()` em prompt/posterior/DFS
-- tree build via NumPy
-- posterior tree walk em Python
-- concat/extração de hidden states em Python
+Tool-result compaction foi importante porque o historico cresce rapido. Compactar apenas resultados antigos bem-sucedidos preserva a informacao que o agente precisa para continuar e evita apagar erros que precisam de reparo.
 
-Acao possivel: reduzir `.tolist()`, mover top-k/tree build/walk para MLX/Metal quando viavel, ou cachear estruturas de arvore por shape/topology.
+Finalizacao precisa permitir texto final depois de validacao. Antes, `structured-cot-tools` podia transformar uma resposta final text-only em novo retry de tool call. A correcao foi considerar task complete quando ha evidencia de validacao e artefatos pedidos, mesmo sem `--agentic-guard`.
 
-### 3. Medir se kernels Metal realmente removem custo
+## Evidencia
 
-Rapid-MLX ja tem kernels Metal para conv1d tree e gated delta tree. Lucebox mostra que o grande ganho veio quando kernel persistente escreveu intermediarios diretamente e evitou copias.
-
-Acao possivel: criar perfil por fase:
-
-- draft
-- tree_build
-- tree_verify_attention
-- tree_verify_linear
-- commit
-- hidden extraction
-
-Objetivo: ver se gargalo atual e kernel, sync, commit ou Python.
-
-### 4. Re-varrer budget depois de reduzir overhead
-
-Hoje budget 6 ficou pior que budget 4 no Rapid-MLX. Lucebox mostra que budget maior so compensa quando verify/commit esta barato. Antes disso, budget maior apenas aumenta custo.
-
-Acao possivel: primeiro otimizar overhead; depois repetir sweep budget 4/6/8/12/16/22 em prompts Luce-style.
-
-### 5. Usar feature ring / sliding hidden cache
-
-Lucebox usa target feature ring de 4096 slots para manter memoria fixa. Rapid-MLX tem caminhos que concatenam/guardam hidden chunks para prompt cache extendido.
-
-Acao possivel: estudar ring buffer para features do drafter e evitar concat/copy em long context.
-
-### 6. Separar benchmark decode puro de benchmark agente
-
-Lucebox mede AR vs DFlash no mesmo harness, concurrency 1, greedy, `n_gen=256`. Rapid-MLX tem numeros de TUI/opencode/tool-calls que misturam prefill, polling, comandos, testes e overhead de agente.
-
-Acao possivel: criar bench equivalente:
-
-- mesmos prompts/datasets
-- AR target-only
-- DFlash chain
-- DDTree
-- DDTree + n-gram
-- `temperature=0`
-- non-streaming
-- wall time com `usage.completion_tokens`
-
-### 7. Tratar n-gram como especializacao
-
-Rapid-MLX viu n-gram piorar prose e melhorar CRUD repetitivo. Lucebox nao usa n-gram como principal. Logo n-gram deve ser opcional por workload, nao default geral.
-
-Acao possivel:
-
-- pure DDTree default para prose, reasoning, tool planning
-- n-gram first apenas para boilerplate, CRUD, JSON/XML, testes repetitivos
-- detector/heuristica baseada em repeticao real, nao so draft length
-
-### 8. Comparar Qwen3.5 e Qwen3.6 separadamente
-
-Lucebox reporta bons ganhos em Qwen3.5-27B. Rapid-MLX testa muito Qwen3.6-27B/35B. Se Qwen3.6 draft tiver menor acceptance, o motor parece pior do que e.
-
-Acao possivel: medir Qwen3.5 target/drafter e Qwen3.6 target/drafter separadamente, sem misturar conclusoes.
-
-## Veredito
-
-Nao existe ganho imediato que pareca apenas ativar flag. Mas existem oportunidades claras aprendidas com Lucebox:
-
-1. confirmar/fortalecer chain pre-seed;
-2. remover sync CPU no loop DDTree;
-3. baratear commit/rollback e hidden feature update;
-4. re-varrer budget apos otimizar overhead;
-5. criar benchmark AR-vs-DDTree limpo;
-6. usar n-gram so onde workload favorece;
-7. comparar familias Qwen separadamente.
-
-Meta realista para Rapid-MLX: nao reproduzir exatamente 129 tok/s CUDA, mas provar speedup AR -> DDTree no Apple Silicon e reduzir overhead ate DDTree vencer baseline de modo consistente.
+- Benchmarks resumidos: `BENCHMARK3.md`.
+- Artefatos: `/tmp/rapid-mlx-bench3/*.result.json`, `.server.log`, `.opencode.log`, `.validation-install.log`, `.validation-test.log`.
+- Validacoes locais do repo:
+  - `uv run ruff check vllm_mlx/routes/chat.py vllm_mlx/engine/batched.py vllm_mlx/scheduler.py vllm_mlx/engine_core.py vllm_mlx/request.py tests/test_speculative_prefill.py`
+  - `uv run pytest tests/test_speculative_prefill.py`
+  - `bash -n scripts/run_opencode_bench3_once.sh`

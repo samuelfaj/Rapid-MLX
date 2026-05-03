@@ -112,6 +112,7 @@ class Request:
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: list[int] | None = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
+    prefix_boundaries: list[int] | None = None  # Additional safe segment boundaries
     logits_processor_factories: list[Any] | None = None
 
     # Paged cache fields (for BlockAwarePrefixCache)

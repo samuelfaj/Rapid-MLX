@@ -99,8 +99,8 @@ _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 4096
 _AGENTIC_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 20000
 _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 65536
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
-_AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 8
-_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 6
+_AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 4
+_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 3
 _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 2
 _AGENTIC_RETRY_MAX_TOKENS = 4096
 _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS = _AGENTIC_RETRY_MAX_TOKENS
@@ -1778,6 +1778,19 @@ def _buffered_tool_call_argument_chars(buffered_events: list[tuple]) -> int:
     return total
 
 
+def _first_tool_call_only(tool_calls: list[dict] | None) -> list[dict] | None:
+    if not tool_calls:
+        return tool_calls
+    filtered = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        index = tool_call.get("index", 0)
+        if index in (0, None):
+            filtered.append(tool_call)
+    return filtered or None
+
+
 def _stream_tool_call_repeats_recent(event, recent_signature) -> bool:
     if not recent_signature:
         return False
@@ -1820,29 +1833,43 @@ def _buffered_tool_call_repeats_recent_path(
     )
 
 
-async def _iterate_with_idle_timeout(async_iter, timeout: float):
+_STREAM_HEARTBEAT = object()
+
+
+async def _iterate_with_idle_timeout(
+    async_iter, timeout: float, heartbeat_interval: float = 15.0
+):
     iterator = async_iter.__aiter__()
     while True:
         task = asyncio.create_task(iterator.__anext__())
+        started = time.perf_counter()
         try:
-            done, _ = await asyncio.wait({task}, timeout=timeout)
-            if task not in done:
-                task.cancel()
-                try:
-                    await asyncio.wait_for(task, timeout=1.0)
-                except (
-                    asyncio.CancelledError,
-                    RuntimeError,
-                    StopAsyncIteration,
-                    TimeoutError,
-                ):
-                    pass
-                if hasattr(iterator, "aclose"):
+            while True:
+                remaining = timeout - (time.perf_counter() - started)
+                if remaining <= 0:
+                    task.cancel()
                     try:
-                        await asyncio.wait_for(iterator.aclose(), timeout=1.0)
-                    except (asyncio.CancelledError, RuntimeError, TimeoutError):
+                        await asyncio.wait_for(task, timeout=1.0)
+                    except (
+                        asyncio.CancelledError,
+                        RuntimeError,
+                        StopAsyncIteration,
+                        TimeoutError,
+                    ):
                         pass
-                raise TimeoutError
+                    if hasattr(iterator, "aclose"):
+                        try:
+                            await asyncio.wait_for(iterator.aclose(), timeout=1.0)
+                        except (asyncio.CancelledError, RuntimeError, TimeoutError):
+                            pass
+                    raise TimeoutError
+
+                done, _ = await asyncio.wait(
+                    {task}, timeout=min(heartbeat_interval, remaining)
+                )
+                if task in done:
+                    break
+                yield _STREAM_HEARTBEAT
             yield task.result()
         except StopAsyncIteration:
             return
@@ -2607,13 +2634,18 @@ async def stream_chat_completion(
                 return [_fast_sse_chunk(event.reasoning, "reasoning_content")]
 
             if event.type == "tool_call":
+                tool_calls = event.tool_calls
+                if agentic_single_tool_call_mode:
+                    tool_calls = _first_tool_call_only(tool_calls)
+                    if not tool_calls:
+                        return []
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_resolve_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
-                                tool_calls=event.tool_calls,
+                                tool_calls=tool_calls,
                             ),
                             finish_reason=event.finish_reason,
                         )
@@ -2643,6 +2675,8 @@ async def stream_chat_completion(
                 return [f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"]
 
             return []
+
+        agentic_single_tool_call_mode = False
 
         def _format_forced_tool_call(tool_calls: list[ToolCall], output) -> str:
             stream_tool_calls = []
@@ -2689,6 +2723,11 @@ async def stream_chat_completion(
             and _agentic_tool_result_count(messages)
             >= _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
             and not _last_tool_result_is_agentic_diagnostic(messages)
+        )
+        agentic_single_tool_call_mode = bool(
+            agentic_repair_mode
+            or agentic_missing_requested_artifacts
+            or agentic_missing_requested_artifacts_without_validation
         )
         agentic_tool_results_since_failure = (
             _agentic_tool_result_count_since_latest_failure(messages)
@@ -2866,18 +2905,13 @@ async def stream_chat_completion(
             and last_content == _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
         )
         agentic_task_complete = (
-            cfg.agentic_guard
-            and bool(request.tools)
+            bool(request.tools)
             and _agentic_completion_needs_verification(messages)
             and _agentic_verification_present(messages)
             and not _agentic_requested_artifacts_missing(messages)
         )
         structured_agentic_continuation = (
-            (
-                tool_continuation_retry
-                or agentic_stream_guard
-            )
-            and (cfg.structured_cot_tools or agentic_stream_guard)
+            (cfg.structured_cot_tools or agentic_stream_guard)
             and bool(request.tools)
             and not repeated_tool_continuation
             and not agentic_task_complete
@@ -2979,6 +3013,15 @@ async def stream_chat_completion(
                     engine.stream_chat(messages=active_messages, **active_kwargs),
                     stream_idle_timeout,
                 ):
+                    if output is _STREAM_HEARTBEAT:
+                        yield (
+                            f'data: {{"id":"{response_id}",'
+                            '"object":"chat.completion.chunk",'
+                            f'"created":{_sse_created},'
+                            f'"model":{_model_escaped},'
+                            '"choices":[{"index":0,"delta":{}}]}\n\n'
+                        )
+                        continue
                     last_output = output
                     if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                         prompt_tokens = output.prompt_tokens
@@ -3139,13 +3182,18 @@ async def stream_chat_completion(
                                 yield _sse
                         buffered_events.clear()
 
+                        tool_calls = event.tool_calls
+                        if agentic_single_tool_call_mode:
+                            tool_calls = _first_tool_call_only(tool_calls)
+                            if not tool_calls:
+                                continue
                         tool_chunk = ChatCompletionChunk(
                             id=response_id,
                             model=_resolve_model_name(request.model),
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
-                                        tool_calls=event.tool_calls,
+                                        tool_calls=tool_calls,
                                     ),
                                     finish_reason="tool_calls",
                                 )
@@ -3219,6 +3267,14 @@ async def stream_chat_completion(
 
             if not retry_reason and deferred_finish and not emitted_tool_call:
                 retry_reason = "text-only stop"
+            elif (
+                not retry_reason
+                and last_output is not None
+                and getattr(last_output, "finish_reason", None) == "length"
+                and bool(request.tools)
+                and not emitted_tool_call
+            ):
+                retry_reason = "length without tool call"
             elif not retry_reason and buffered_events and not emitted_tool_call:
                 retry_reason = "stream exhausted without tool call"
 

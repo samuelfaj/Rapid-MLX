@@ -9,14 +9,15 @@ should create models, seeders and migrations. You must create unit tests for eac
 
 ## Resultado curto
 
-- Qwen3.6 35B A3B 4bit: speedup fim-a-fim = n/a; 0/1 baseline e 0/1 otimizado validaram; throughput de decode 0.41x maior.
+- Qwen3.6 35B A3B 4bit: run otimizado corrigido validou em 4m50.2s; `pi` finalizou, `bun test` passou com 14/14 e `bun run build` passou.
+- Baseline historico continua 0/1 validado; rerun otimizado manual em 2026-05-02 substitui o resultado otimizado anterior com timeout.
 
 ## Tabela
 
 | modelo | perfil | runs | pi finalizou | validou | timeouts | mediana wall | mediana wall valida | tok/s mediana |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Qwen3.6 35B A3B 4bit | baseline | 1 | 1/1 | 0/1 | 0 | 3m18.2s | n/a | 113.11 |
-| Qwen3.6 35B A3B 4bit | optimized | 1 | 0/1 | 0/1 | 1 | 10m00.2s | n/a | 46.2 |
+| Qwen3.6 35B A3B 4bit | optimized | 1 | 1/1 | 1/1 | 0 | 4m50.2s | 4m50.2s | 97.53 |
 
 ## Metodo
 
@@ -28,6 +29,7 @@ should create models, seeders and migrations. You must create unit tests for eac
 - `pi` usa provider local OpenAI-compatible via `PI_CODING_AGENT_DIR`, `rapid-mlx` em `http://127.0.0.1:8010/v1`, `temperature=0`, `max_tokens=4096`.
 - Validacao: instala dependencias com package manager detectado, roda `test` quando existir ou for pedido, roda `build`/`lint` quando existirem.
 - Tok/s e diagnostico de servidor, nao criterio de sucesso. Runs longos podem trocar entradas antigas do `/v1/requests`; `BENCHMARK.py` agora faz polling para novos reruns.
+- Rerun otimizado manual de 2026-05-02: `/tmp/rapid-mlx-manual-pi6`, `PI_CODING_AGENT_DIR=/tmp/rapid-mlx-bench/pi-agent-fresh-2`, prompt igual ao acima. Validacao local independente: `bun test` = 14 pass / 0 fail; `bun run build` = pass.
 
 ## Perfis
 
@@ -49,6 +51,6 @@ should create models, seeders and migrations. You must create unit tests for eac
 
 4/ Resultado bom = run termina, projeto nasce em pasta limpa, testes passam, build passa. Resultado ruim = timeout, erro de tool-call, pacote incompleto, ou validacao quebrada.
 
-5/ Conclusao: nenhum perfil otimizado atingiu sucesso completo. Neste teste, throughput parcial nao basta se agente nao termina e valida.
+5/ Conclusao: depois dos fixes de agentic guard/repair e fallback target-only para prompts longos, o perfil otimizado atingiu sucesso completo no rerun manual: agente terminou, projeto nasceu em pasta limpa, testes passaram e build passou.
 
 6/ Artefatos brutos: `/tmp/rapid-mlx-bench`. JSON completo: `/tmp/rapid-mlx-bench/results.json`.

@@ -3,6 +3,7 @@
 
 import concurrent.futures
 import sys
+import threading
 import types
 
 import numpy as np
@@ -219,3 +220,154 @@ def test_ddtree_ngram_tool_call_guard_detects_xml_markers():
 
     assert _looks_like_tool_call_draft(FakeTokenizer(), [1, 2], 3, [4])
     assert not _looks_like_tool_call_draft(FakeTokenizer(), [1, 2], 3, [5])
+
+
+def test_dflash_agentic_target_fallback_only_for_long_tool_prompts(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_TARGET_FALLBACK", "1")
+    monkeypatch.setenv("DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS", "4")
+
+    class FakeTokenizer:
+        def encode(self, prompt):
+            return prompt.split()
+
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        fallback_mode="ngram",
+    )
+    engine._tokenizer = FakeTokenizer()
+
+    assert engine._should_use_agentic_target_fallback(
+        "one two three four", tools_requested=True
+    )
+    assert not engine._should_use_agentic_target_fallback(
+        "one two three", tools_requested=True
+    )
+    assert not engine._should_use_agentic_target_fallback(
+        "one two three four", tools_requested=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_dflash_target_fallback_closes_generator_on_worker(monkeypatch):
+    import mlx_lm
+
+    threads: dict[str, int] = {}
+
+    class FakeResponse:
+        text = "</tool_call>"
+        token = 1
+        prompt_tokens = 4
+        prompt_tps = 2.0
+        generation_tokens = 1
+        generation_tps = 10.0
+        finish_reason = None
+
+    class FakeGenerator:
+        def __init__(self):
+            self._done = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            threads["next"] = threading.get_ident()
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return FakeResponse()
+
+        def close(self):
+            threads["close"] = threading.get_ident()
+
+    monkeypatch.setattr(
+        mlx_lm,
+        "stream_generate",
+        lambda *args, **kwargs: FakeGenerator(),
+    )
+
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+    )
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    try:
+        outputs = [
+            output
+            async for output in engine._stream_target(
+                "prompt",
+                max_tokens=8,
+                temperature=0,
+                top_p=1,
+                stop=None,
+                tools_requested=True,
+            )
+        ]
+    finally:
+        await engine.stop()
+
+    assert outputs[-1].finish_reason == "stop"
+    assert threads["close"] == threads["next"]
+
+
+@pytest.mark.asyncio
+async def test_dflash_stop_closes_active_target_fallback_generator(monkeypatch):
+    import mlx_lm
+
+    threads: dict[str, int] = {}
+
+    class FakeResponse:
+        text = "partial"
+        token = 1
+        prompt_tokens = 4
+        prompt_tps = 2.0
+        generation_tokens = 1
+        generation_tps = 10.0
+        finish_reason = None
+
+    class FakeGenerator:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            threads["next"] = threading.get_ident()
+            return FakeResponse()
+
+        def close(self):
+            threads["close"] = threading.get_ident()
+
+    monkeypatch.setattr(
+        mlx_lm,
+        "stream_generate",
+        lambda *args, **kwargs: FakeGenerator(),
+    )
+
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+    )
+    engine._model = object()
+    engine._tokenizer = object()
+    engine._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    stream = engine._stream_target(
+        "prompt",
+        max_tokens=8,
+        temperature=0,
+        top_p=1,
+        stop=None,
+        tools_requested=False,
+    )
+    output = await stream.__anext__()
+    assert output.text == "partial"
+
+    await engine.stop()
+    await stream.aclose()
+
+    assert threads["close"] == threads["next"]

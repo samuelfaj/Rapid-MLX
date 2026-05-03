@@ -288,6 +288,7 @@ class DFlashEngine(BatchedEngine):
 
         self._lock = asyncio.Lock()
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._target_stream_generators: set[Any] = set()
         self._active: _ActiveRequest | None = None
         self._inflight = 0
 
@@ -395,9 +396,29 @@ class DFlashEngine(BatchedEngine):
 
     async def stop(self) -> None:
         if self._executor is not None:
+            await self._close_target_stream_generators()
             self._executor.shutdown(wait=False)
             self._executor = None
         self._drafter = None
+
+    async def _close_target_stream_generators(self) -> None:
+        executor = self._executor
+        if executor is None or not self._target_stream_generators:
+            self._target_stream_generators.clear()
+            return
+
+        generators = tuple(self._target_stream_generators)
+        loop = asyncio.get_running_loop()
+
+        def _close_all() -> None:
+            for gen in generators:
+                close = getattr(gen, "close", None)
+                if close is not None:
+                    close()
+
+        await loop.run_in_executor(executor, _close_all)
+        for gen in generators:
+            self._target_stream_generators.discard(gen)
 
     # ------------------------------------------------------------------
     # Generation core
@@ -464,6 +485,141 @@ class DFlashEngine(BatchedEngine):
             )
             return None
         return ddtree_block_size
+
+    def _prompt_token_count(self, prompt: str) -> int:
+        try:
+            encoded = self._tokenizer.encode(prompt)
+            return int(len(encoded))
+        except Exception:
+            return 0
+
+    def _should_use_agentic_target_fallback(
+        self,
+        prompt: str,
+        tools_requested: bool,
+    ) -> bool:
+        if not tools_requested:
+            return False
+        if not _env_bool("DFLASH_AGENTIC_TARGET_FALLBACK", True):
+            return False
+        threshold = max(
+            1,
+            int(os.environ.get("DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS", "4096")),
+        )
+        return self._prompt_token_count(prompt) >= threshold
+
+    async def _stream_target(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None,
+        tools_requested: bool,
+        logits_processor_factories: list[Any] | None = None,
+    ):
+        """Run target-only mlx-lm decode on the DFlash worker thread."""
+        from mlx_lm import stream_generate as _target_stream_generate
+        from mlx_lm.sample_utils import make_sampler
+
+        loop = asyncio.get_running_loop()
+        executor = self._executor
+        assert executor is not None, "DFlashEngine not started"
+
+        def _make_gen():
+            processors = []
+            for factory in logits_processor_factories or ():
+                processor = factory()
+                if processor is not None:
+                    processors.append(processor)
+            sampler = make_sampler(temp=float(temperature or 0.0), top_p=float(top_p or 0.0))
+            return _target_stream_generate(
+                self._model,
+                self._tokenizer,
+                prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=processors or None,
+            )
+
+        gen = await loop.run_in_executor(executor, _make_gen)
+        self._target_stream_generators.add(gen)
+        sentinel = object()
+        stop_after_strings = list(_TOOL_STOP_AFTER_STRINGS) if tools_requested else []
+        stop_strings = [*(stop or ()), *stop_after_strings]
+        cumulative = ""
+        stopped = False
+
+        def _next():
+            try:
+                return next(gen)
+            except StopIteration:
+                return sentinel
+
+        exhausted = False
+
+        def _close_gen():
+            close = getattr(gen, "close", None)
+            if close is not None:
+                close()
+
+        try:
+            while True:
+                resp = await loop.run_in_executor(executor, _next)
+                if resp is sentinel:
+                    exhausted = True
+                    return
+                text = getattr(resp, "text", "") or ""
+                cumulative += text
+                finish_reason = getattr(resp, "finish_reason", None)
+                if stop_strings and any(marker in cumulative for marker in stop_strings):
+                    stopped = True
+                    finish_reason = "stop"
+                yield SimpleNamespace(
+                    text=text,
+                    tokens=[int(getattr(resp, "token", 0))]
+                    if getattr(resp, "token", None) is not None
+                    else [],
+                    prompt_tokens=int(getattr(resp, "prompt_tokens", 0) or 0),
+                    prefill_seconds=(
+                        float(getattr(resp, "prompt_tokens", 0) or 0)
+                        / float(getattr(resp, "prompt_tps", 0.0) or 1.0)
+                        if getattr(resp, "prompt_tps", 0.0)
+                        else 0.0
+                    ),
+                    generation_tokens=int(getattr(resp, "generation_tokens", 0) or 0),
+                    generation_tps=float(getattr(resp, "generation_tps", 0.0) or 0.0),
+                    finish_reason=finish_reason,
+                    proposed_tokens=0,
+                    accepted_tokens=0,
+                    speculative_steps=0,
+                    avg_acceptance_ratio=0.0,
+                    block_size_history=(),
+                    avg_tree_node_count=0.0,
+                    ddtree_fast_path_ratio=0.0,
+                    tree_budget=0,
+                    ngram_acceptance_ratio=0.0,
+                    ngram_cycles=0,
+                    ngram_fallback_cycles=0,
+                    ngram_tool_guard_cycles=0,
+                    cache_hit_type="agentic-target-fallback",
+                    cached_tokens=0,
+                    phase_timings_us={},
+                )
+                if stopped:
+                    return
+        finally:
+            if not exhausted:
+                if self._executor is not None:
+                    try:
+                        await loop.run_in_executor(executor, _close_gen)
+                    except RuntimeError as exc:
+                        logger.warning(
+                            "[DFlash] target stream close skipped after executor "
+                            "shutdown: %s",
+                            exc,
+                        )
+            self._target_stream_generators.discard(gen)
 
     def _store_ddtree_cache_result(
         self,
@@ -788,6 +944,42 @@ class DFlashEngine(BatchedEngine):
                     logits_processor_factories = kwargs.pop(
                         "logits_processor_factories", None
                     )
+                    if self._should_use_agentic_target_fallback(
+                        prompt, tools_requested
+                    ):
+                        self._track_request_start("target-fallback")
+                        try:
+                            last_resp = None
+                            text_parts: list[str] = []
+                            async for resp in self._stream_target(
+                                prompt,
+                                max_tokens,
+                                temperature,
+                                top_p,
+                                stop,
+                                tools_requested,
+                                logits_processor_factories,
+                            ):
+                                last_resp = resp
+                                if resp.text:
+                                    text_parts.append(resp.text)
+                                self._update_active(resp, new_text=resp.text or "")
+                            return GenerationOutput(
+                                text=clean_output_text("".join(text_parts)),
+                                prompt_tokens=last_resp.prompt_tokens
+                                if last_resp
+                                else 0,
+                                completion_tokens=last_resp.generation_tokens
+                                if last_resp
+                                else 0,
+                                finished=True,
+                                finish_reason=(
+                                    last_resp.finish_reason if last_resp else None
+                                )
+                                or "stop",
+                            )
+                        finally:
+                            self._track_request_end()
                     mode = (
                         "ddtree-ngram"
                         if self._should_enable_ngram_first(prompt)
@@ -922,27 +1114,33 @@ class DFlashEngine(BatchedEngine):
                     "logits_processor_factories", None
                 )
                 greedy_request = temperature in (0, 0.0)
+                use_target_fallback = self._should_use_agentic_target_fallback(
+                    prompt, tools_requested
+                )
                 if self._ddtree_budget > 0 and not greedy_request:
                     logger.warning(
                         "[DDTree] falling back to DFlash for non-greedy request: temperature=%s top_p=%s",
                         temperature,
                         top_p,
                     )
-                mode = (
-                    "ddtree-ngram"
-                    if (
-                        (
-                            self._should_enable_ngram_first(prompt)
-                            or self._thinking_ngram_enabled
+                if use_target_fallback:
+                    mode = "target-fallback"
+                else:
+                    mode = (
+                        "ddtree-ngram"
+                        if (
+                            (
+                                self._should_enable_ngram_first(prompt)
+                                or self._thinking_ngram_enabled
+                            )
+                            and greedy_request
                         )
-                        and greedy_request
+                        else (
+                            "ddtree"
+                            if self._ddtree_budget > 0 and greedy_request
+                            else "dflash"
+                        )
                     )
-                    else (
-                        "ddtree"
-                        if self._ddtree_budget > 0 and greedy_request
-                        else "dflash"
-                    )
-                )
                 if logits_processor_factories and mode == "dflash":
                     raise RuntimeError(
                         "Structured CoT logits masking requires greedy DDTree mode "
@@ -953,12 +1151,18 @@ class DFlashEngine(BatchedEngine):
                 cumulative = ""
                 last_resp = None
                 try:
-                    stream = (
-                        self._stream_ddtree
-                        if mode in ("ddtree", "ddtree-ngram")
-                        else self._stream_dflash
-                    )
-                    if mode in ("ddtree", "ddtree-ngram"):
+                    if mode == "target-fallback":
+                        response_stream = self._stream_target(
+                            prompt,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            stop,
+                            tools_requested,
+                            logits_processor_factories,
+                        )
+                    elif mode in ("ddtree", "ddtree-ngram"):
+                        stream = self._stream_ddtree
                         response_stream = stream(
                             prompt,
                             max_tokens,
@@ -970,6 +1174,7 @@ class DFlashEngine(BatchedEngine):
                             logits_processor_factories,
                         )
                     else:
+                        stream = self._stream_dflash
                         response_stream = stream(prompt, max_tokens, temperature, top_p)
                     async for resp in response_stream:
                         last_resp = resp
@@ -1214,6 +1419,15 @@ class DFlashEngine(BatchedEngine):
                 "thinking_ngram_size": self._thinking_ngram_size or 0,
                 "thinking_ngram_min_matches": (
                     self._thinking_ngram_min_matches or 0
+                ),
+                "agentic_target_fallback_enabled": _env_bool(
+                    "DFLASH_AGENTIC_TARGET_FALLBACK", True
+                ),
+                "agentic_target_fallback_min_prompt_tokens": int(
+                    os.environ.get(
+                        "DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS",
+                        "4096",
+                    )
                 ),
                 "ngram_last_acceptance_ratio": self._ddtree_last.get(
                     "ngram_acceptance_ratio", 0.0

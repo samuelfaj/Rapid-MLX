@@ -300,6 +300,35 @@ _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT = (
     "../models/modelName, and src/config from a nested services directory uses "
     "../../../config only if a config import is truly needed."
 )
+_AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT = (
+    "The latest validation failure is a sequelize-typescript decorator order "
+    "error: '@Column annotation is missing'. Your entire next response must be "
+    "one valid write or edit tool call only. Fix the model file named in the "
+    "stack trace, not the service test. In sequelize-typescript, @Column must "
+    "be the decorator closest to the property in source order so its runtime "
+    "decorator call runs first. For UUID primary keys, use the exact source "
+    "order @PrimaryKey, then @Default(DataType.UUIDV4), then "
+    "@Column(DataType.UUID), then the property declaration. Put validation or "
+    "option decorators such as @CreatedAt, @UpdatedAt, @Default, @Length, "
+    "@IsEmail, @Min, @IsFloat, @ForeignKey, @BelongsTo, or @HasMany above "
+    "@Column, never below it. For timestamps, use the order "
+    "@CreatedAt, then @Default if needed, then @Column(DataType.DATE), then "
+    "the property declaration. Apply the same pattern to every property in the "
+    "failing model that combines @Column with other decorators. Do not run "
+    "validation again until the model file has changed."
+)
+_AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT = (
+    "The latest validation failure is a service unit test mock returning a "
+    "plain object that lacks an instance method called by the service, such as "
+    "update or destroy. Your entire next response must be one valid write or "
+    "edit tool call only. Fix the failing *.service.test.ts file, not the "
+    "service implementation, unless the service stack trace proves production "
+    "logic is wrong. Ensure every mocked findByPk/findOne result used by an "
+    "update, delete, save, destroy, or similar service path includes the exact "
+    "async instance method the service calls, and assert that method was called "
+    "with expected data. Do not run validation again until the test mock file "
+    "has changed."
+)
 _AGENTIC_REPEATED_TOOL_PROMPT = (
     "You repeated a validation or diagnostic tool call without fixing files. "
     "That is a loop. Use the existing tool output. Your next response must be "
@@ -726,6 +755,55 @@ def _agentic_created_artifact_paths(messages: list) -> list[str]:
     return paths
 
 
+_AGENTIC_PROJECT_MANIFESTS = {
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "go.mod",
+    "cargo.toml",
+    "pom.xml",
+    "build.gradle",
+}
+
+
+def _agentic_project_root_from_messages(messages: list) -> str | None:
+    paths = _agentic_created_artifact_paths(messages)
+    for path in reversed(paths):
+        manifest_path = Path(path)
+        if manifest_path.name.lower() in _AGENTIC_PROJECT_MANIFESTS:
+            parent = str(manifest_path.parent)
+            return parent if parent and parent != "." else None
+
+    roots: Counter[str] = Counter()
+    for path in paths:
+        lower = path.lower()
+        marker = "/src/"
+        if marker in lower:
+            roots[path[: lower.index(marker)]] += 1
+        elif lower.startswith("src/"):
+            roots["."] += 1
+
+    for root, _count in roots.most_common():
+        if root and root != ".":
+            return root
+    return None
+
+
+def _agentic_diagnostic_command(messages: list | None = None) -> str:
+    root = _agentic_project_root_from_messages(messages or [])
+    if not root:
+        return _AGENTIC_DIAGNOSTIC_COMMAND
+    return f"cd {shlex.quote(root)} && {_AGENTIC_DIAGNOSTIC_COMMAND}"
+
+
+def _agentic_service_artifact_name(path: str) -> str:
+    stem = Path(path).stem.lower()
+    stem = re.sub(r"(?:[._-]?(?:test|spec))$", "", stem)
+    stem = re.sub(r"(?:[._-]?service)$", "", stem)
+    return stem.rstrip("._-")
+
+
 def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
     requested = _agentic_requested_artifact_terms(messages)
     if not requested:
@@ -757,12 +835,12 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
             missing.add(term)
     if "service" in requested and "test" in requested:
         service_names = {
-            re.sub(r"(?:service|\.service)$", "", Path(path).stem).lower()
+            _agentic_service_artifact_name(path)
             for path in paths
             if "service" in path and "test" not in path and "spec" not in path
         }
         tested_names = {
-            re.sub(r"(?:service|\.service|test|spec)$", "", Path(path).stem).lower()
+            _agentic_service_artifact_name(path)
             for path in paths
             if ("test" in path or "spec" in path) and "service" in path
         }
@@ -989,6 +1067,39 @@ def _last_tool_result_service_db_test_failure(messages: list) -> bool:
     return False
 
 
+def _last_tool_result_sequelize_column_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return "@column annotation is missing" in text
+    return False
+
+
+def _last_tool_result_service_instance_mock_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        has_service_test_context = ".service.test" in text or "/services/" in text
+        has_missing_instance_method = re.search(
+            r"typeerror:\s+\w+\.(?:update|destroy|save|reload|restore)\s+is not a function",
+            text,
+        )
+        return has_service_test_context and has_missing_instance_method is not None
+    return False
+
+
 def _last_tool_result_no_change(messages: list) -> bool:
     for message in reversed(messages):
         role = (
@@ -1092,6 +1203,10 @@ def _agentic_repair_prompt(messages: list) -> str:
         return _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT
     if _last_tool_result_bun_jest_failure(messages):
         return _AGENTIC_BUN_TEST_REPAIR_PROMPT
+    if _last_tool_result_sequelize_column_failure(messages):
+        return _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    if _last_tool_result_service_instance_mock_failure(messages):
+        return _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
     if _last_tool_result_service_db_test_failure(messages):
         return _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
     return _AGENTIC_REPAIR_USER_PROMPT
@@ -1341,14 +1456,14 @@ def _tool_names(tools) -> set[str]:
     return names
 
 
-def _agentic_diagnostic_tool_call() -> ToolCall:
+def _agentic_diagnostic_tool_call(messages: list | None = None) -> ToolCall:
     return ToolCall(
         id=f"call_{uuid.uuid4().hex[:8]}",
         function=FunctionCall(
             name="bash",
             arguments=json.dumps(
                 {
-                    "command": _AGENTIC_DIAGNOSTIC_COMMAND,
+                    "command": _agentic_diagnostic_command(messages),
                     "timeout": 120,
                 }
             ),
@@ -2665,7 +2780,10 @@ async def stream_chat_completion(
                 agentic_same_path_tools_since_failure,
                 agentic_same_command_tools_since_failure,
             )
-            yield _format_forced_tool_call([_agentic_diagnostic_tool_call()], None)
+            yield _format_forced_tool_call(
+                [_agentic_diagnostic_tool_call(messages)],
+                None,
+            )
             if include_usage:
                 usage_chunk = ChatCompletionChunk(
                     id=response_id,
@@ -3206,7 +3324,7 @@ async def stream_chat_completion(
                         retry_reason,
                     )
                 yield _format_forced_tool_call(
-                    [_agentic_diagnostic_tool_call()],
+                    [_agentic_diagnostic_tool_call(messages)],
                     last_output,
                 )
                 break

@@ -25,7 +25,9 @@ from vllm_mlx.routes.chat import (
     _AGENTIC_REPAIR_USER_PROMPT,
     _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
     _AGENTIC_REPEATED_TOOL_PROMPT,
+    _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT,
     _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT,
+    _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT,
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
@@ -1603,6 +1605,58 @@ def test_agentic_repair_prompt_prioritizes_service_db_test_failures():
     )
     assert "Fix the failing *.service.test.ts files instead" in (
         _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    )
+
+
+def test_agentic_repair_prompt_prioritizes_sequelize_column_order_failures():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "error: @Column annotation is missing for "
+                '"createdAt" of class "User" or annotation order is wrong.\n'
+                "at /tmp/app/src/features/users/models/user.model.ts:40:11\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "Fix the model file named in the stack trace" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "@Column must be the decorator closest to the property" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "@PrimaryKey, then @Default(DataType.UUIDV4), then" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+
+
+def test_agentic_repair_prompt_handles_missing_service_instance_methods():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "src/modules/orders/services/order.service.test.ts:\n"
+                "TypeError: order.update is not a function\n"
+                "at update (/tmp/app/src/modules/orders/services/order.service.ts:59:17)\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    )
+    assert "Fix the failing *.service.test.ts file" in (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    )
+    assert "includes the exact async instance method" in (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
     )
 
 

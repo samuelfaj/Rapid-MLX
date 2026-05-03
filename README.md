@@ -63,7 +63,54 @@ curl http://localhost:8010/v1/chat/completions \
   }'
 ```
 
-## DFlash Example
+## Best Agentic Coding Server Config
+
+This is the fastest validated configuration for opencode-style agentic coding
+with tools and finalization. It keeps prefix caching enabled, uses segmented
+prefix cache and tool-result compaction from the server, and avoids forcing
+DFlash/DDTree on long tool workflows.
+
+```bash
+lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
+  --served-model-name local \
+  --port 8010 \
+  --default-temperature 0 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder_xml \
+  --max-tokens 4096 \
+  --timeout 300
+```
+
+For the replicated 27B run, use the same server shape plus short structured
+tool reasoning:
+
+```bash
+lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-27B-UD-Q4_K_XL-mlx \
+  --served-model-name local \
+  --port 8010 \
+  --default-temperature 0 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder_xml \
+  --max-tokens 4096 \
+  --timeout 300 \
+  --structured-cot-tools \
+  --structured-cot-token-budget 96
+```
+
+Do not add `--no-thinking` for these benchmarks. It was intentionally not used.
+
+Validated result for the 35B opencode benchmark:
+
+- Baseline without prefix cache: 472.24s, opencode exit 0, `bun test` passed.
+- Best config above: 207.25s, opencode exit 0, `bun test` passed.
+- End-to-end wall-clock speedup: 2.28x.
+
+## DFlash Example For Decode-Heavy Runs
+
+DFlash/DDTree/n-gram are available, but they were not the winning configuration
+for long agentic coding with many tool results. In the opencode benchmark,
+forcing DFlash/DDTree/n-gram timed out and was slower because the bottleneck was
+repeated prefill over tool history, not pure decode.
 
 ```bash
 DFLASH_DRAFT_SINK=64 DFLASH_DRAFT_WINDOW=1024 \
@@ -121,4 +168,3 @@ Format and lint policy follows the existing Python project configuration in [pyp
 ## Repository Relationship
 
 This repository is intended to remain visibly connected to the original Rapid-MLX project while using `main` for the performance fork line. Upstream history is preserved so original authorship and commit ancestry remain available.
-

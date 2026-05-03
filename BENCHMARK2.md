@@ -22,6 +22,8 @@ Conclusao atual: nenhum perfil novo atingiu a meta critica com qualidade valida.
 | Qwen3.6 35B A3B 4bit | baseline | 1/1 | 0/1 | 0 | 3m18.2s | 113.11 | 1.00x | nao |
 | Qwen3.6 35B A3B 4bit | DFlash/DDTree/spec-prefill/guard | 1/1 | 1/1 | 0 | 4m50.2s | 97.53 | 0.68x | nao |
 | Qwen3.6 35B A3B 4bit | target-only/no-thinking/guard | 0/1 | 0/1 | abortado manualmente depois de >270s | >4m30s | n/a | <0.73x | nao |
+| Qwen3.6 35B A3B 4bit | DFlash budget2/adaptive/spec-prefill/guard | 0/1 | 0/1 | 1 | 2m12.1s | 99.93 | 1.50x bruto | nao |
+| Qwen3.6 35B A3B 4bit | DFlash validado + appended pi system prompt | 0/1 | 0/1 | 1 | 2m12.0s | 101.49 | 1.50x bruto | nao |
 | Qwen3.6 27B UD Q4_K_XL | baseline | 0/1 | 0/1 | 1 | 7m00.5s | 20.93 | 1.00x | nao |
 | Qwen3.6 27B UD Q4_K_XL | DFlash/DDTree/spec-prefill/guard | 0/1 | 0/1 | 1 | 7m00.2s | 22.16 | 1.00x | nao |
 | Qwen3.6 27B UD Q4_K_XL | no-thinking/guard/pin | 0/1 | 0/1 | 1 | 4m40.3s | 21.51 | 1.50x bruto | nao |
@@ -124,6 +126,8 @@ Evidencia: `/tmp/rapid-mlx-bench2/qwen36_27b_optimized_rest.result.json`. Gerou 
 - 27B no-thinking max 2048: `/tmp/rapid-mlx-bench2/qwen36_27b_no_thinking_guard_max2048_rest.result.json`.
 - 27B MTP: `/tmp/rapid-mlx-bench2/qwen36_27b_mtp_guard_rest.result.json`.
 - 27B DFlash + appended pi system prompt: `/tmp/rapid-mlx-bench2/qwen36_27b_dflash_agent_prompt_rest.result.json`.
+- 35B DFlash budget2/adaptive: `/tmp/rapid-mlx-bench2/qwen36_35b_dflash_budget2_adaptive_rest.result.json`.
+- 35B DFlash + appended pi system prompt: `/tmp/rapid-mlx-bench2/qwen36_35b_dflash_agent_prompt_rest.result.json`.
 
 ## Proximo caminho
 

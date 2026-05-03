@@ -24,12 +24,18 @@ Conclusao atual: nenhum perfil novo atingiu a meta critica com qualidade valida.
 | Qwen3.6 35B A3B 4bit | target-only/no-thinking/guard | 0/1 | 0/1 | abortado manualmente depois de >270s | >4m30s | n/a | <0.73x | nao |
 | Qwen3.6 35B A3B 4bit | DFlash budget2/adaptive/spec-prefill/guard | 0/1 | 0/1 | 1 | 2m12.1s | 99.93 | 1.50x bruto | nao |
 | Qwen3.6 35B A3B 4bit | DFlash validado + appended pi system prompt | 0/1 | 0/1 | 1 | 2m12.0s | 101.49 | 1.50x bruto | nao |
+| Qwen3.6 35B A3B 4bit | DFlash warm-cache 2 runs | 1/2 | 0/2 | 1 | 10m00.1s / 7m35.2s | 94.46 / 95.90 | 0.44x bruto no melhor run | nao |
+| Qwen3.6 35B A3B 4bit | target no-thinking + restricted tools + strict system | 0/1 | 0/1 | 1 | 2m12.5s | 111.96 | 1.50x bruto | nao |
 | Qwen3.6 27B UD Q4_K_XL | baseline | 0/1 | 0/1 | 1 | 7m00.5s | 20.93 | 1.00x | nao |
 | Qwen3.6 27B UD Q4_K_XL | DFlash/DDTree/spec-prefill/guard | 0/1 | 0/1 | 1 | 7m00.2s | 22.16 | 1.00x | nao |
 | Qwen3.6 27B UD Q4_K_XL | no-thinking/guard/pin | 0/1 | 0/1 | 1 | 4m40.3s | 21.51 | 1.50x bruto | nao |
 | Qwen3.6 27B UD Q4_K_XL | no-thinking/guard/pin/max_tokens=2048 | 0/1 | 0/1 | 1 | 5m00.3s | 20.69 | 1.40x bruto | nao |
 | Qwen3.6 27B UD Q4_K_XL | MTP optimistic/guard/pin | 0/1 | 0/1 | 1 | 4m40.1s | 1.17 | 1.50x bruto | nao |
 | Qwen3.6 27B UD Q4_K_XL | DFlash + appended pi system prompt | 0/1 | 0/1 | 1 | 4m40.5s | 1.23 | 1.50x bruto | nao |
+| Qwen3.6 27B UD Q4_K_XL | no-thinking + strict appended system | 0/1 | 0/1 | 1 | 4m40.1s | 21.34 | 1.50x bruto | nao |
+| Qwen3.6 27B UD Q4_K_XL | no-thinking + restricted tools + strict system | 0/1 | 0/1 | 1 | 4m40.3s | 22.53 | 1.50x bruto | nao |
+| Qwen3.6 27B UD Q4_K_XL | no-thinking + custom system prompt | 0/1 | 0/1 | 1 | 4m40.3s | 22.45 | 1.50x bruto | nao |
+| Qwen3.6 27B UD Q4_K_XL | structured-cot budget 256 + custom system | 0/1 | 0/1 | 1 | 4m40.2s | 22.80 | 1.50x bruto | nao |
 
 ## Melhor config 35B encontrada
 
@@ -115,6 +121,8 @@ Evidencia: `/tmp/rapid-mlx-bench2/qwen36_27b_optimized_rest.result.json`. Gerou 
 - 27B baseline gerou estrutura melhor que no-thinking, mas nao criou unit tests/scripts e deu timeout.
 - 27B DFlash gerou arquivos de teste, mas `package.json` nao tinha scripts. `bun test` falhou por import invalido `Allow` em `sequelize-typescript`; `tsc --noEmit` falhou por tipos de `Sequelize`, seeders e services.
 - 27B no-thinking reduziu tempo bruto, mas simplificou demais: nao criou migrations/seeders completas nem testes.
+- 27B restricted/custom-system criou scripts `test` e `build`, mas ainda falhou validacao por uso incorreto de Bun mock API, import proibido `Allow`, ou testes sem inicializar Sequelize.
+- 35B restricted/custom-system nao criou `package.json` antes do gate de 132s; a tentativa warm-cache terminou um segundo run, mas sem validacao.
 - 27B MTP optimistic ficou muito mais lento no decode observado. O sidecar existe em `mtp-sidecar/model-mtp.safetensors`, mas o loader espera `model-mtp.safetensors` no root; symlink temporario foi criado para teste e removido depois.
 
 ## Artefatos
@@ -128,6 +136,12 @@ Evidencia: `/tmp/rapid-mlx-bench2/qwen36_27b_optimized_rest.result.json`. Gerou 
 - 27B DFlash + appended pi system prompt: `/tmp/rapid-mlx-bench2/qwen36_27b_dflash_agent_prompt_rest.result.json`.
 - 35B DFlash budget2/adaptive: `/tmp/rapid-mlx-bench2/qwen36_35b_dflash_budget2_adaptive_rest.result.json`.
 - 35B DFlash + appended pi system prompt: `/tmp/rapid-mlx-bench2/qwen36_35b_dflash_agent_prompt_rest.result.json`.
+- 35B DFlash warm-cache: `/tmp/rapid-mlx-bench2/qwen36_35b_optimized_warm_cache_rest.result.json`.
+- 35B no-thinking restricted strict: `/tmp/rapid-mlx-bench2/qwen36_35b_no_thinking_restricted_strict_rest.result.json`.
+- 27B no-thinking strict system: `/tmp/rapid-mlx-bench2/qwen36_27b_no_thinking_strict_system_rest.result.json`.
+- 27B no-thinking restricted strict: `/tmp/rapid-mlx-bench2/qwen36_27b_no_thinking_restricted_strict_rest.result.json`.
+- 27B no-thinking custom system: `/tmp/rapid-mlx-bench2/qwen36_27b_no_thinking_custom_system_rest.result.json`.
+- 27B structured budget256 custom system: `/tmp/rapid-mlx-bench2/qwen36_27b_structured_budget256_custom_system_rest.result.json`.
 
 ## Proximo caminho
 

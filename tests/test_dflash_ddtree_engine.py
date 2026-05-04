@@ -371,6 +371,45 @@ def test_agentic_auto_ngram_only_for_long_text_phase(monkeypatch):
     ) is False
 
 
+def test_agentic_auto_targets_outside_ddtree_sweet_spot(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS", "4")
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_MAX_TOKENS", "1024")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four five",
+        tools_requested=True,
+        max_tokens=1024,
+        greedy_request=True,
+        phase="long_text_or_code",
+        cached_tokens=4,
+    )
+
+    assert mode == "target-fallback"
+    assert reason == "prompt_outside_ddtree_sweet_spot"
+    assert metadata["ddtree_prompt_limit"] == 4
+
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS", "16")
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four five",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="long_text_or_code",
+        cached_tokens=0,
+    )
+
+    assert mode == "target-fallback"
+    assert reason == "max_tokens_outside_ddtree_sweet_spot"
+    assert metadata["ddtree_max_tokens_limit"] == 1024
+
+
 @pytest.mark.asyncio
 async def test_dflash_target_fallback_closes_generator_on_worker(monkeypatch):
     import mlx_lm

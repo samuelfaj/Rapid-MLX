@@ -630,6 +630,12 @@ class DFlashEngine(BatchedEngine):
         if phase in {"repair", "validation", "finalization", "tool_json"}:
             return "target-fallback", f"phase_{phase}", metadata
         prefill_limit = int(os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000"))
+        ddtree_prompt_limit = int(
+            os.environ.get("DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS", "16384")
+        )
+        ddtree_max_tokens_limit = int(
+            os.environ.get("DFLASH_AGENTIC_DDTREE_MAX_TOKENS", "1024")
+        )
         prefill_too_large = remaining_prefill_tokens > prefill_limit
         if self._agentic_policy_cooldown > 0:
             self._agentic_policy_cooldown -= 1
@@ -643,6 +649,12 @@ class DFlashEngine(BatchedEngine):
             )
             metadata["cooldown"] = self._agentic_policy_cooldown
             return "target-fallback", "low_acceptance", metadata
+        if prompt_tokens > ddtree_prompt_limit:
+            metadata["ddtree_prompt_limit"] = ddtree_prompt_limit
+            return "target-fallback", "prompt_outside_ddtree_sweet_spot", metadata
+        if max_tokens > ddtree_max_tokens_limit:
+            metadata["ddtree_max_tokens_limit"] = ddtree_max_tokens_limit
+            return "target-fallback", "max_tokens_outside_ddtree_sweet_spot", metadata
         if (
             max_tokens > 512
             and greedy_request

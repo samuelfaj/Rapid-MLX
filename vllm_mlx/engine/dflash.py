@@ -652,7 +652,12 @@ class DFlashEngine(BatchedEngine):
         if prompt_tokens > ddtree_prompt_limit:
             metadata["ddtree_prompt_limit"] = ddtree_prompt_limit
             return "target-fallback", "prompt_outside_ddtree_sweet_spot", metadata
-        if max_tokens > ddtree_max_tokens_limit:
+        metadata["ddtree_max_tokens_limit"] = ddtree_max_tokens_limit
+        metadata["max_tokens_over_ddtree_limit"] = max_tokens > ddtree_max_tokens_limit
+        if max_tokens > ddtree_max_tokens_limit and _env_bool(
+            "DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS",
+            False,
+        ):
             metadata["ddtree_max_tokens_limit"] = ddtree_max_tokens_limit
             return "target-fallback", "max_tokens_outside_ddtree_sweet_spot", metadata
         if (

@@ -405,6 +405,20 @@ def test_agentic_auto_targets_outside_ddtree_sweet_spot(monkeypatch):
         cached_tokens=0,
     )
 
+    assert mode == "ddtree-ngram"
+    assert reason == "long_generation_ngram"
+    assert metadata["max_tokens_over_ddtree_limit"] is True
+
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS", "1")
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four five",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="long_text_or_code",
+        cached_tokens=0,
+    )
+
     assert mode == "target-fallback"
     assert reason == "max_tokens_outside_ddtree_sweet_spot"
     assert metadata["ddtree_max_tokens_limit"] == 1024

@@ -25,6 +25,7 @@ mkdir -p "$RUN_DIR"
 cat > "$RUN_DIR/AGENTS.md" <<'EOF'
 Use the exact user request. Keep scope minimal but complete. Create User and Product vertical slices only. Use express, bun, typescript, sequelize-typescript. Create models, migrations, seeders, services, controllers, routes, app/server. Use bun test only; do not use jest, bun-jest, or reassign imported bindings. Unit tests should test services with simple in-memory fakes or pure repository injection. Add package scripts: test, build, start. Run bun install and bun test. Stop after tests pass or after one clear failing test report.
 When using Bun test hooks, import them explicitly from bun:test, for example `import { describe, it, expect, beforeEach } from "bun:test"`. Do not keep working after tests pass.
+Do not use the task tool or delegate to subagents; create and edit files directly in this workspace.
 EOF
 
 (

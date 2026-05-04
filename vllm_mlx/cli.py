@@ -422,6 +422,9 @@ def serve_command(args):
             structured_cot=getattr(args, "structured_cot", False),
             structured_cot_tools=getattr(args, "structured_cot_tools", False),
             agentic_guard=getattr(args, "agentic_guard", False),
+            agentic_speculative_policy=getattr(
+                args, "agentic_speculative_policy", "off"
+            ),
             structured_cot_token_budget=getattr(
                 args, "structured_cot_token_budget", 256
             ),
@@ -1427,6 +1430,15 @@ Examples:
         action="store_true",
         default=False,
         help="Enable benchmark-specific agentic repair guard for tool workflows.",
+    )
+    serve_parser.add_argument(
+        "--agentic-speculative-policy",
+        choices=["off", "auto"],
+        default="off",
+        help=(
+            "Automatically gate DFlash/DDTree/n-gram and speculative prefill "
+            "for tool-heavy agentic workflows."
+        ),
     )
     serve_parser.add_argument(
         "--structured-cot-token-budget",

@@ -192,6 +192,7 @@ _no_thinking: bool = (
 _structured_cot: bool = False
 _structured_cot_tools: bool = False
 _agentic_guard: bool = False
+_agentic_speculative_policy: str = "off"
 _structured_cot_token_budget: int = 256
 _speculative_prefill: bool = False
 _speculative_prefill_draft_model: str | None = None
@@ -478,6 +479,7 @@ def load_model(
     structured_cot: bool = False,
     structured_cot_tools: bool = False,
     agentic_guard: bool = False,
+    agentic_speculative_policy: str = "off",
     structured_cot_token_budget: int = 256,
     speculative_prefill: bool = False,
     speculative_prefill_draft_model: str | None = None,
@@ -507,6 +509,7 @@ def load_model(
         _structured_cot, \
         _structured_cot_tools, \
         _agentic_guard, \
+        _agentic_speculative_policy, \
         _structured_cot_token_budget, \
         _speculative_prefill, \
         _speculative_prefill_draft_model, \
@@ -520,6 +523,7 @@ def load_model(
     _structured_cot = bool(structured_cot)
     _structured_cot_tools = bool(structured_cot_tools)
     _agentic_guard = bool(agentic_guard)
+    _agentic_speculative_policy = str(agentic_speculative_policy or "off")
     _structured_cot_token_budget = int(structured_cot_token_budget)
     _speculative_prefill = bool(speculative_prefill)
     _speculative_prefill_draft_model = speculative_prefill_draft_model
@@ -580,6 +584,7 @@ def load_model(
             thinking_ngram_num_draft_tokens=dflash_thinking_ngram_num_draft_tokens,
             thinking_ngram_size=dflash_thinking_ngram_size,
             thinking_ngram_min_matches=dflash_thinking_ngram_min_matches,
+            agentic_speculative_policy=_agentic_speculative_policy,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -738,6 +743,7 @@ def _sync_config() -> None:
     cfg.structured_cot = _structured_cot
     cfg.structured_cot_tools = _structured_cot_tools
     cfg.agentic_guard = _agentic_guard
+    cfg.agentic_speculative_policy = _agentic_speculative_policy
     cfg.structured_cot_token_budget = _structured_cot_token_budget
     cfg.speculative_prefill = _speculative_prefill
     cfg.speculative_prefill_draft_model = _speculative_prefill_draft_model
@@ -1148,6 +1154,7 @@ Examples:
         structured_cot=args.structured_cot,
         structured_cot_tools=args.structured_cot_tools,
         agentic_guard=args.agentic_guard,
+        agentic_speculative_policy=args.agentic_speculative_policy,
         structured_cot_token_budget=args.structured_cot_token_budget,
         speculative_prefill=args.speculative_prefill,
         speculative_prefill_draft_model=args.speculative_prefill_draft_model,

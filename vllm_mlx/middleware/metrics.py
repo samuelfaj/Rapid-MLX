@@ -105,6 +105,10 @@ class MetricsMiddleware:
         engine_accepted_tokens: int | None = None
         engine_proposed_tokens: int | None = None
         engine_speculative_steps: int | None = None
+        engine_cached_tokens: int | None = None
+        engine_agentic_phase: str | None = None
+        engine_agentic_policy_decision: str | None = None
+        engine_agentic_policy_reason: str | None = None
 
         def poll_engine_stats() -> None:
             """Snapshot engine's per-request tps/ttft/acceptance during the stream."""
@@ -115,6 +119,8 @@ class MetricsMiddleware:
             nonlocal engine_ngram_fallback_cycles, engine_ngram_tool_guard_cycles
             nonlocal engine_accepted_tokens, engine_proposed_tokens
             nonlocal engine_speculative_steps
+            nonlocal engine_cached_tokens, engine_agentic_phase
+            nonlocal engine_agentic_policy_decision, engine_agentic_policy_reason
             try:
                 from ..config import get_config
 
@@ -238,6 +244,21 @@ class MetricsMiddleware:
                             engine_speculative_steps = int(value)
                         except Exception:
                             pass
+                    value = r.get("cached_tokens")
+                    if value is not None:
+                        try:
+                            engine_cached_tokens = int(value)
+                        except Exception:
+                            pass
+                    value = r.get("agentic_phase")
+                    if value:
+                        engine_agentic_phase = str(value)
+                    value = r.get("agentic_policy_decision")
+                    if value:
+                        engine_agentic_policy_decision = str(value)
+                    value = r.get("agentic_policy_reason")
+                    if value:
+                        engine_agentic_policy_reason = str(value)
             except Exception:
                 pass
 
@@ -342,6 +363,22 @@ class MetricsMiddleware:
                             speculative_accepted_tokens=engine_accepted_tokens,
                             speculative_proposed_tokens=engine_proposed_tokens,
                             speculative_steps=engine_speculative_steps,
+                            cached_tokens=engine_cached_tokens,
+                            remaining_prefill_tokens=(
+                                max(
+                                    0,
+                                    int(last_prompt_tokens or 0)
+                                    - int(engine_cached_tokens or 0),
+                                )
+                                if last_prompt_tokens is not None
+                                and engine_cached_tokens is not None
+                                else None
+                            ),
+                            tool_call_expected=is_chat,
+                            tool_call_emitted=last_finish_reason == "tool_calls",
+                            agentic_phase=engine_agentic_phase,
+                            agentic_policy_decision=engine_agentic_policy_decision,
+                            agentic_policy_reason=engine_agentic_policy_reason,
                         )
             except Exception as exc:  # never let metrics break the response
                 logger.debug("metrics middleware error: %s", exc)

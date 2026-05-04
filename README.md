@@ -68,7 +68,9 @@ curl http://localhost:8010/v1/chat/completions \
 This is the fastest validated configuration for opencode-style agentic coding
 with tools and finalization. It keeps prefix caching enabled, uses segmented
 prefix cache and tool-result compaction from the server, and avoids forcing
-DFlash/DDTree on long tool workflows.
+DFlash/DDTree on long tool workflows. The automatic agentic policy can still
+use speculative paths when the phase is favorable, and falls back when tool
+history makes prefill the bottleneck.
 
 ```bash
 lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
@@ -77,6 +79,7 @@ lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
   --default-temperature 0 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder_xml \
+  --agentic-speculative-policy auto \
   --max-tokens 4096 \
   --timeout 300
 ```
@@ -101,9 +104,9 @@ Do not add `--no-thinking` for these benchmarks. It was intentionally not used.
 
 Validated result for the 35B opencode benchmark:
 
-- Baseline without prefix cache: 472.24s, opencode exit 0, `bun test` passed.
-- Best config above: 207.25s, opencode exit 0, `bun test` passed.
-- End-to-end wall-clock speedup: 2.28x.
+- Baseline without prefix cache: 458s, opencode exit 0, `bun test` passed.
+- Best config above: 121s, opencode exit 0, `bun test` passed.
+- End-to-end wall-clock speedup: 3.79x.
 
 ## DFlash Example For Decode-Heavy Runs
 

@@ -16,6 +16,7 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..agentic_policy import classify_agentic_phase
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
 from ..speculative.prefill import (
@@ -699,6 +700,13 @@ class BatchedEngine(BaseEngine):
             messages, tools_requested=bool(tools)
         )
         messages = self._maybe_compact_tool_results(messages)
+        from ..config.server_config import get_config
+
+        cfg = get_config()
+        if cfg.agentic_speculative_policy == "auto" and tools:
+            kwargs["agentic_speculative_policy"] = "auto"
+            kwargs["agentic_phase"] = classify_agentic_phase(messages, True)
+            kwargs["tool_call_expected"] = True
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -923,6 +931,13 @@ class BatchedEngine(BaseEngine):
             messages, tools_requested=bool(tools)
         )
         messages = self._maybe_compact_tool_results(messages)
+        from ..config.server_config import get_config
+
+        cfg = get_config()
+        if cfg.agentic_speculative_policy == "auto" and tools:
+            kwargs["agentic_speculative_policy"] = "auto"
+            kwargs["agentic_phase"] = classify_agentic_phase(messages, True)
+            kwargs["tool_call_expected"] = True
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None

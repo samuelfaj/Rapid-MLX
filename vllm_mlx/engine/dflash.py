@@ -22,6 +22,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -93,6 +94,9 @@ class _ActiveRequest:
     ngram_tool_guard_cycles: int = 0
     cache_hit_type: str | None = None
     cached_tokens: int = 0
+    agentic_phase: str | None = None
+    agentic_policy_decision: str | None = None
+    agentic_policy_reason: str | None = None
     phase_timings_us: dict[str, float] = field(default_factory=dict)
 
 
@@ -225,6 +229,7 @@ class DFlashEngine(BatchedEngine):
         thinking_ngram_num_draft_tokens: int | None = None,
         thinking_ngram_size: int | None = None,
         thinking_ngram_min_matches: int | None = None,
+        agentic_speculative_policy: str = "off",
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         trust_remote_code: bool = True,
@@ -285,6 +290,12 @@ class DFlashEngine(BatchedEngine):
         self._thinking_ngram_enabled = (
             self._thinking_ngram_num_draft_tokens is not None
         )
+        self._agentic_speculative_policy = str(
+            agentic_speculative_policy or "off"
+        )
+        self._agentic_policy_history: deque[dict[str, Any]] = deque(maxlen=8)
+        self._agentic_policy_cooldown = 0
+        self._last_agentic_policy: dict[str, Any] = {}
 
         self._lock = asyncio.Lock()
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -507,6 +518,71 @@ class DFlashEngine(BatchedEngine):
             int(os.environ.get("DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS", "4096")),
         )
         return self._prompt_token_count(prompt) >= threshold
+
+    def _recent_agentic_acceptance(self) -> float | None:
+        ratios = [
+            float(item["acceptance_ratio"])
+            for item in self._agentic_policy_history
+            if item.get("proposed_tokens", 0) > 0
+            and item.get("acceptance_ratio") is not None
+        ]
+        if not ratios:
+            return None
+        return sum(ratios[-3:]) / len(ratios[-3:])
+
+    def _agentic_policy_decision(
+        self,
+        prompt: str,
+        *,
+        tools_requested: bool,
+        max_tokens: int,
+        greedy_request: bool,
+        phase: str | None,
+    ) -> tuple[str | None, str, dict[str, Any]]:
+        """Return forced mode for auto policy, or None for existing DFlash logic."""
+
+        policy = self._agentic_speculative_policy
+        if policy != "auto" or not tools_requested:
+            return None, "policy_off_or_no_tools", {}
+
+        prompt_tokens = self._prompt_token_count(prompt)
+        recent_acceptance = self._recent_agentic_acceptance()
+        phase = phase or "tool_json"
+        metadata: dict[str, Any] = {
+            "policy": policy,
+            "phase": phase,
+            "prompt_tokens": prompt_tokens,
+            "remaining_prefill_tokens": prompt_tokens,
+            "recent_acceptance": recent_acceptance,
+            "cooldown": self._agentic_policy_cooldown,
+        }
+
+        if phase in {"repair", "validation", "finalization", "tool_json"}:
+            return "target-fallback", f"phase_{phase}", metadata
+        if prompt_tokens > int(os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000")):
+            return "target-fallback", "prefill_too_large", metadata
+        if self._agentic_policy_cooldown > 0:
+            self._agentic_policy_cooldown -= 1
+            metadata["cooldown"] = self._agentic_policy_cooldown
+            return "target-fallback", "cooldown", metadata
+        if recent_acceptance is not None and recent_acceptance < float(
+            os.environ.get("DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE", "0.35")
+        ):
+            self._agentic_policy_cooldown = int(
+                os.environ.get("DFLASH_AGENTIC_POLICY_COOLDOWN", "3")
+            )
+            metadata["cooldown"] = self._agentic_policy_cooldown
+            return "target-fallback", "low_acceptance", metadata
+        if (
+            max_tokens > 512
+            and greedy_request
+            and self._ddtree_budget > 0
+            and phase in {"initial_scaffold", "long_text_or_code"}
+        ):
+            if self._should_enable_ngram_first(prompt) or self._thinking_ngram_enabled:
+                return "ddtree-ngram", "long_generation_ngram", metadata
+            return "ddtree", "long_generation_ddtree", metadata
+        return "target-fallback", "short_or_non_greedy", metadata
 
     async def _stream_target(
         self,
@@ -941,13 +1017,36 @@ class DFlashEngine(BatchedEngine):
                 async with self._lock:
                     tools_requested = bool(kwargs.pop("tools_requested", False))
                     prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                    agentic_phase = kwargs.pop("agentic_phase", None)
+                    kwargs.pop("agentic_speculative_policy", None)
+                    kwargs.pop("tool_call_expected", None)
                     logits_processor_factories = kwargs.pop(
                         "logits_processor_factories", None
                     )
-                    if self._should_use_agentic_target_fallback(
-                        prompt, tools_requested
+                    forced_mode, policy_reason, policy_metadata = (
+                        self._agentic_policy_decision(
+                            prompt,
+                            tools_requested=tools_requested,
+                            max_tokens=max_tokens,
+                            greedy_request=greedy_request,
+                            phase=agentic_phase,
+                        )
+                    )
+                    self._last_agentic_policy = policy_metadata | {
+                        "decision": forced_mode,
+                        "reason": policy_reason,
+                    }
+                    if forced_mode == "target-fallback" or (
+                        forced_mode is None
+                        and self._should_use_agentic_target_fallback(
+                            prompt, tools_requested
+                        )
                     ):
                         self._track_request_start("target-fallback")
+                        if self._active is not None:
+                            self._active.agentic_phase = agentic_phase
+                            self._active.agentic_policy_decision = "target-fallback"
+                            self._active.agentic_policy_reason = policy_reason
                         try:
                             last_resp = None
                             text_parts: list[str] = []
@@ -980,13 +1079,17 @@ class DFlashEngine(BatchedEngine):
                             )
                         finally:
                             self._track_request_end()
-                    mode = (
+                    mode = forced_mode or (
                         "ddtree-ngram"
                         if self._should_enable_ngram_first(prompt)
                         or self._thinking_ngram_enabled
                         else "ddtree"
                     )
                     self._track_request_start(mode)
+                    if self._active is not None:
+                        self._active.agentic_phase = agentic_phase
+                        self._active.agentic_policy_decision = mode
+                        self._active.agentic_policy_reason = policy_reason
                     try:
                         loop = asyncio.get_running_loop()
                         executor = self._executor
@@ -1110,12 +1213,31 @@ class DFlashEngine(BatchedEngine):
             async with self._lock:
                 tools_requested = bool(kwargs.pop("tools_requested", False))
                 prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                agentic_phase = kwargs.pop("agentic_phase", None)
+                kwargs.pop("agentic_speculative_policy", None)
+                kwargs.pop("tool_call_expected", None)
                 logits_processor_factories = kwargs.pop(
                     "logits_processor_factories", None
                 )
                 greedy_request = temperature in (0, 0.0)
-                use_target_fallback = self._should_use_agentic_target_fallback(
-                    prompt, tools_requested
+                forced_mode, policy_reason, policy_metadata = (
+                    self._agentic_policy_decision(
+                        prompt,
+                        tools_requested=tools_requested,
+                        max_tokens=max_tokens,
+                        greedy_request=greedy_request,
+                        phase=agentic_phase,
+                    )
+                )
+                self._last_agentic_policy = policy_metadata | {
+                    "decision": forced_mode,
+                    "reason": policy_reason,
+                }
+                use_target_fallback = forced_mode == "target-fallback" or (
+                    forced_mode is None
+                    and self._should_use_agentic_target_fallback(
+                        prompt, tools_requested
+                    )
                 )
                 if self._ddtree_budget > 0 and not greedy_request:
                     logger.warning(
@@ -1126,7 +1248,7 @@ class DFlashEngine(BatchedEngine):
                 if use_target_fallback:
                     mode = "target-fallback"
                 else:
-                    mode = (
+                    mode = forced_mode or (
                         "ddtree-ngram"
                         if (
                             (
@@ -1148,6 +1270,20 @@ class DFlashEngine(BatchedEngine):
                         "--default-temperature 0, or disable --structured-cot."
                     )
                 self._track_request_start(mode)
+                if self._active is not None:
+                    self._active.agentic_phase = agentic_phase
+                    self._active.agentic_policy_decision = mode
+                    self._active.agentic_policy_reason = policy_reason
+                    logger.info(
+                        "[agentic-speculative-policy] phase=%s mode=%s reason=%s "
+                        "prompt_tokens=%s acceptance=%s cooldown=%s",
+                        agentic_phase,
+                        mode,
+                        policy_reason,
+                        policy_metadata.get("prompt_tokens"),
+                        policy_metadata.get("recent_acceptance"),
+                        policy_metadata.get("cooldown"),
+                    )
                 cumulative = ""
                 last_resp = None
                 try:
@@ -1229,6 +1365,20 @@ class DFlashEngine(BatchedEngine):
             self._lifetime_accepted += self._active.accepted_tokens
             if self._active.mode in ("ddtree", "ddtree-ngram"):
                 self._ddtree_responses += 1
+            if self._active.agentic_policy_decision:
+                self._agentic_policy_history.append(
+                    {
+                        "mode": self._active.mode,
+                        "phase": self._active.agentic_phase,
+                        "decision": self._active.agentic_policy_decision,
+                        "reason": self._active.agentic_policy_reason,
+                        "acceptance_ratio": self._active.acceptance_ratio,
+                        "proposed_tokens": self._active.proposed_tokens,
+                        "accepted_tokens": self._active.accepted_tokens,
+                        "generated_tokens": self._active.generated_tokens,
+                        "prompt_tokens": self._active.prompt_tokens,
+                    }
+                )
         self._active = None
 
     def _update_active(self, resp: Any, new_text: str = "") -> None:
@@ -1331,6 +1481,9 @@ class DFlashEngine(BatchedEngine):
                     "ngram_tool_guard_cycles": self._active.ngram_tool_guard_cycles,
                     "cache_hit_type": self._active.cache_hit_type,
                     "cached_tokens": self._active.cached_tokens,
+                    "agentic_phase": self._active.agentic_phase,
+                    "agentic_policy_decision": self._active.agentic_policy_decision,
+                    "agentic_policy_reason": self._active.agentic_policy_reason,
                     "phase_timings_us": self._active.phase_timings_us,
                     "progress": 0.0,
                 }
@@ -1423,6 +1576,10 @@ class DFlashEngine(BatchedEngine):
                 "agentic_target_fallback_enabled": _env_bool(
                     "DFLASH_AGENTIC_TARGET_FALLBACK", True
                 ),
+                "agentic_speculative_policy": self._agentic_speculative_policy,
+                "agentic_policy_cooldown": self._agentic_policy_cooldown,
+                "agentic_policy_last": self._last_agentic_policy,
+                "agentic_policy_history": list(self._agentic_policy_history),
                 "agentic_target_fallback_min_prompt_tokens": int(
                     os.environ.get(
                         "DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS",

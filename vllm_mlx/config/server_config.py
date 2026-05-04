@@ -68,6 +68,7 @@ class ServerConfig:
     structured_cot: bool = False
     structured_cot_tools: bool = False
     agentic_guard: bool = False
+    agentic_speculative_policy: str = "off"
     structured_cot_token_budget: int = 256
     speculative_prefill: bool = False
     speculative_prefill_draft_model: str | None = None

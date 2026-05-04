@@ -86,9 +86,11 @@ class _ActiveRequest:
     prefill_seconds: float = 0.0
     generated_tokens: int = 0
     generation_tps: float = 0.0
+    effective_tps: float = 0.0
     proposed_tokens: int = 0
     accepted_tokens: int = 0
     speculative_steps: int = 0
+    acceptance_length: float = 0.0
     acceptance_ratio: float = 0.0
     block_size: int = 0
     block_history: list[int] = field(default_factory=list)
@@ -97,6 +99,8 @@ class _ActiveRequest:
     ddtree_fast_path_ratio: float = 0.0
     ngram_acceptance_ratio: float = 0.0
     ngram_cycles: int = 0
+    ngram_proposed_tokens: int = 0
+    ngram_accepted_tokens: int = 0
     ngram_fallback_cycles: int = 0
     ngram_tool_guard_cycles: int = 0
     cache_hit_type: str | None = None
@@ -104,6 +108,7 @@ class _ActiveRequest:
     agentic_phase: str | None = None
     agentic_policy_decision: str | None = None
     agentic_policy_reason: str | None = None
+    agentic_policy_bucket: str | None = None
     phase_timings_us: dict[str, float] = field(default_factory=dict)
 
 
@@ -317,8 +322,9 @@ class DFlashEngine(BatchedEngine):
         self._agentic_speculative_policy = str(
             agentic_speculative_policy or "off"
         )
-        self._agentic_policy_history: deque[dict[str, Any]] = deque(maxlen=8)
+        self._agentic_policy_history: deque[dict[str, Any]] = deque(maxlen=64)
         self._agentic_policy_cooldown = 0
+        self._agentic_policy_bucket_cooldowns: dict[tuple[str, str], int] = {}
         self._last_agentic_policy: dict[str, Any] = {}
 
         self._lock = asyncio.Lock()
@@ -595,16 +601,162 @@ class DFlashEngine(BatchedEngine):
 
     def _recent_agentic_target_tps(self) -> tuple[float | None, int]:
         values = [
-            float(item["generation_tps"])
+            float(item.get("effective_tps") or item.get("generation_tps") or 0.0)
             for item in self._agentic_policy_history
             if item.get("mode") in {"target-fallback", "target-prefix-cache"}
-            and float(item.get("generation_tps") or 0.0) > 0
+            and float(item.get("effective_tps") or item.get("generation_tps") or 0.0)
+            > 0
             and int(item.get("generated_tokens") or 0) >= 32
         ]
         if not values:
             return None, 0
         recent = values[-4:]
         return sum(recent) / len(recent), len(values)
+
+    @staticmethod
+    def _agentic_prompt_bucket(prompt_tokens: int) -> str:
+        if prompt_tokens <= 4096:
+            return "0-4k"
+        if prompt_tokens <= 8192:
+            return "4-8k"
+        if prompt_tokens <= 16384:
+            return "8-16k"
+        if prompt_tokens <= 32768:
+            return "16-32k"
+        return "32k+"
+
+    @staticmethod
+    def _agentic_max_tokens_bucket(max_tokens: int) -> str:
+        if max_tokens <= 256:
+            return "0-256"
+        if max_tokens <= 512:
+            return "257-512"
+        if max_tokens <= 1024:
+            return "513-1024"
+        return "1025+"
+
+    def _agentic_policy_bucket(
+        self,
+        phase: str,
+        prompt_tokens: int,
+        max_tokens: int,
+        greedy_request: bool,
+    ) -> str:
+        sampler = "greedy" if greedy_request else "sampled"
+        return "|".join(
+            (
+                phase,
+                self._agentic_prompt_bucket(prompt_tokens),
+                self._agentic_max_tokens_bucket(max_tokens),
+                sampler,
+            )
+        )
+
+    def _parse_agentic_budget_candidates(self) -> list[int]:
+        raw = os.environ.get("DFLASH_AGENTIC_DDTREE_BUDGET_CANDIDATES")
+        fallback = [self._ddtree_budget] if self._ddtree_budget > 0 else []
+        if raw is None:
+            return fallback
+        values: list[int] = []
+        for part in raw.split(","):
+            try:
+                value = int(part.strip())
+            except ValueError:
+                continue
+            if value > 0 and value not in values:
+                values.append(value)
+        return values or fallback
+
+    def _agentic_bucket_history(
+        self,
+        bucket: str,
+        *,
+        path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            item
+            for item in self._agentic_policy_history
+            if item.get("bucket") == bucket
+            and (path is None or item.get("mode") == path)
+            and int(item.get("generated_tokens") or 0) > 0
+        ]
+        return rows
+
+    @staticmethod
+    def _agentic_path_score(rows: list[dict[str, Any]]) -> dict[str, float]:
+        if not rows:
+            return {"samples": 0.0}
+        recent = rows[-4:]
+        effective = [
+            float(item.get("effective_tps") or 0.0)
+            for item in recent
+            if float(item.get("effective_tps") or 0.0) > 0
+        ]
+        al = [
+            float(item.get("acceptance_length") or 0.0)
+            for item in recent
+            if float(item.get("acceptance_length") or 0.0) > 0
+        ]
+        ngram_ratio = [
+            float(item.get("ngram_acceptance_ratio") or 0.0)
+            for item in recent
+            if int(item.get("ngram_cycles") or 0) > 0
+        ]
+        return {
+            "samples": float(len(rows)),
+            "effective_tps": sum(effective) / len(effective) if effective else 0.0,
+            "acceptance_length": sum(al) / len(al) if al else 0.0,
+            "ngram_acceptance_ratio": (
+                sum(ngram_ratio) / len(ngram_ratio) if ngram_ratio else -1.0
+            ),
+        }
+
+    def _agentic_bucket_cooldown_remaining(self, bucket: str, path: str) -> int:
+        key = (bucket, path)
+        remaining = self._agentic_policy_bucket_cooldowns.get(key, 0)
+        if remaining <= 0:
+            self._agentic_policy_bucket_cooldowns.pop(key, None)
+            return 0
+        self._agentic_policy_bucket_cooldowns[key] = remaining - 1
+        return remaining
+
+    def _agentic_set_bucket_cooldown(self, bucket: str, path: str, value: int) -> None:
+        if value > 0:
+            self._agentic_policy_bucket_cooldowns[(bucket, path)] = value
+
+    def _agentic_best_budget(self, bucket: str, default_budget: int) -> int:
+        candidates = self._parse_agentic_budget_candidates()
+        if not candidates:
+            return default_budget
+        if not _env_bool("DFLASH_AGENTIC_DDTREE_BUDGET_EXPLORE", True):
+            return default_budget
+        best_budget = default_budget if default_budget in candidates else candidates[0]
+        best_score = 0.0
+        for budget in candidates:
+            rows = [
+                item
+                for item in self._agentic_bucket_history(bucket)
+                if item.get("mode") in {"ddtree", "ddtree-ngram"}
+                and int(item.get("tree_budget") or 0) == budget
+            ]
+            score = self._agentic_path_score(rows)
+            effective = score.get("effective_tps", 0.0)
+            al = score.get("acceptance_length", 0.0)
+            if score.get("samples", 0.0) >= 1 and al >= float(
+                os.environ.get("DFLASH_AGENTIC_DDTREE_AL_ENABLE", "4.0")
+            ):
+                candidate_score = effective * max(1.0, al)
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_budget = budget
+        if best_score > 0:
+            return best_budget
+        explore_every = max(
+            1,
+            int(os.environ.get("DFLASH_AGENTIC_POLICY_EXPLORE_EVERY", "8")),
+        )
+        index = (self._lifetime_responses // explore_every) % len(candidates)
+        return candidates[index]
 
     def _agentic_policy_decision(
         self,
@@ -628,19 +780,64 @@ class DFlashEngine(BatchedEngine):
         recent_acceptance = self._recent_agentic_acceptance()
         recent_target_tps, target_tps_samples = self._recent_agentic_target_tps()
         phase = phase or "tool_json"
+        prompt_bucket = self._agentic_prompt_bucket(prompt_tokens)
+        max_tokens_bucket = self._agentic_max_tokens_bucket(max_tokens)
+        bucket = self._agentic_policy_bucket(
+            phase,
+            prompt_tokens,
+            max_tokens,
+            greedy_request,
+        )
+        target_score = self._agentic_path_score(
+            self._agentic_bucket_history(bucket, path="target-prefix-cache")
+            + self._agentic_bucket_history(bucket, path="target-fallback")
+        )
+        ddtree_score = self._agentic_path_score(
+            self._agentic_bucket_history(bucket, path="ddtree")
+        )
+        ddtree_ngram_score = self._agentic_path_score(
+            self._agentic_bucket_history(bucket, path="ddtree-ngram")
+        )
+        ddtree_recent_al = max(
+            ddtree_score.get("acceptance_length", 0.0),
+            ddtree_ngram_score.get("acceptance_length", 0.0),
+        )
+        ddtree_recent_effective_tps = max(
+            ddtree_score.get("effective_tps", 0.0),
+            ddtree_ngram_score.get("effective_tps", 0.0),
+        )
+        ddtree_bucket_cooldown = self._agentic_bucket_cooldown_remaining(
+            bucket,
+            "ddtree",
+        )
+        ngram_bucket_cooldown = self._agentic_bucket_cooldown_remaining(
+            bucket,
+            "ddtree-ngram",
+        )
         metadata: dict[str, Any] = {
             "policy": policy,
             "phase": phase,
+            "selected_path": None,
+            "prompt_bucket": prompt_bucket,
+            "max_tokens_bucket": max_tokens_bucket,
+            "bucket": bucket,
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
             "cache_hit_ratio": (
                 cached_tokens / prompt_tokens if prompt_tokens > 0 else 0.0
             ),
+            "uncached_tokens": remaining_prefill_tokens,
             "remaining_prefill_tokens": remaining_prefill_tokens,
             "recent_acceptance": recent_acceptance,
             "recent_target_tps": recent_target_tps,
+            "target_recent_effective_tps": target_score.get("effective_tps", 0.0),
+            "ddtree_recent_al": ddtree_recent_al,
+            "ddtree_recent_effective_tps": ddtree_recent_effective_tps,
+            "ddtree_score": ddtree_score,
+            "ddtree_ngram_score": ddtree_ngram_score,
             "target_tps_samples": target_tps_samples,
             "cooldown": self._agentic_policy_cooldown,
+            "bucket_cooldown": max(ddtree_bucket_cooldown, ngram_bucket_cooldown),
         }
 
         if phase in {"repair", "validation", "finalization", "tool_json"}:
@@ -665,6 +862,20 @@ class DFlashEngine(BatchedEngine):
             )
             metadata["cooldown"] = self._agentic_policy_cooldown
             return "target-fallback", "low_acceptance", metadata
+        al_disable = float(os.environ.get("DFLASH_AGENTIC_DDTREE_AL_DISABLE", "2.5"))
+        al_enable = float(os.environ.get("DFLASH_AGENTIC_DDTREE_AL_ENABLE", "4.0"))
+        al_strong = float(os.environ.get("DFLASH_AGENTIC_DDTREE_AL_STRONG", "6.0"))
+        metadata["ddtree_al_disable"] = al_disable
+        metadata["ddtree_al_enable"] = al_enable
+        metadata["ddtree_al_strong"] = al_strong
+        if ddtree_recent_al > 0 and ddtree_recent_al < al_disable:
+            cooldown = int(os.environ.get("DFLASH_AGENTIC_POLICY_COOLDOWN", "3"))
+            self._agentic_set_bucket_cooldown(bucket, "ddtree", cooldown)
+            self._agentic_set_bucket_cooldown(bucket, "ddtree-ngram", cooldown)
+            metadata["bucket_cooldown"] = cooldown
+            return "target-fallback", "low_acceptance_length", metadata
+        if ddtree_bucket_cooldown > 0:
+            return "target-fallback", "bucket_cooldown", metadata
         if prompt_tokens > ddtree_prompt_limit:
             metadata["ddtree_prompt_limit"] = ddtree_prompt_limit
             return "target-fallback", "prompt_outside_ddtree_sweet_spot", metadata
@@ -688,7 +899,34 @@ class DFlashEngine(BatchedEngine):
         )
         explore_every = max(
             0,
-            int(os.environ.get("DFLASH_AGENTIC_ADAPTIVE_EXPLORE_EVERY", "8")),
+            int(
+                os.environ.get(
+                    "DFLASH_AGENTIC_POLICY_EXPLORE_EVERY",
+                    os.environ.get("DFLASH_AGENTIC_ADAPTIVE_EXPLORE_EVERY", "8"),
+                )
+            ),
+        )
+        explore_min_output_tokens = max(
+            1,
+            int(os.environ.get("DFLASH_AGENTIC_POLICY_EXPLORE_MIN_OUTPUT_TOKENS", "64")),
+        )
+        target_winner_margin = float(
+            os.environ.get("DFLASH_AGENTIC_POLICY_WINNER_MARGIN", "1.10")
+        )
+        target_effective_tps = target_score.get("effective_tps", 0.0)
+        target_has_enough_samples = target_score.get("samples", 0.0) >= 2
+        ddtree_has_enough_samples = (
+            ddtree_score.get("samples", 0.0)
+            + ddtree_ngram_score.get("samples", 0.0)
+            >= 2
+        )
+        target_known_winner = (
+            target_has_enough_samples
+            and ddtree_has_enough_samples
+            and target_effective_tps > 0
+            and ddtree_recent_effective_tps > 0
+            and target_effective_tps >= ddtree_recent_effective_tps * target_winner_margin
+            and ddtree_recent_al < al_enable
         )
         adaptive_ready = (
             not adaptive_ddtree
@@ -702,11 +940,18 @@ class DFlashEngine(BatchedEngine):
                 explore_every > 0
                 and self._lifetime_responses > 0
                 and self._lifetime_responses % explore_every == 0
+                and max_tokens >= explore_min_output_tokens
             )
+            or ddtree_recent_al >= al_enable
         )
         metadata["adaptive_ddtree_ready"] = adaptive_ready
         metadata["adaptive_min_prompt_tokens"] = adaptive_min_prompt
         metadata["adaptive_target_tps_trigger"] = target_tps_trigger
+        metadata["explore_every"] = explore_every
+        metadata["explore_min_output_tokens"] = explore_min_output_tokens
+        metadata["target_known_winner"] = target_known_winner
+        if target_known_winner:
+            return "target-fallback", "bucket_target_winner", metadata
         if (
             adaptive_ddtree
             and phase in {"initial_scaffold", "long_text_or_code"}
@@ -719,9 +964,45 @@ class DFlashEngine(BatchedEngine):
             and self._ddtree_budget > 0
             and phase in {"initial_scaffold", "long_text_or_code"}
         ):
+            selected_budget = self._agentic_best_budget(bucket, self._ddtree_budget)
+            metadata["ddtree_budget"] = selected_budget
+            metadata["ddtree_budget_candidates"] = (
+                self._parse_agentic_budget_candidates()
+            )
+            ngram_min_acceptance = float(
+                os.environ.get("DFLASH_AGENTIC_NGRAM_MIN_ACCEPTANCE", "0.30")
+            )
+            ngram_acceptance = ddtree_ngram_score.get(
+                "ngram_acceptance_ratio",
+                -1.0,
+            )
+            ngram_allowed = (
+                ngram_bucket_cooldown <= 0
+                and (
+                    ngram_acceptance < 0
+                    or ngram_acceptance >= ngram_min_acceptance
+                )
+            )
             if (
-                self._should_enable_ngram_first(prompt, phase)
-                or self._thinking_ngram_enabled
+                ngram_acceptance >= 0
+                and ngram_acceptance < ngram_min_acceptance
+            ):
+                cooldown = int(os.environ.get("DFLASH_AGENTIC_NGRAM_COOLDOWN", "3"))
+                self._agentic_set_bucket_cooldown(
+                    bucket,
+                    "ddtree-ngram",
+                    cooldown,
+                )
+                metadata["bucket_cooldown"] = cooldown
+                ngram_allowed = False
+            metadata["ngram_min_acceptance"] = ngram_min_acceptance
+            metadata["ngram_allowed"] = ngram_allowed
+            if (
+                ngram_allowed
+                and (
+                    self._should_enable_ngram_first(prompt, phase)
+                    or self._thinking_ngram_enabled
+                )
             ):
                 reason = (
                     "long_prefill_suffix_speculative_prefill_ngram"
@@ -1329,14 +1610,21 @@ class DFlashEngine(BatchedEngine):
         emit_step_text: bool = False,
         logits_processors: list[Any] | None = None,
         agentic_phase: str | None = None,
+        selected_mode: str | None = None,
+        tree_budget: int | None = None,
     ) -> dict[str, Any]:
         from ..speculative.ddtree.engine import generate_ddtree, tokenize_prompt
 
         prompt_array = tokenize_prompt(self._tokenizer, prompt)
-        ngram_first_enabled = self._should_enable_ngram_first(
-            prompt,
-            agentic_phase,
+        ngram_first_enabled = (
+            selected_mode == "ddtree-ngram"
+            or (
+                selected_mode is None
+                and self._should_enable_ngram_first(prompt, agentic_phase)
+            )
+            or self._thinking_ngram_enabled
         )
+        effective_tree_budget = max(0, int(tree_budget or self._ddtree_budget))
         prompt_token_ids = []
         if self._ddtree_capture_cache:
             prompt_token_ids = (
@@ -1349,7 +1637,7 @@ class DFlashEngine(BatchedEngine):
             if self._ddtree_capture_cache
             else SimpleNamespace(state=None, hit_type=None, cached_tokens=0)
         )
-        logger.info(
+        logger.debug(
             "[DDTree] cache_fetch %s cached_tokens=%d prompt_tokens=%d",
             "HIT" if getattr(cache_fetch, "cached_tokens", 0) else "MISS",
             int(getattr(cache_fetch, "cached_tokens", 0) or 0),
@@ -1371,7 +1659,7 @@ class DFlashEngine(BatchedEngine):
             tokenizer=self._tokenizer,
             prompt_tokens=prompt_array,
             max_new_tokens=max_tokens,
-            tree_budget=self._ddtree_budget,
+            tree_budget=effective_tree_budget,
             block_size=self._effective_ddtree_block_size(),
             adaptive_block_size=self._adaptive_cfg,
             prefix_state=cache_fetch.state,
@@ -1406,6 +1694,7 @@ class DFlashEngine(BatchedEngine):
             on_step=on_step,
             emit_step_text=emit_step_text,
         )
+        result["tree_budget"] = effective_tree_budget
         self._store_ddtree_cache_result(result, prompt_token_ids, prefix_boundary)
         self._ddtree_last = {
             key: value
@@ -1433,6 +1722,8 @@ class DFlashEngine(BatchedEngine):
         prefix_boundary: int = 0,
         logits_processor_factories: list[Any] | None = None,
         agentic_phase: str | None = None,
+        selected_mode: str | None = None,
+        tree_budget: int | None = None,
     ):
         """Run the Rapid-MLX DDTree loop on the DFlash MLX worker thread."""
         if not _is_greedy_sampling(temperature, top_p):
@@ -1477,6 +1768,8 @@ class DFlashEngine(BatchedEngine):
                     emit_step_text=True,
                     logits_processors=logits_processors,
                     agentic_phase=agentic_phase,
+                    selected_mode=selected_mode,
+                    tree_budget=tree_budget,
                 )
                 loop.call_soon_threadsafe(queue.put_nowait, result)
             finally:
@@ -1530,10 +1823,19 @@ class DFlashEngine(BatchedEngine):
                         item.get("ddtree_fast_path_ratio") or 0.0
                     ),
                     tree_budget=int(item.get("tree_budget") or self._ddtree_budget),
+                    avg_acceptance_length=float(
+                        item.get("avg_acceptance_length") or 0.0
+                    ),
                     ngram_acceptance_ratio=float(
                         item.get("ngram_acceptance_ratio") or 0.0
                     ),
                     ngram_cycles=int(item.get("ngram_cycles_completed") or 0),
+                    ngram_proposed_tokens=int(
+                        item.get("ngram_proposed_tokens") or 0
+                    ),
+                    ngram_accepted_tokens=int(
+                        item.get("ngram_accepted_tokens") or 0
+                    ),
                     ngram_fallback_cycles=int(
                         item.get("ngram_fallback_cycles") or 0
                     ),
@@ -1647,6 +1949,7 @@ class DFlashEngine(BatchedEngine):
                                 else "target-fallback"
                             )
                             self._active.agentic_policy_reason = policy_reason
+                            self._active.agentic_policy_bucket = policy_metadata.get("bucket")
                         try:
                             last_resp = None
                             text_parts: list[str] = []
@@ -1698,11 +2001,24 @@ class DFlashEngine(BatchedEngine):
                         or self._thinking_ngram_enabled
                         else "ddtree"
                     )
+                    selected_tree_budget = int(
+                        policy_metadata.get("ddtree_budget") or self._ddtree_budget
+                    )
+                    self._last_agentic_policy = self._last_agentic_policy | {
+                        "selected_path": mode,
+                        "ddtree_budget": selected_tree_budget,
+                    }
                     self._track_request_start(mode)
                     if self._active is not None:
                         self._active.agentic_phase = agentic_phase
                         self._active.agentic_policy_decision = mode
                         self._active.agentic_policy_reason = policy_reason
+                        self._active.agentic_policy_bucket = policy_metadata.get("bucket")
+                        self._active.tree_budget = (
+                            selected_tree_budget
+                            if mode in ("ddtree", "ddtree-ngram")
+                            else 0
+                        )
                     try:
                         loop = asyncio.get_running_loop()
                         executor = self._executor
@@ -1722,6 +2038,8 @@ class DFlashEngine(BatchedEngine):
                                     logits_processor_factories
                                 ),
                                 agentic_phase=agentic_phase,
+                                selected_mode=mode,
+                                tree_budget=selected_tree_budget,
                             ),
                         )
                         try:
@@ -1753,10 +2071,20 @@ class DFlashEngine(BatchedEngine):
                             ddtree_fast_path_ratio=float(
                                 result.get("ddtree_fast_path_ratio") or 0.0
                             ),
+                            tree_budget=int(result.get("tree_budget") or self._ddtree_budget),
+                            avg_acceptance_length=float(
+                                result.get("avg_acceptance_length") or 0.0
+                            ),
                             ngram_acceptance_ratio=float(
                                 result.get("ngram_acceptance_ratio") or 0.0
                             ),
                             ngram_cycles=int(result.get("ngram_cycles_completed") or 0),
+                            ngram_proposed_tokens=int(
+                                result.get("ngram_proposed_tokens") or 0
+                            ),
+                            ngram_accepted_tokens=int(
+                                result.get("ngram_accepted_tokens") or 0
+                            ),
                             ngram_fallback_cycles=int(
                                 result.get("ngram_fallback_cycles") or 0
                             ),
@@ -1886,6 +2214,17 @@ class DFlashEngine(BatchedEngine):
                             else "dflash"
                         )
                     )
+                selected_tree_budget = int(
+                    policy_metadata.get("ddtree_budget") or self._ddtree_budget
+                )
+                self._last_agentic_policy = self._last_agentic_policy | {
+                    "selected_path": mode,
+                    "ddtree_budget": (
+                        selected_tree_budget
+                        if mode in ("ddtree", "ddtree-ngram")
+                        else 0
+                    ),
+                }
                 if logits_processor_factories and mode == "dflash":
                     raise RuntimeError(
                         "Structured CoT logits masking requires greedy DDTree mode "
@@ -1897,6 +2236,12 @@ class DFlashEngine(BatchedEngine):
                     self._active.agentic_phase = agentic_phase
                     self._active.agentic_policy_decision = mode
                     self._active.agentic_policy_reason = policy_reason
+                    self._active.agentic_policy_bucket = policy_metadata.get("bucket")
+                    self._active.tree_budget = (
+                        selected_tree_budget
+                        if mode in ("ddtree", "ddtree-ngram")
+                        else 0
+                    )
                     logger.info(
                         "[agentic-speculative-policy] phase=%s mode=%s reason=%s "
                         "prompt_tokens=%s acceptance=%s cooldown=%s",
@@ -1943,6 +2288,8 @@ class DFlashEngine(BatchedEngine):
                             prefix_boundary,
                             logits_processor_factories,
                             agentic_phase,
+                            mode,
+                            selected_tree_budget,
                         )
                     else:
                         stream = self._stream_dflash
@@ -1995,6 +2342,12 @@ class DFlashEngine(BatchedEngine):
 
     def _track_request_end(self) -> None:
         if self._active is not None:
+            elapsed = max(time.time() - self._active.started_at, 1e-6)
+            self._active.effective_tps = (
+                self._active.generated_tokens / elapsed
+                if self._active.generated_tokens > 0
+                else 0.0
+            )
             self._lifetime_responses += 1
             self._lifetime_proposed += self._active.proposed_tokens
             self._lifetime_accepted += self._active.accepted_tokens
@@ -2007,12 +2360,29 @@ class DFlashEngine(BatchedEngine):
                         "phase": self._active.agentic_phase,
                         "decision": self._active.agentic_policy_decision,
                         "reason": self._active.agentic_policy_reason,
+                        "bucket": self._active.agentic_policy_bucket,
                         "acceptance_ratio": self._active.acceptance_ratio,
+                        "acceptance_length": self._active.acceptance_length,
                         "proposed_tokens": self._active.proposed_tokens,
                         "accepted_tokens": self._active.accepted_tokens,
+                        "speculative_steps": self._active.speculative_steps,
                         "generated_tokens": self._active.generated_tokens,
                         "prompt_tokens": self._active.prompt_tokens,
+                        "tree_budget": self._active.tree_budget,
                         "generation_tps": self._active.generation_tps,
+                        "effective_tps": self._active.effective_tps,
+                        "elapsed_s": elapsed,
+                        "cached_tokens": self._active.cached_tokens,
+                        "uncached_tokens": max(
+                            self._active.prompt_tokens - self._active.cached_tokens,
+                            0,
+                        ),
+                        "ngram_acceptance_ratio": (
+                            self._active.ngram_acceptance_ratio
+                        ),
+                        "ngram_cycles": self._active.ngram_cycles,
+                        "ngram_proposed_tokens": self._active.ngram_proposed_tokens,
+                        "ngram_accepted_tokens": self._active.ngram_accepted_tokens,
                     }
                 )
         self._active = None
@@ -2030,7 +2400,13 @@ class DFlashEngine(BatchedEngine):
         a.proposed_tokens = int(resp.proposed_tokens or 0)
         a.accepted_tokens = int(resp.accepted_tokens or 0)
         a.speculative_steps = int(resp.speculative_steps or 0)
+        a.acceptance_length = float(
+            getattr(resp, "avg_acceptance_length", 0.0) or 0.0
+        )
+        if a.acceptance_length <= 0 and a.speculative_steps > 0:
+            a.acceptance_length = a.accepted_tokens / max(a.speculative_steps, 1)
         a.acceptance_ratio = float(resp.avg_acceptance_ratio or 0.0)
+        a.tree_budget = int(getattr(resp, "tree_budget", a.tree_budget) or a.tree_budget)
         a.avg_tree_node_count = float(getattr(resp, "avg_tree_node_count", 0.0) or 0.0)
         a.ddtree_fast_path_ratio = float(
             getattr(resp, "ddtree_fast_path_ratio", 0.0) or 0.0
@@ -2039,6 +2415,12 @@ class DFlashEngine(BatchedEngine):
             getattr(resp, "ngram_acceptance_ratio", 0.0) or 0.0
         )
         a.ngram_cycles = int(getattr(resp, "ngram_cycles", 0) or 0)
+        a.ngram_proposed_tokens = int(
+            getattr(resp, "ngram_proposed_tokens", 0) or 0
+        )
+        a.ngram_accepted_tokens = int(
+            getattr(resp, "ngram_accepted_tokens", 0) or 0
+        )
         a.ngram_fallback_cycles = int(
             getattr(resp, "ngram_fallback_cycles", 0) or 0
         )
@@ -2102,8 +2484,14 @@ class DFlashEngine(BatchedEngine):
                     "completion_tokens": self._active.generated_tokens,
                     "max_tokens": 0,
                     "tokens_per_second": tps,
+                    "effective_tokens_per_second": (
+                        self._active.generated_tokens / max(elapsed, 1e-6)
+                        if self._active.generated_tokens > 0
+                        else 0.0
+                    ),
                     "ttft_s": ttft,
                     "acceptance_ratio": self._active.acceptance_ratio,
+                    "acceptance_length": self._active.acceptance_length,
                     "block_size": self._active.block_size,
                     "speculative_steps": self._active.speculative_steps,
                     "accepted_tokens": self._active.accepted_tokens,
@@ -2113,6 +2501,8 @@ class DFlashEngine(BatchedEngine):
                     "ddtree_fast_path_ratio": self._active.ddtree_fast_path_ratio,
                     "ngram_acceptance_ratio": self._active.ngram_acceptance_ratio,
                     "ngram_cycles": self._active.ngram_cycles,
+                    "ngram_proposed_tokens": self._active.ngram_proposed_tokens,
+                    "ngram_accepted_tokens": self._active.ngram_accepted_tokens,
                     "ngram_fallback_cycles": self._active.ngram_fallback_cycles,
                     "ngram_tool_guard_cycles": self._active.ngram_tool_guard_cycles,
                     "cache_hit_type": self._active.cache_hit_type,
@@ -2120,6 +2510,7 @@ class DFlashEngine(BatchedEngine):
                     "agentic_phase": self._active.agentic_phase,
                     "agentic_policy_decision": self._active.agentic_policy_decision,
                     "agentic_policy_reason": self._active.agentic_policy_reason,
+                    "agentic_policy_bucket": self._active.agentic_policy_bucket,
                     "phase_timings_us": self._active.phase_timings_us,
                     "progress": 0.0,
                 }
@@ -2191,9 +2582,13 @@ class DFlashEngine(BatchedEngine):
                 "ddtree_last_generation_tps": self._ddtree_last.get(
                     "generation_tps", 0.0
                 ),
+                "ddtree_last_acceptance_length": self._ddtree_last.get(
+                    "avg_acceptance_length", 0.0
+                ),
                 "ddtree_last_phase_timings_us": self._ddtree_last.get(
                     "ddtree_phase_timings_us", {}
                 ),
+                "ddtree_budget_candidates": self._parse_agentic_budget_candidates(),
                 "ngram_first_enabled": self._ngram_first_enabled,
                 "ngram_num_draft_tokens": self._ngram_num_draft_tokens,
                 "ngram_size": self._ngram_size,
@@ -2216,6 +2611,11 @@ class DFlashEngine(BatchedEngine):
                 "target_prefix_cache": self._target_prefix_cache.get_stats(),
                 "agentic_speculative_policy": self._agentic_speculative_policy,
                 "agentic_policy_cooldown": self._agentic_policy_cooldown,
+                "agentic_policy_bucket_cooldowns": {
+                    "|".join(key): value
+                    for key, value in self._agentic_policy_bucket_cooldowns.items()
+                    if value > 0
+                },
                 "agentic_policy_last": self._last_agentic_policy,
                 "agentic_policy_history": list(self._agentic_policy_history),
                 "agentic_target_fallback_min_prompt_tokens": int(
@@ -2229,6 +2629,12 @@ class DFlashEngine(BatchedEngine):
                 ),
                 "ngram_last_cycles": self._ddtree_last.get(
                     "ngram_cycles_completed", 0
+                ),
+                "ngram_last_proposed_tokens": self._ddtree_last.get(
+                    "ngram_proposed_tokens", 0
+                ),
+                "ngram_last_accepted_tokens": self._ddtree_last.get(
+                    "ngram_accepted_tokens", 0
                 ),
                 "ngram_last_fallback_cycles": self._ddtree_last.get(
                     "ngram_fallback_cycles", 0

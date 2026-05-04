@@ -487,6 +487,274 @@ def test_agentic_auto_adaptive_ddtree_waits_for_slow_target(monkeypatch):
     assert metadata["recent_target_tps"] == 15.5
 
 
+def test_agentic_history_records_acceptance_length_and_effective_tps():
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._track_request_start("ddtree")
+    assert engine._active is not None
+    engine._active.started_at -= 2.0
+    engine._active.agentic_phase = "initial_scaffold"
+    engine._active.agentic_policy_decision = "ddtree"
+    engine._active.agentic_policy_reason = "long_generation_ddtree"
+    engine._active.agentic_policy_bucket = "initial_scaffold|4-8k|513-1024|greedy"
+    engine._update_active(
+        types.SimpleNamespace(
+            tokens=[1],
+            prompt_tokens=5000,
+            prefill_seconds=0.5,
+            generation_tokens=100,
+            generation_tps=1000.0,
+            proposed_tokens=60,
+            accepted_tokens=24,
+            speculative_steps=6,
+            avg_acceptance_ratio=0.4,
+            avg_acceptance_length=0.0,
+            block_size_history=[2],
+            avg_tree_node_count=4.0,
+            ddtree_fast_path_ratio=1.0,
+            tree_budget=4,
+            ngram_acceptance_ratio=0.0,
+            ngram_cycles=0,
+            ngram_proposed_tokens=0,
+            ngram_accepted_tokens=0,
+            ngram_fallback_cycles=0,
+            ngram_tool_guard_cycles=0,
+            cache_hit_type=None,
+            cached_tokens=1000,
+            phase_timings_us={},
+        ),
+        new_text="ok",
+    )
+    engine._track_request_end()
+
+    row = engine.get_stats()["dflash"]["agentic_policy_history"][-1]
+    assert row["acceptance_length"] == 4.0
+    assert row["generation_tps"] == 1000.0
+    assert 40.0 <= row["effective_tps"] <= 60.0
+    assert row["uncached_tokens"] == 4000
+    assert row["tree_budget"] == 4
+
+
+def test_agentic_auto_uses_acceptance_length_bucket_cooldown(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_DDTREE", "0")
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_AL_DISABLE", "2.5")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+    bucket = "initial_scaffold|0-4k|1025+|greedy"
+    engine._agentic_policy_history.append(
+        {
+            "mode": "ddtree",
+            "bucket": bucket,
+            "phase": "initial_scaffold",
+            "generated_tokens": 128,
+            "effective_tps": 12.0,
+            "acceptance_length": 1.5,
+            "tree_budget": 4,
+        }
+    )
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=0,
+    )
+
+    assert mode == "target-fallback"
+    assert reason == "low_acceptance_length"
+    assert metadata["ddtree_recent_al"] == 1.5
+    assert metadata["bucket_cooldown"] > 0
+
+
+def test_agentic_auto_selects_best_ddtree_budget_from_bucket_history(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_DDTREE", "0")
+    monkeypatch.setenv("DFLASH_AGENTIC_DDTREE_BUDGET_CANDIDATES", "2,4,8")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+    bucket = "initial_scaffold|0-4k|1025+|greedy"
+    engine._agentic_policy_history.extend(
+        [
+            {
+                "mode": "ddtree",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 10.0,
+                "acceptance_length": 4.5,
+                "tree_budget": 4,
+            },
+            {
+                "mode": "ddtree",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 14.0,
+                "acceptance_length": 6.0,
+                "tree_budget": 8,
+            },
+        ]
+    )
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=0,
+    )
+
+    assert mode == "ddtree"
+    assert reason == "long_generation_ddtree"
+    assert metadata["ddtree_budget"] == 8
+
+
+def test_agentic_auto_ngram_low_acceptance_disables_ngram_only(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_DDTREE", "0")
+    monkeypatch.setenv("DFLASH_AGENTIC_NGRAM_MIN_ACCEPTANCE", "0.30")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+    bucket = "long_text_or_code|0-4k|1025+|greedy"
+    engine._agentic_policy_history.append(
+        {
+            "mode": "ddtree-ngram",
+            "bucket": bucket,
+            "phase": "long_text_or_code",
+            "generated_tokens": 128,
+            "effective_tps": 12.0,
+            "acceptance_length": 4.5,
+            "tree_budget": 4,
+            "ngram_cycles": 3,
+            "ngram_acceptance_ratio": 0.10,
+        }
+    )
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="long_text_or_code",
+        cached_tokens=0,
+    )
+
+    assert mode == "ddtree"
+    assert reason == "long_generation_ddtree"
+    assert metadata["ngram_allowed"] is False
+
+
+def test_agentic_auto_bucket_target_winner_blocks_ddtree(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_DDTREE", "0")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+    bucket = "initial_scaffold|0-4k|1025+|greedy"
+    engine._agentic_policy_history.extend(
+        [
+            {
+                "mode": "target-prefix-cache",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 30.0,
+            },
+            {
+                "mode": "target-prefix-cache",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 32.0,
+            },
+            {
+                "mode": "ddtree",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 20.0,
+                "acceptance_length": 3.0,
+                "tree_budget": 4,
+            },
+            {
+                "mode": "ddtree",
+                "bucket": bucket,
+                "phase": "initial_scaffold",
+                "generated_tokens": 128,
+                "effective_tps": 19.0,
+                "acceptance_length": 3.5,
+                "tree_budget": 4,
+            },
+        ]
+    )
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=0,
+    )
+
+    assert mode == "target-fallback"
+    assert reason == "bucket_target_winner"
+    assert metadata["target_known_winner"] is True
+
+
+def test_agentic_auto_deterministic_exploration_allows_ddtree(monkeypatch):
+    monkeypatch.delenv("DFLASH_AGENTIC_ADAPTIVE_DDTREE", raising=False)
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_MIN_TARGET_SAMPLES", "4")
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_TARGET_TPS_TRIGGER", "1")
+    monkeypatch.setenv("DFLASH_AGENTIC_ADAPTIVE_MIN_PROMPT_TOKENS", "4")
+    monkeypatch.setenv("DFLASH_AGENTIC_POLICY_EXPLORE_EVERY", "8")
+    monkeypatch.setenv("DFLASH_AGENTIC_POLICY_EXPLORE_MIN_OUTPUT_TOKENS", "64")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+    engine._lifetime_responses = 8
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four",
+        tools_requested=True,
+        max_tokens=2048,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=0,
+    )
+
+    assert mode == "ddtree"
+    assert reason == "long_generation_ddtree"
+    assert metadata["adaptive_ddtree_ready"] is True
+
+
 @pytest.mark.asyncio
 async def test_dflash_target_fallback_closes_generator_on_worker(monkeypatch):
     import mlx_lm

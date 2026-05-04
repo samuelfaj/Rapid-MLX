@@ -180,6 +180,8 @@ The DFlash auto policy uses:
 - max token budget
 - greedy mode, usually `temperature=0`
 - recent acceptance ratio
+- recent acceptance length (`accepted_tokens / speculative_steps`)
+- recent effective TPS by phase/prompt/max-token bucket
 - cooldown state
 - whether DDTree budget is configured
 - whether n-gram lookup is configured
@@ -193,16 +195,20 @@ elif prompt has cached prefix:
     prefill only uncached suffix
 elif recent_acceptance < DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE:
     use target fallback for cooldown window
+elif recent_ddtree_acceptance_length < DFLASH_AGENTIC_DDTREE_AL_DISABLE:
+    use target fallback for this phase/prompt bucket cooldown
 elif prompt_tokens > DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS:
     use target fallback, optionally with target-prefix-cache
 elif max_tokens > DFLASH_AGENTIC_DDTREE_MAX_TOKENS and DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS=1:
     use target fallback, optionally with target-prefix-cache
-elif DFLASH_AGENTIC_ADAPTIVE_DDTREE=1 and target/cache has not slowed down:
+elif target-prefix-cache is the measured bucket winner:
+    use target fallback, optionally with target-prefix-cache
+elif DFLASH_AGENTIC_ADAPTIVE_DDTREE=1 and target/cache has not slowed down and no exploration is due:
     use target fallback, optionally with target-prefix-cache
 elif phase is long_text_or_code and ddtree_budget > 0:
-    use ddtree-ngram unless DFLASH_AGENTIC_NGRAM_LONG_TEXT=0
+    use ddtree-ngram unless n-gram is disabled or in cooldown
 elif max_tokens > 512 and greedy and ddtree_budget > 0:
-    use ddtree or ddtree-ngram
+    use ddtree or ddtree-ngram with the best known DDTree budget for the bucket
 else:
     use target fallback
 ```
@@ -214,15 +220,25 @@ Environment knobs:
 | `DFLASH_AGENTIC_POLICY_MAX_PREFILL` | `8000` | Above this prompt size, auto avoids DFlash because prefill dominates. |
 | `DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE` | `0.35` | Below this recent acceptance ratio, auto disables speculation temporarily. |
 | `DFLASH_AGENTIC_POLICY_COOLDOWN` | `3` | Number of following requests to keep fallback after poor acceptance. |
+| `DFLASH_AGENTIC_POLICY_EXPLORE_EVERY` | `8` | Periodically try speculative paths per request count when the phase can benefit. |
+| `DFLASH_AGENTIC_POLICY_EXPLORE_MIN_OUTPUT_TOKENS` | `64` | Minimum max-token budget before exploration can fire. |
+| `DFLASH_AGENTIC_POLICY_WINNER_MARGIN` | `1.10` | Target/cache must beat DDTree effective TPS by this margin before it becomes bucket winner. |
 | `DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS` | `16384` | Above this full prompt size, auto prefers target-prefix-cache because DFlash/DDTree prefill overhead dominates. |
 | `DFLASH_AGENTIC_DDTREE_MAX_TOKENS` | `1024` | Sweet-spot generation budget recorded in policy metadata. High agent budgets do not block DDTree unless strict mode is enabled. |
 | `DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS` | `0` | When set, treat `DFLASH_AGENTIC_DDTREE_MAX_TOKENS` as a hard DDTree cutoff. |
+| `DFLASH_AGENTIC_DDTREE_AL_DISABLE` | `2.5` | Below this recent DDTree acceptance length, auto cools down DDTree for the current bucket. |
+| `DFLASH_AGENTIC_DDTREE_AL_ENABLE` | `4.0` | Recent DDTree acceptance length needed before DDTree is considered healthy for a bucket. |
+| `DFLASH_AGENTIC_DDTREE_AL_STRONG` | `6.0` | Strong DDTree acceptance length signal used for higher-budget exploration. |
+| `DFLASH_AGENTIC_DDTREE_BUDGET_CANDIDATES` | current budget | Comma-separated DDTree budgets to explore, for example `2,4,6,8,12,16`. |
+| `DFLASH_AGENTIC_DDTREE_BUDGET_EXPLORE` | `1` | Allow auto policy to select the best known DDTree budget per bucket. |
 | `DFLASH_AGENTIC_ADAPTIVE_DDTREE` | `1` | Start target/cache for agentic long-code phases, then try DDTree only after target/cache slows or periodic exploration fires. |
 | `DFLASH_AGENTIC_ADAPTIVE_MIN_TARGET_SAMPLES` | `2` | Minimum recent target/cache samples before slowdown can trigger DDTree. |
 | `DFLASH_AGENTIC_ADAPTIVE_TARGET_TPS_TRIGGER` | `18` | Recent target/cache generation TPS threshold below which auto may try DDTree. |
 | `DFLASH_AGENTIC_ADAPTIVE_MIN_PROMPT_TOKENS` | `4096` | Minimum prompt size before slowdown-triggered DDTree is considered. |
 | `DFLASH_AGENTIC_ADAPTIVE_EXPLORE_EVERY` | `8` | Periodically try DDTree every N completed requests to re-check whether it now wins. Set `0` to disable exploration. |
 | `DFLASH_AGENTIC_NGRAM_LONG_TEXT` | `1` | In agentic auto mode, allow n-gram lookup only for `long_text_or_code` phases. Set `0` to disable. |
+| `DFLASH_AGENTIC_NGRAM_MIN_ACCEPTANCE` | `0.30` | Below this recent n-gram acceptance ratio, auto cools down n-gram for the current bucket. |
+| `DFLASH_AGENTIC_NGRAM_COOLDOWN` | `3` | Number of following bucket attempts to keep n-gram disabled after poor acceptance. |
 
 ## Why Auto Beats Forced DFlash/DDTree
 
@@ -283,7 +299,7 @@ Notes:
 - DFlash mode is text-only.
 - DFlash is mutually exclusive with `--enable-mtp` and `--mllm`.
 - DFlash mode is single-request oriented; continuous batching is disabled there.
-- `--dflash-ddtree-budget 4` is the tested DDTree budget suggestion for Qwen3.6 A3B.
+- `--dflash-ddtree-budget 4` is a conservative default capability, not a universal fastest setting. With `--agentic-speculative-policy auto`, Rapid-MLX records acceptance length and effective TPS per bucket, then can explore `DFLASH_AGENTIC_DDTREE_BUDGET_CANDIDATES` to keep the budget that wins for that workload.
 
 ## Benchmarks
 
@@ -292,6 +308,19 @@ Benchmark document:
 ```text
 BENCHMARK4.md
 ```
+
+Agentic speculative policy benchmark helper:
+
+```bash
+python3 scripts/agentic_speculative_bench.py \
+  --base-url http://127.0.0.1:8010 \
+  --model local \
+  --count 3 \
+  --max-tokens 1024 \
+  --output reports/benchmarks/agentic-speculative.jsonl
+```
+
+The helper calls `/v1/chat/completions`, reads `/v1/status`, writes JSONL per request, prints path counts, and recommends target-only/prefix-cache or adaptive speculation for that run.
 
 Workload prompt:
 

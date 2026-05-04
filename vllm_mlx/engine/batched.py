@@ -358,6 +358,7 @@ class BatchedEngine(BaseEngine):
             stream_interval=self._stream_interval,
             gpu_memory_utilization=self._gpu_memory_utilization,
             tool_logits_processor_factory=self._tool_logits_processor_factory,
+            speculative_prefill_compressor=self._speculative_prefill,
         )
 
         # Create async engine
@@ -503,7 +504,7 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt = self._maybe_compress_prompt(prompt, kwargs)
+        agentic_phase = kwargs.pop("agentic_phase", None)
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
@@ -543,6 +544,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             logits_processor_factories=logits_processor_factories,
+            agentic_phase=agentic_phase,
         )
 
         text = clean_output_text(output.output_text)
@@ -584,7 +586,7 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt = self._maybe_compress_prompt(prompt, kwargs)
+        agentic_phase = kwargs.pop("agentic_phase", None)
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
@@ -630,6 +632,7 @@ class BatchedEngine(BaseEngine):
             prefix_boundary=prefix_boundary,
             prefix_boundaries=prefix_boundaries,
             logits_processor_factories=logits_processor_factories,
+            agentic_phase=agentic_phase,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -696,9 +699,6 @@ class BatchedEngine(BaseEngine):
             )
         )
 
-        messages = self._maybe_compress_last_user_message(
-            messages, tools_requested=bool(tools)
-        )
         messages = self._maybe_compact_tool_results(messages)
         from ..config.server_config import get_config
 
@@ -736,7 +736,6 @@ class BatchedEngine(BaseEngine):
                 if structured_cot
                 else None
             ),
-            speculative_prefill_applied=self._speculative_prefill.config.enabled,
             **kwargs,
         )
 
@@ -927,9 +926,6 @@ class BatchedEngine(BaseEngine):
             )
         )
 
-        messages = self._maybe_compress_last_user_message(
-            messages, tools_requested=bool(tools)
-        )
         messages = self._maybe_compact_tool_results(messages)
         from ..config.server_config import get_config
 
@@ -967,9 +963,6 @@ class BatchedEngine(BaseEngine):
             kwargs["logits_processor_factories"] = [
                 self._make_structured_cot_factory(prompt, structured_cot_token_budget)
             ]
-        if self._speculative_prefill.config.enabled:
-            kwargs["speculative_prefill_applied"] = True
-
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -999,41 +992,13 @@ class BatchedEngine(BaseEngine):
         return factory
 
     def _maybe_compress_prompt(self, prompt: str, kwargs: dict[str, Any]) -> str:
-        if kwargs.pop("speculative_prefill_applied", False):
-            return prompt
-        if not self._speculative_prefill.config.enabled:
-            return prompt
-        result = self._speculative_prefill.compress(prompt, self.tokenizer)
-        return result.prompt
+        kwargs.pop("speculative_prefill_applied", None)
+        return prompt
 
     def _maybe_compress_last_user_message(
         self, messages: list[dict[str, Any]], tools_requested: bool = False
     ) -> list[dict[str, Any]]:
-        if not self._speculative_prefill.config.enabled:
-            return messages
-        has_tool_result = any(message.get("role") == "tool" for message in messages)
-        if tools_requested and has_tool_result:
-            self._speculative_prefill.last_result = None
-            return messages
-        last_user_idx = None
-        for idx in range(len(messages) - 1, -1, -1):
-            if messages[idx].get("role") == "user":
-                last_user_idx = idx
-                break
-        if last_user_idx is None:
-            return messages
-        content = messages[last_user_idx].get("content")
-        if not isinstance(content, str):
-            return messages
-        result = self._speculative_prefill.compress(content, self.tokenizer)
-        if not result.applied:
-            return messages
-        compressed_messages = list(messages)
-        compressed_messages[last_user_idx] = {
-            **messages[last_user_idx],
-            "content": result.prompt,
-        }
-        return compressed_messages
+        return messages
 
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""

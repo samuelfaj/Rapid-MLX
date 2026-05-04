@@ -56,6 +56,7 @@ class EngineConfig:
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     gpu_memory_utilization: float = 0.90  # Fraction of device memory for allocation
     tool_logits_processor_factory: Any | None = None  # Factory for tool logits bias
+    speculative_prefill_compressor: Any | None = None
 
 
 class EngineCore:
@@ -110,6 +111,7 @@ class EngineCore:
             tokenizer=tokenizer,
             config=scheduler_config,
             tool_logits_processor_factory=self.config.tool_logits_processor_factory,
+            speculative_prefill_compressor=self.config.speculative_prefill_compressor,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -287,6 +289,7 @@ class EngineCore:
         prefix_boundary: int = 0,
         prefix_boundaries: list[int] | None = None,
         logits_processor_factories: list[Any] | None = None,
+        agentic_phase: str | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -317,6 +320,7 @@ class EngineCore:
             prefix_boundary=prefix_boundary,
             prefix_boundaries=prefix_boundaries,
             logits_processor_factories=logits_processor_factories,
+            agentic_phase=agentic_phase,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

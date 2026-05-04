@@ -192,6 +192,15 @@ class TestHelperFunctions:
         assert not is_mllm_model("mlx-community/Mistral-7B-Instruct-4bit")
         assert not is_mllm_model("mlx-community/Qwen2-7B-Instruct-4bit")
 
+    def test_agentic_auto_enables_speculative_prefill_only_with_drafter(self):
+        """Test agentic auto prefill capability gating."""
+        from vllm_mlx.server import _should_enable_speculative_prefill
+
+        assert _should_enable_speculative_prefill(True, "off", None) is True
+        assert _should_enable_speculative_prefill(False, "auto", "/tmp/drafter") is True
+        assert _should_enable_speculative_prefill(False, "auto", None) is False
+        assert _should_enable_speculative_prefill(False, "off", "/tmp/drafter") is False
+
     def test_extract_multimodal_content_text_only(self):
         """Test extracting content from text-only messages."""
         from vllm_mlx.server import Message, extract_multimodal_content

@@ -199,6 +199,18 @@ _speculative_prefill_draft_model: str | None = None
 _speculative_prefill_ratio: float = 0.85
 _speculative_prefill_min_tokens: int = 128
 
+
+def _should_enable_speculative_prefill(
+    explicit_enabled: bool,
+    agentic_speculative_policy: str,
+    drafter_path: str | None,
+) -> bool:
+    """Resolve prefill compression capability for agentic auto mode."""
+
+    if explicit_enabled:
+        return True
+    return bool(drafter_path) and str(agentic_speculative_policy or "off") == "auto"
+
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
@@ -532,8 +544,13 @@ def load_model(
 
     from .speculative.prefill import SpeculativePrefillConfig
 
+    speculative_prefill_enabled = _should_enable_speculative_prefill(
+        _speculative_prefill,
+        _agentic_speculative_policy,
+        drafter_path,
+    )
     speculative_prefill_config = SpeculativePrefillConfig(
-        enabled=_speculative_prefill,
+        enabled=speculative_prefill_enabled,
         draft_model_path=_speculative_prefill_draft_model,
         target_token_ratio=_speculative_prefill_ratio,
         min_prompt_tokens=_speculative_prefill_min_tokens,

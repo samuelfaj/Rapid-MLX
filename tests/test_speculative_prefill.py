@@ -2,6 +2,8 @@
 """Tests for speculative prefill prompt compression."""
 
 from vllm_mlx.engine.batched import BatchedEngine
+from vllm_mlx.request import Request, SamplingParams
+from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 from vllm_mlx.speculative.prefill import (
     SpeculativePrefillCompressor,
     SpeculativePrefillConfig,
@@ -133,8 +135,7 @@ def test_draft_scores_align_between_different_tokenizers():
     assert scores == [0.2, 9.0, 9.0]
 
 
-def test_batched_engine_compresses_only_last_user_message():
-    tokenizer = StableWordTokenizer()
+def test_batched_engine_leaves_messages_for_suffix_prefill():
     engine = BatchedEngine(
         "dummy",
         speculative_prefill_config=SpeculativePrefillConfig(
@@ -145,11 +146,6 @@ def test_batched_engine_compresses_only_last_user_message():
             preserve_last_tokens=1,
         ),
     )
-    engine._tokenizer = tokenizer
-    engine._speculative_prefill._score_fn = lambda tokens, _tokenizer: [
-        10.0 if idx in {0, 7} else 0.1 for idx, _ in enumerate(tokens)
-    ]
-
     messages = [
         {"role": "system", "content": "system text should stay"},
         {"role": "user", "content": "alpha beta gamma delta epsilon zeta eta omega"},
@@ -157,11 +153,88 @@ def test_batched_engine_compresses_only_last_user_message():
 
     compressed = engine._maybe_compress_last_user_message(messages)
 
-    assert compressed[0]["content"] == "system text should stay"
-    assert compressed[1]["content"] != messages[1]["content"]
+    assert compressed == messages
 
 
-def test_batched_engine_compresses_initial_tool_request():
+def test_scheduler_compresses_only_uncached_suffix():
+    tokenizer = StableWordTokenizer()
+    compressor = SpeculativePrefillCompressor(
+        SpeculativePrefillConfig(
+            enabled=True,
+            target_token_ratio=0.5,
+            min_prompt_tokens=4,
+            preserve_first_tokens=1,
+            preserve_last_tokens=1,
+        ),
+        score_fn=lambda tokens, _tokenizer: [
+            10.0 if idx in {0, len(tokens) - 1} else 0.1
+            for idx, _ in enumerate(tokens)
+        ],
+    )
+    scheduler = Scheduler(
+        model=None,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(enable_prefix_cache=False),
+        speculative_prefill_compressor=compressor,
+    )
+    prompt_tokens = tokenizer.encode(
+        "prefix alpha beta gamma delta epsilon zeta eta omega"
+    )
+    cached_tokens = 1
+    request = Request(
+        request_id="req",
+        prompt=prompt_tokens,
+        sampling_params=SamplingParams(),
+        agentic_phase="initial_scaffold",
+    )
+    request.prompt_token_ids = prompt_tokens
+    request.num_prompt_tokens = len(prompt_tokens)
+    request.cached_tokens = cached_tokens
+    request.remaining_tokens = prompt_tokens[cached_tokens:]
+
+    scheduler._maybe_compress_uncached_suffix(request)
+
+    assert request.prompt_token_ids[:cached_tokens] == prompt_tokens[:cached_tokens]
+    assert len(request.remaining_tokens) < len(prompt_tokens[cached_tokens:])
+    assert request.num_prompt_tokens == cached_tokens + len(request.remaining_tokens)
+
+
+def test_scheduler_does_not_compress_critical_agentic_phase():
+    tokenizer = StableWordTokenizer()
+    compressor = SpeculativePrefillCompressor(
+        SpeculativePrefillConfig(
+            enabled=True,
+            target_token_ratio=0.5,
+            min_prompt_tokens=4,
+            preserve_first_tokens=1,
+            preserve_last_tokens=1,
+        ),
+        score_fn=lambda tokens, _tokenizer: [0.1] * len(tokens),
+    )
+    scheduler = Scheduler(
+        model=None,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(enable_prefix_cache=False),
+        speculative_prefill_compressor=compressor,
+    )
+    prompt_tokens = tokenizer.encode("alpha beta gamma delta epsilon zeta eta omega")
+    request = Request(
+        request_id="req",
+        prompt=prompt_tokens,
+        sampling_params=SamplingParams(),
+        agentic_phase="repair",
+    )
+    request.prompt_token_ids = prompt_tokens
+    request.num_prompt_tokens = len(prompt_tokens)
+    request.remaining_tokens = prompt_tokens
+
+    scheduler._maybe_compress_uncached_suffix(request)
+
+    assert request.prompt_token_ids == prompt_tokens
+    assert request.remaining_tokens == prompt_tokens
+
+
+def test_batched_engine_does_not_compress_initial_tool_request_before_cache():
     engine = BatchedEngine(
         "dummy",
         speculative_prefill_config=SpeculativePrefillConfig(
@@ -184,7 +257,7 @@ def test_batched_engine_compresses_initial_tool_request():
         messages, tools_requested=True
     )
 
-    assert compressed != messages
+    assert compressed == messages
 
 
 def test_batched_engine_does_not_compress_after_tool_result():

@@ -114,6 +114,7 @@ class Request:
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
     prefix_boundaries: list[int] | None = None  # Additional safe segment boundaries
     logits_processor_factories: list[Any] | None = None
+    agentic_phase: str | None = None
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache

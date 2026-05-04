@@ -26,6 +26,7 @@ from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .speculative.prefill import SpeculativePrefillCompressor
 from .utils.decode import IncrementalDecoder
 from .utils.mamba_cache import ensure_mamba_support
 
@@ -1194,6 +1195,7 @@ class Scheduler:
         tokenizer: Any,
         config: SchedulerConfig | None = None,
         tool_logits_processor_factory: Any | None = None,
+        speculative_prefill_compressor: SpeculativePrefillCompressor | None = None,
     ):
         """
         Initialize the scheduler.
@@ -1210,6 +1212,7 @@ class Scheduler:
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
         self._tool_logits_processor_factory = tool_logits_processor_factory
+        self._speculative_prefill = speculative_prefill_compressor
 
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
@@ -1914,12 +1917,54 @@ class Scheduler:
             request.cache_hit_type = "miss"
             request.remaining_tokens = request.prompt_token_ids
 
+        self._maybe_compress_uncached_suffix(request)
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
 
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
+        )
+
+    def _maybe_compress_uncached_suffix(self, request: Request) -> None:
+        compressor = self._speculative_prefill
+        if compressor is None or not compressor.config.enabled:
+            return
+        phase = request.agentic_phase
+        if phase in {"tool_json", "repair", "validation", "finalization"}:
+            compressor.last_result = None
+            return
+        if request.remaining_tokens is None:
+            return
+        if len(request.remaining_tokens) == 0:
+            compressor.last_result = None
+            return
+        try:
+            suffix_text = self._actual_tokenizer.decode(request.remaining_tokens)
+        except Exception:
+            compressor.last_result = None
+            return
+        result = compressor.compress(suffix_text, self._actual_tokenizer)
+        if not result.applied:
+            return
+        compressed_suffix = self._actual_tokenizer.encode(result.prompt)
+        if len(compressed_suffix) >= len(request.remaining_tokens):
+            return
+        prefix_tokens = list(request.prompt_token_ids[: request.cached_tokens])
+        request.remaining_tokens = list(compressed_suffix)
+        request.prompt_token_ids = [*prefix_tokens, *request.remaining_tokens]
+        request.num_prompt_tokens = len(request.prompt_token_ids)
+        request.prefix_boundary = 0
+        request.prefix_boundaries = None
+        logger.info(
+            "[speculative-prefill] suffix compressed request=%s cached=%d "
+            "suffix=%d->%d total=%d",
+            request.request_id[:12],
+            request.cached_tokens,
+            result.original_tokens,
+            result.compressed_tokens,
+            request.num_prompt_tokens,
         )
 
     def abort_request(self, request_id: str) -> bool:

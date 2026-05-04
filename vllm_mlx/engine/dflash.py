@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+import mlx.core as mx
+
 from ..api.utils import clean_output_text
 from ..speculative.prefill import SpeculativePrefillConfig
 from .base import GenerationOutput
@@ -170,6 +172,16 @@ class _DDTreePrefixStateCache:
             hit_type=hit_type,
             cached_tokens=len(best_key),
         )
+
+    def peek_cached_tokens(self, prompt_tokens: list[int]) -> int:
+        if self.max_entries <= 0 or not prompt_tokens:
+            return 0
+        prompt_tuple = tuple(int(token) for token in prompt_tokens)
+        best_len = 0
+        for key in self._entries:
+            if len(key) <= len(prompt_tuple) and prompt_tuple[: len(key)] == key:
+                best_len = max(best_len, len(key))
+        return best_len
 
     def store(self, prompt_tokens: list[int], state: Any | None) -> None:
         if self.max_entries <= 0 or state is None or not prompt_tokens:
@@ -538,6 +550,7 @@ class DFlashEngine(BatchedEngine):
         max_tokens: int,
         greedy_request: bool,
         phase: str | None,
+        cached_tokens: int | None = None,
     ) -> tuple[str | None, str, dict[str, Any]]:
         """Return forced mode for auto policy, or None for existing DFlash logic."""
 
@@ -546,20 +559,28 @@ class DFlashEngine(BatchedEngine):
             return None, "policy_off_or_no_tools", {}
 
         prompt_tokens = self._prompt_token_count(prompt)
+        cached_tokens = max(0, min(int(cached_tokens or 0), prompt_tokens))
+        remaining_prefill_tokens = prompt_tokens - cached_tokens
         recent_acceptance = self._recent_agentic_acceptance()
         phase = phase or "tool_json"
         metadata: dict[str, Any] = {
             "policy": policy,
             "phase": phase,
             "prompt_tokens": prompt_tokens,
-            "remaining_prefill_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_hit_ratio": (
+                cached_tokens / prompt_tokens if prompt_tokens > 0 else 0.0
+            ),
+            "remaining_prefill_tokens": remaining_prefill_tokens,
             "recent_acceptance": recent_acceptance,
             "cooldown": self._agentic_policy_cooldown,
         }
 
         if phase in {"repair", "validation", "finalization", "tool_json"}:
             return "target-fallback", f"phase_{phase}", metadata
-        if prompt_tokens > int(os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000")):
+        if remaining_prefill_tokens > int(
+            os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000")
+        ):
             return "target-fallback", "prefill_too_large", metadata
         if self._agentic_policy_cooldown > 0:
             self._agentic_policy_cooldown -= 1
@@ -583,6 +604,22 @@ class DFlashEngine(BatchedEngine):
                 return "ddtree-ngram", "long_generation_ngram", metadata
             return "ddtree", "long_generation_ddtree", metadata
         return "target-fallback", "short_or_non_greedy", metadata
+
+    def _ddtree_cached_token_count(self, prompt: str) -> int:
+        if not self._ddtree_capture_cache:
+            return 0
+        try:
+            from ..speculative.ddtree.engine import tokenize_prompt
+
+            prompt_array = tokenize_prompt(self._tokenizer, prompt)
+            prompt_token_ids = (
+                prompt_array.tolist()
+                if hasattr(prompt_array, "tolist")
+                else list(prompt_array)
+            )
+        except Exception:
+            return 0
+        return self._ddtree_prefix_cache.peek_cached_tokens(prompt_token_ids)
 
     async def _stream_target(
         self,
@@ -752,6 +789,41 @@ class DFlashEngine(BatchedEngine):
         unique_ratio = len(set(words)) / len(words)
         return unique_ratio <= 0.55
 
+    def _maybe_compress_ddtree_suffix(
+        self,
+        prompt_token_ids: list[int],
+        cached_tokens: int,
+        phase: str | None,
+    ) -> list[int]:
+        if not self._speculative_prefill.config.enabled:
+            return prompt_token_ids
+        if phase in {"tool_json", "repair", "validation", "finalization"}:
+            self._speculative_prefill.last_result = None
+            return prompt_token_ids
+        cached_tokens = max(0, min(int(cached_tokens or 0), len(prompt_token_ids)))
+        suffix_tokens = prompt_token_ids[cached_tokens:]
+        if not suffix_tokens:
+            self._speculative_prefill.last_result = None
+            return prompt_token_ids
+        try:
+            suffix_text = self._tokenizer.decode(suffix_tokens)
+        except Exception:
+            self._speculative_prefill.last_result = None
+            return prompt_token_ids
+        result = self._speculative_prefill.compress(suffix_text, self._tokenizer)
+        if not result.applied:
+            return prompt_token_ids
+        compressed_suffix = list(self._tokenizer.encode(result.prompt))
+        if len(compressed_suffix) >= len(suffix_tokens):
+            return prompt_token_ids
+        logger.info(
+            "[speculative-prefill] ddtree suffix compressed cached=%d suffix=%d->%d",
+            cached_tokens,
+            len(suffix_tokens),
+            len(compressed_suffix),
+        )
+        return [*prompt_token_ids[:cached_tokens], *compressed_suffix]
+
     def _run_ddtree_sync(
         self,
         prompt: str,
@@ -763,6 +835,7 @@ class DFlashEngine(BatchedEngine):
         should_stop: Any = None,
         emit_step_text: bool = False,
         logits_processors: list[Any] | None = None,
+        agentic_phase: str | None = None,
     ) -> dict[str, Any]:
         from ..speculative.ddtree.engine import generate_ddtree, tokenize_prompt
 
@@ -780,6 +853,15 @@ class DFlashEngine(BatchedEngine):
             if self._ddtree_capture_cache
             else SimpleNamespace(state=None, hit_type=None, cached_tokens=0)
         )
+        if prompt_token_ids:
+            prompt_token_ids = self._maybe_compress_ddtree_suffix(
+                prompt_token_ids,
+                int(getattr(cache_fetch, "cached_tokens", 0) or 0),
+                agentic_phase,
+            )
+            prompt_array = mx.array(prompt_token_ids)
+            if prefix_boundary > int(getattr(cache_fetch, "cached_tokens", 0) or 0):
+                prefix_boundary = 0
 
         result = generate_ddtree(
             target_model=self._model,
@@ -848,6 +930,7 @@ class DFlashEngine(BatchedEngine):
         tools_requested: bool,
         prefix_boundary: int = 0,
         logits_processor_factories: list[Any] | None = None,
+        agentic_phase: str | None = None,
     ):
         """Run the Rapid-MLX DDTree loop on the DFlash MLX worker thread."""
         if temperature not in (0, 0.0) or top_p not in (0, 0.0, 1, 1.0):
@@ -891,6 +974,7 @@ class DFlashEngine(BatchedEngine):
                     should_stop=stop_event.is_set,
                     emit_step_text=True,
                     logits_processors=logits_processors,
+                    agentic_phase=agentic_phase,
                 )
                 loop.call_soon_threadsafe(queue.put_nowait, result)
             finally:
@@ -1030,6 +1114,7 @@ class DFlashEngine(BatchedEngine):
                             max_tokens=max_tokens,
                             greedy_request=greedy_request,
                             phase=agentic_phase,
+                            cached_tokens=self._ddtree_cached_token_count(prompt),
                         )
                     )
                     self._last_agentic_policy = policy_metadata | {
@@ -1108,6 +1193,7 @@ class DFlashEngine(BatchedEngine):
                                 logits_processors=self._make_ddtree_logits_processors(
                                     logits_processor_factories
                                 ),
+                                agentic_phase=agentic_phase,
                             ),
                         )
                         try:
@@ -1227,6 +1313,7 @@ class DFlashEngine(BatchedEngine):
                         max_tokens=max_tokens,
                         greedy_request=greedy_request,
                         phase=agentic_phase,
+                        cached_tokens=self._ddtree_cached_token_count(prompt),
                     )
                 )
                 self._last_agentic_policy = policy_metadata | {
@@ -1308,6 +1395,7 @@ class DFlashEngine(BatchedEngine):
                             tools_requested,
                             prefix_boundary,
                             logits_processor_factories,
+                            agentic_phase,
                         )
                     else:
                         stream = self._stream_dflash

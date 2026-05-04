@@ -649,7 +649,10 @@ class DFlashEngine(BatchedEngine):
             and self._ddtree_budget > 0
             and phase in {"initial_scaffold", "long_text_or_code"}
         ):
-            if self._should_enable_ngram_first(prompt) or self._thinking_ngram_enabled:
+            if (
+                self._should_enable_ngram_first(prompt, phase)
+                or self._thinking_ngram_enabled
+            ):
                 reason = (
                     "long_prefill_suffix_speculative_prefill_ngram"
                     if prefill_too_large
@@ -1177,10 +1180,18 @@ class DFlashEngine(BatchedEngine):
                 result.get("prefix_boundary_state"),
             )
 
-    def _should_enable_ngram_first(self, prompt: str) -> bool:
-        if not self._ngram_first_enabled:
+    def _should_enable_ngram_first(
+        self, prompt: str, phase: str | None = None
+    ) -> bool:
+        agentic_long_text_ngram = (
+            self._agentic_speculative_policy == "auto"
+            and phase == "long_text_or_code"
+            and self._ddtree_budget > 0
+            and _env_bool("DFLASH_AGENTIC_NGRAM_LONG_TEXT", True)
+        )
+        if not (self._ngram_first_enabled or agentic_long_text_ngram):
             return False
-        if _env_bool("DFLASH_NGRAM_FORCE", False):
+        if agentic_long_text_ngram or _env_bool("DFLASH_NGRAM_FORCE", False):
             return True
         lowered = prompt.lower()
         structured_markers = (
@@ -1252,7 +1263,10 @@ class DFlashEngine(BatchedEngine):
         from ..speculative.ddtree.engine import generate_ddtree, tokenize_prompt
 
         prompt_array = tokenize_prompt(self._tokenizer, prompt)
-        ngram_first_enabled = self._should_enable_ngram_first(prompt)
+        ngram_first_enabled = self._should_enable_ngram_first(
+            prompt,
+            agentic_phase,
+        )
         prompt_token_ids = []
         if self._ddtree_capture_cache:
             prompt_token_ids = (
@@ -1610,7 +1624,7 @@ class DFlashEngine(BatchedEngine):
                             self._track_request_end()
                     mode = forced_mode or (
                         "ddtree-ngram"
-                        if self._should_enable_ngram_first(prompt)
+                        if self._should_enable_ngram_first(prompt, agentic_phase)
                         or self._thinking_ngram_enabled
                         else "ddtree"
                     )
@@ -1791,7 +1805,7 @@ class DFlashEngine(BatchedEngine):
                         "ddtree-ngram"
                         if (
                             (
-                                self._should_enable_ngram_first(prompt)
+                                self._should_enable_ngram_first(prompt, agentic_phase)
                                 or self._thinking_ngram_enabled
                             )
                             and greedy_request

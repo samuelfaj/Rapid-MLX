@@ -339,6 +339,38 @@ def test_agentic_auto_targets_only_for_large_uncached_scaffold_without_prefill(m
     assert reason == "prefill_too_large"
 
 
+def test_agentic_auto_ngram_only_for_long_text_phase(monkeypatch):
+    monkeypatch.delenv("DFLASH_AGENTIC_NGRAM_LONG_TEXT", raising=False)
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+    )
+    engine._tokenizer = FakeTokenizer()
+
+    mode, reason, _ = engine._agentic_policy_decision(
+        "one two three four five six",
+        tools_requested=True,
+        max_tokens=1024,
+        greedy_request=True,
+        phase="long_text_or_code",
+        cached_tokens=0,
+    )
+
+    assert mode == "ddtree-ngram"
+    assert reason == "long_generation_ngram"
+    assert engine._should_enable_ngram_first("one two three", "tool_json") is False
+    assert engine._should_enable_ngram_first("one two three", "repair") is False
+    assert engine._should_enable_ngram_first("one two three", "validation") is False
+
+    monkeypatch.setenv("DFLASH_AGENTIC_NGRAM_LONG_TEXT", "0")
+    assert engine._should_enable_ngram_first(
+        "one two three",
+        "long_text_or_code",
+    ) is False
+
+
 @pytest.mark.asyncio
 async def test_dflash_target_fallback_closes_generator_on_worker(monkeypatch):
     import mlx_lm

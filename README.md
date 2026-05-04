@@ -193,6 +193,8 @@ elif prompt has cached prefix:
     prefill only uncached suffix
 elif recent_acceptance < DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE:
     use target fallback for cooldown window
+elif phase is long_text_or_code and ddtree_budget > 0:
+    use ddtree-ngram unless DFLASH_AGENTIC_NGRAM_LONG_TEXT=0
 elif max_tokens > 512 and greedy and ddtree_budget > 0:
     use ddtree or ddtree-ngram
 else:
@@ -206,6 +208,7 @@ Environment knobs:
 | `DFLASH_AGENTIC_POLICY_MAX_PREFILL` | `8000` | Above this prompt size, auto avoids DFlash because prefill dominates. |
 | `DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE` | `0.35` | Below this recent acceptance ratio, auto disables speculation temporarily. |
 | `DFLASH_AGENTIC_POLICY_COOLDOWN` | `3` | Number of following requests to keep fallback after poor acceptance. |
+| `DFLASH_AGENTIC_NGRAM_LONG_TEXT` | `1` | In agentic auto mode, allow n-gram lookup only for `long_text_or_code` phases. Set `0` to disable. |
 
 ## Why Auto Beats Forced DFlash/DDTree
 
@@ -228,6 +231,7 @@ So the best validated profile is:
 - `--agentic-speculative-policy auto`
 - `--drafter` present as capability
 - `--dflash-ddtree-budget 4`
+- n-gram lookup only for `long_text_or_code`, not for tool JSON, repair, validation, or finalization
 
 The benchmark win came from making repeated target-only phases cache-friendly while keeping DDTree/n-gram decode available only when the policy allows it.
 

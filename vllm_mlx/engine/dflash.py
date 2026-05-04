@@ -1150,7 +1150,7 @@ class DFlashEngine(BatchedEngine):
                 if stop_strings and any(marker in cumulative for marker in stop_strings):
                     finish_reason = "stop"
                 if resp.cached_tokens:
-                    logger.info(
+                    logger.debug(
                         "[target-prefix-cache] cache_fetch HIT cached_tokens=%d prompt_tokens=%d",
                         resp.cached_tokens,
                         resp.prompt_tokens,

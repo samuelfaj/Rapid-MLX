@@ -105,6 +105,7 @@ class MetricsMiddleware:
         engine_accepted_tokens: int | None = None
         engine_proposed_tokens: int | None = None
         engine_speculative_steps: int | None = None
+        engine_speculative_observed = False
         engine_cached_tokens: int | None = None
         engine_agentic_phase: str | None = None
         engine_agentic_policy_decision: str | None = None
@@ -118,7 +119,7 @@ class MetricsMiddleware:
             nonlocal engine_ngram_acceptance, engine_ngram_cycles
             nonlocal engine_ngram_fallback_cycles, engine_ngram_tool_guard_cycles
             nonlocal engine_accepted_tokens, engine_proposed_tokens
-            nonlocal engine_speculative_steps
+            nonlocal engine_speculative_steps, engine_speculative_observed
             nonlocal engine_cached_tokens, engine_agentic_phase
             nonlocal engine_agentic_policy_decision, engine_agentic_policy_reason
             try:
@@ -129,6 +130,11 @@ class MetricsMiddleware:
                     return
                 stats = cfg.engine.get_stats()
                 for r in stats.get("requests") or []:
+                    request_mode = str(r.get("mode") or "")
+                    target_mode_after_spec = (
+                        engine_speculative_observed
+                        and request_mode in {"target-fallback", "target-prefix-cache"}
+                    )
                     tps = r.get("tokens_per_second")
                     if tps is not None:
                         v = float(tps)
@@ -153,7 +159,7 @@ class MetricsMiddleware:
                         except Exception:
                             pass
                     mode = r.get("mode")
-                    if mode:
+                    if mode and not target_mode_after_spec:
                         engine_spec_mode = str(mode)
                     fast_path = r.get("ddtree_fast_path_ratio")
                     if fast_path is not None:
@@ -170,13 +176,21 @@ class MetricsMiddleware:
                     value = r.get("ngram_cycles")
                     if value is not None:
                         try:
-                            engine_ngram_cycles = int(value)
+                            parsed = int(value)
+                            if parsed > 0:
+                                engine_speculative_observed = True
+                            if parsed > 0 or not target_mode_after_spec:
+                                engine_ngram_cycles = parsed
                         except Exception:
                             pass
                     value = r.get("ngram_fallback_cycles")
                     if value is not None:
                         try:
-                            engine_ngram_fallback_cycles = int(value)
+                            parsed = int(value)
+                            if parsed > 0:
+                                engine_speculative_observed = True
+                            if parsed > 0 or not target_mode_after_spec:
+                                engine_ngram_fallback_cycles = parsed
                         except Exception:
                             pass
                     value = r.get("ngram_tool_guard_cycles")
@@ -188,19 +202,31 @@ class MetricsMiddleware:
                     value = r.get("accepted_tokens")
                     if value is not None:
                         try:
-                            engine_accepted_tokens = int(value)
+                            parsed = int(value)
+                            if parsed > 0:
+                                engine_speculative_observed = True
+                            if parsed > 0 or not target_mode_after_spec:
+                                engine_accepted_tokens = parsed
                         except Exception:
                             pass
                     value = r.get("proposed_tokens")
                     if value is not None:
                         try:
-                            engine_proposed_tokens = int(value)
+                            parsed = int(value)
+                            if parsed > 0:
+                                engine_speculative_observed = True
+                            if parsed > 0 or not target_mode_after_spec:
+                                engine_proposed_tokens = parsed
                         except Exception:
                             pass
                     value = r.get("speculative_steps")
                     if value is not None:
                         try:
-                            engine_speculative_steps = int(value)
+                            parsed = int(value)
+                            if parsed > 0:
+                                engine_speculative_observed = True
+                            if parsed > 0 or not target_mode_after_spec:
+                                engine_speculative_steps = parsed
                         except Exception:
                             pass
                     value = r.get("cached_tokens")
@@ -210,13 +236,13 @@ class MetricsMiddleware:
                         except Exception:
                             pass
                     value = r.get("agentic_phase")
-                    if value:
+                    if value and not target_mode_after_spec:
                         engine_agentic_phase = str(value)
                     value = r.get("agentic_policy_decision")
-                    if value:
+                    if value and not target_mode_after_spec:
                         engine_agentic_policy_decision = str(value)
                     value = r.get("agentic_policy_reason")
-                    if value:
+                    if value and not target_mode_after_spec:
                         engine_agentic_policy_reason = str(value)
             except Exception:
                 pass

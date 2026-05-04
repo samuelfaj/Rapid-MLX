@@ -10,6 +10,18 @@ def test_agentic_policy_classifies_initial_scaffold():
     assert classify_agentic_phase(messages, tools_requested=True) == "initial_scaffold"
 
 
+def test_agentic_policy_ignores_system_guard_text_for_initial_scaffold():
+    messages = [
+        {
+            "role": "system",
+            "content": "If validation fails, repair the error before finalization.",
+        },
+        {"role": "user", "content": "create a REST API"},
+    ]
+
+    assert classify_agentic_phase(messages, tools_requested=True) == "initial_scaffold"
+
+
 def test_agentic_policy_classifies_repair_after_failure():
     messages = [
         {"role": "user", "content": "create a REST API"},
@@ -28,4 +40,3 @@ def test_agentic_policy_classifies_finalization_after_tests_pass():
     ]
 
     assert classify_agentic_phase(messages, tools_requested=True) == "finalization"
-

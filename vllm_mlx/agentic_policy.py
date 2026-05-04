@@ -65,7 +65,12 @@ def classify_agentic_phase(messages: list[Any], tools_requested: bool) -> str:
             bool(message.get("tool_calls")) if isinstance(message, dict) else False
         )
     ]
-    transcript_tail = "\n".join(_message_text(message) for message in messages[-8:])
+    phase_messages = [
+        message
+        for message in messages
+        if _message_role(message) not in {"system", "developer"}
+    ]
+    transcript_tail = "\n".join(_message_text(message) for message in phase_messages[-8:])
     lowered_tail = transcript_tail.lower()
 
     validation_seen = any(marker in lowered_tail for marker in VALIDATION_MARKERS)

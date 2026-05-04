@@ -84,10 +84,46 @@ Speed:
 - Median effective TPS speedup: `71.5 / 16.15 = 4.43x`.
 - Median TTFT improved from `7.1s` to `1.5s`.
 
+## Five-Run Reliability Check
+
+After the first result, the benchmark was repeated five times per profile with
+fresh profile names. Each run used a newly emptied workspace directory under
+`/tmp/rapid-mlx-bench3`. The benchmark script cleanup was tightened to kill the
+server process tree, preventing stale servers from staying on port `8010`
+between retries.
+
+| Profile | r1 | r2 | r3 | r4 | r5 | Validation rate | Wall median, all | Wall median, valid only |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline, no prefix cache | 84s fail | 394s pass | 272s pass | 143s fail | 216s fail | 2/5 | 216s | 333s |
+| Agentic policy auto | 76s fail | 195s pass | 505s fail | 442s fail | 198s pass | 2/5 | 198s | 196.5s |
+
+Five-run summary:
+
+- Baseline valid runs: `2/5`, valid wall median `333s`, valid median TTFT `5.9s`, valid median effective TPS `30.8`.
+- Auto valid runs: `2/5`, valid wall median `196.5s`, valid median TTFT `2.62s`, valid median effective TPS `58.27`.
+- Valid-output wall speedup: `333 / 196.5 = 1.69x`.
+- All-run wall median speedup: `216 / 198 = 1.09x`.
+
+Reliability conclusion: `--agentic-speculative-policy auto` remained faster on
+the successful outputs, but it did not improve pass rate in this five-run set.
+Both profiles passed validation `40%` of the time. The remaining quality
+variance appears to come from the agent's generated app/test choices rather than
+from server timeout behavior; no retry timed out in the corrected five-run set.
+
 Artifacts:
 
 - `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_baseline_no_prefix_direct_600s.result.json`
 - `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_agentic_policy_auto_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_baseline_r1_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_baseline_r2_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_baseline_r3_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_baseline_r4_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_baseline_r5_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_auto_r1_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_auto_r2_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_auto_r3_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_auto_r4_direct_600s.result.json`
+- `/tmp/rapid-mlx-bench3/qwen36_35b_benchmark4_reliable_auto_r5_direct_600s.result.json`
 
 ## Notes
 

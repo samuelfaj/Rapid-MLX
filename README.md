@@ -108,6 +108,12 @@ Validated result for the 35B opencode benchmark:
 - Best config above: 121s, opencode exit 0, `bun test` passed.
 - End-to-end wall-clock speedup: 3.79x.
 
+Five-run reliability check:
+
+- Baseline without prefix cache: 2/5 validation pass rate, valid-run median 333s.
+- Best config above: 2/5 validation pass rate, valid-run median 196.5s.
+- Valid-run median speedup: 1.69x.
+
 ## DFlash Example For Decode-Heavy Runs
 
 DFlash/DDTree/n-gram are available, but they were not the winning configuration

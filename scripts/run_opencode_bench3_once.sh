@@ -36,13 +36,23 @@ EOF
 ) > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
+kill_tree() {
+  local signal="$1"
+  local pid="$2"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$signal" "$child"
+  done
+  kill "-$signal" "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   if kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -INT "$SERVER_PID" 2>/dev/null || true
+    kill_tree INT "$SERVER_PID"
     sleep 5
-    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    kill_tree TERM "$SERVER_PID"
     sleep 2
-    kill -KILL "$SERVER_PID" 2>/dev/null || true
+    kill_tree KILL "$SERVER_PID"
   fi
 }
 trap cleanup EXIT

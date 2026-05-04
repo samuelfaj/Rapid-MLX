@@ -961,6 +961,67 @@ async def test_agentic_guard_retries_auto_text_for_agentic_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agentic_auto_retries_text_only_first_turn(monkeypatch):
+    """Agentic auto policy should keep tool workflows autonomous without guard flag."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    cfg = get_config()
+    cfg.agentic_speculative_policy = "auto"
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeStreamingPostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatExhaustsThenCallsTool()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Build the requested project and validate it."
+                        ),
+                    }
+                ],
+                request,
+                tool_continuation_retry=False,
+                max_tokens=4096,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert engine.messages_seen[1][-1]["content"] == _TOOL_CALL_REQUIRED_RETRY_PROMPT
+    assert engine.kwargs_seen[1]["max_tokens"] == _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS
+    assert not any("Thinking only." in chunk for chunk in chunks)
+    assert any('"tool_calls"' in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
 async def test_agentic_guard_allows_long_text_before_tool_call(monkeypatch):
     """Agentic guard should keep buffering longer planning text until tool call."""
     from vllm_mlx.config import get_config, reset_config

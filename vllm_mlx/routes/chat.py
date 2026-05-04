@@ -2001,6 +2001,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     logger.debug(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
     cfg = get_config()
+    agentic_auto_enabled = (
+        str(getattr(cfg, "agentic_speculative_policy", "off") or "off") == "auto"
+    )
+    agentic_workflow_guard = bool(cfg.agentic_guard or agentic_auto_enabled)
     if cfg.agentic_guard:
         for idx, message in enumerate(request.messages):
             role = getattr(message, "role", None)
@@ -2074,7 +2078,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 m.role = "system"
 
     agentic_terminal_ready = bool(
-        cfg.agentic_guard and request.tools and _agentic_task_terminal_ready(messages)
+        agentic_workflow_guard
+        and request.tools
+        and _agentic_task_terminal_ready(messages)
     )
     if agentic_terminal_ready:
         logger.info(
@@ -2096,7 +2102,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             "'We should respond...' or 'Let me think...'. Be concise."
         )
     agentic_verification_required = bool(
-        cfg.agentic_guard
+        agentic_workflow_guard
         and request.tools
         and _agentic_completion_needs_verification(messages)
     )
@@ -2699,8 +2705,12 @@ async def stream_chat_completion(
             )
             return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
+        agentic_auto_enabled = (
+            str(getattr(cfg, "agentic_speculative_policy", "off") or "off") == "auto"
+        )
+        agentic_workflow_guard = bool(cfg.agentic_guard or agentic_auto_enabled)
         agentic_stream_guard = (
-            cfg.agentic_guard
+            agentic_workflow_guard
             and bool(request.tools)
             and _agentic_completion_needs_verification(messages)
             and (
@@ -2777,7 +2787,7 @@ async def stream_chat_completion(
             yield "data: [DONE]\n\n"
             return
         agentic_diagnostic_needed = (
-            cfg.agentic_guard
+            agentic_workflow_guard
             and bool(request.tools)
             and not _agentic_verification_present(messages)
             and not _last_tool_result_is_agentic_diagnostic(messages)
@@ -2911,7 +2921,10 @@ async def stream_chat_completion(
             and not _agentic_requested_artifacts_missing(messages)
         )
         structured_agentic_continuation = (
-            (cfg.structured_cot_tools or agentic_stream_guard)
+            (
+                agentic_stream_guard
+                or (cfg.structured_cot_tools and tool_continuation_retry)
+            )
             and bool(request.tools)
             and not repeated_tool_continuation
             and not agentic_task_complete
@@ -2948,7 +2961,7 @@ async def stream_chat_completion(
 
         while True:
             agentic_task_active = (
-                cfg.agentic_guard
+                agentic_workflow_guard
                 and bool(request.tools)
                 and _agentic_completion_needs_verification(messages)
                 and not agentic_task_complete
@@ -2960,7 +2973,7 @@ async def stream_chat_completion(
             )
             repeat_tool_detection_enabled = (
                 tool_continuation_retry
-                and not cfg.agentic_guard
+                and not agentic_stream_guard
                 and not agentic_repair_mode
                 and not _last_tool_result_indicates_failure(messages)
                 and bool(

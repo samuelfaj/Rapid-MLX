@@ -682,6 +682,70 @@ def _install_chunked_prefill(
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
 
+def _install_native_prompt_cache_save(
+    batch_gen: "BatchGenerator",
+    prompt_cache_save,
+    prefix_cache_save=None,
+) -> None:
+    """Store prompt-only cache for mlx-lm's native prompt processing path."""
+
+    if prompt_cache_save is None or not hasattr(batch_gen, "_next"):
+        return
+
+    _orig_next = batch_gen._next
+    _saved_prompt_cache_uids: set[int] = set()
+
+    def _next_with_prompt_cache_save():
+        prompt_responses, generation_responses = _orig_next()
+        generation_batch = getattr(batch_gen, "_generation_batch", None)
+        if generation_batch is None:
+            return prompt_responses, generation_responses
+
+        generation_uids = list(getattr(generation_batch, "uids", []) or [])
+        prompt_batch = getattr(batch_gen, "_prompt_batch", None)
+        prompt_uids = list(getattr(prompt_batch, "uids", []) or [])
+        for response in prompt_responses:
+            uid = getattr(response, "uid", None)
+            if uid is None:
+                continue
+
+            if (
+                prefix_cache_save is not None
+                and getattr(response, "end_of_segment", False)
+                and not getattr(response, "end_of_prompt", False)
+            ):
+                try:
+                    idx = prompt_uids.index(uid)
+                    progress = getattr(response, "progress", (0, 0))
+                    processed = int(progress[0] if progress else 0)
+                    prefix_cache_save(uid, processed, prompt_batch.extract_cache(idx))
+                except Exception:
+                    logger.debug(
+                        "[prefix_cache_save] native hook failed for uid=%s",
+                        uid,
+                        exc_info=True,
+                    )
+
+            if uid in _saved_prompt_cache_uids:
+                continue
+            if not getattr(response, "end_of_prompt", False):
+                continue
+            try:
+                idx = generation_uids.index(uid)
+                prompt_cache_save(uid, generation_batch.extract_cache(idx))
+                _saved_prompt_cache_uids.add(uid)
+            except Exception:
+                logger.debug(
+                    "[prompt_cache_save] native hook failed for uid=%s",
+                    uid,
+                    exc_info=True,
+                )
+        return prompt_responses, generation_responses
+
+    batch_gen._next = _next_with_prompt_cache_save
+    logger.info("[prompt_cache_save] native mlx-lm hook installed")
+
+
 def _install_mtp(
     batch_gen: "BatchGenerator",
     model: Any,
@@ -1350,10 +1414,16 @@ class Scheduler:
                 requests=self.requests,
             )
         elif need_chunked and not _has_old_batch_api:
+            if self.memory_aware_cache is not None:
+                _install_native_prompt_cache_save(
+                    bg,
+                    self._make_prompt_cache_save_callback(),
+                    prefix_cache_save=self._make_native_prefix_cache_save_callback(),
+                )
             logger.warning(
                 "[chunked_prefill] Skipped — mlx-lm 0.31+ removed the internal "
                 "Batch API. Using native prefill_step_size=%d instead. "
-                "Memory-aware cache and mid-prefill snapshots are unavailable.",
+                "Mid-prefill snapshots are unavailable.",
                 self.config.prefill_step_size,
             )
 
@@ -1412,6 +1482,39 @@ class Scheduler:
                 )
 
         return _prompt_cache_save
+
+    def _make_native_prefix_cache_save_callback(self):
+        """Create a callback that stores native segment-boundary cache."""
+        import time as _time
+
+        def _prefix_cache_save(uid, processed_tokens, extracted_cache):
+            request_id = self.uid_to_request_id.get(uid)
+            if not request_id:
+                return
+            request = self.requests.get(request_id)
+            if not request or not request.prompt_token_ids:
+                return
+            if processed_tokens <= 0 or processed_tokens >= len(
+                request.prompt_token_ids
+            ):
+                return
+
+            prefix_tokens = list(request.prompt_token_ids[:processed_tokens])
+            _t0 = _time.monotonic()
+            stored = self.memory_aware_cache.store(
+                prefix_tokens,
+                extracted_cache,
+                evict_prefixes=False,
+            )
+            _dt = _time.monotonic() - _t0
+            if stored:
+                logger.info(
+                    f"[prefix_cache_save] request={request_id[:12]} "
+                    f"prefix_tokens={processed_tokens}/{len(request.prompt_token_ids)} "
+                    f"store_time={_dt:.3f}s"
+                )
+
+        return _prefix_cache_save
 
     def _make_mid_prefill_save_callback(self, save_interval: int):
         """Create a callback for saving intermediate KV cache during chunked prefill.
@@ -2004,13 +2107,52 @@ class Scheduler:
             )
 
             try:
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
-                    caches=[cache_to_use] if cache_to_use else None,
-                    samplers=[request_sampler],
-                    logits_processors=request_logits_processors,
+                prefix_boundaries = [
+                    int(boundary)
+                    for boundary in (
+                        getattr(request, "prefix_boundaries", None) or []
+                    )
+                    if isinstance(boundary, int | float)
+                ]
+                prefix_boundary = int(getattr(request, "prefix_boundary", 0) or 0)
+                if prefix_boundary > 0:
+                    prefix_boundaries.append(prefix_boundary)
+                prefix_boundaries = sorted(
+                    {
+                        boundary
+                        for boundary in prefix_boundaries
+                        if 0 < boundary < len(tokens_to_process)
+                    }
                 )
+                use_segmented_prompt = (
+                    cache_to_use is None
+                    and bool(prefix_boundaries)
+                    and hasattr(self.batch_generator, "insert_segments")
+                )
+                if use_segmented_prompt:
+                    segments = []
+                    start = 0
+                    for boundary in prefix_boundaries:
+                        if boundary > start:
+                            segments.append(tokens_to_process[start:boundary])
+                            start = boundary
+                    if start < len(tokens_to_process):
+                        segments.append(tokens_to_process[start:])
+                    uids = self.batch_generator.insert_segments(
+                        [segments],
+                        max_tokens=[request.sampling_params.max_tokens],
+                        caches=None,
+                        samplers=[request_sampler],
+                        logits_processors=request_logits_processors,
+                    )
+                else:
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process],
+                        max_tokens=[request.sampling_params.max_tokens],
+                        caches=[cache_to_use] if cache_to_use else None,
+                        samplers=[request_sampler],
+                        logits_processors=request_logits_processors,
+                    )
             except Exception as e:
                 if cache_to_use is not None:
                     logger.warning(

@@ -9,14 +9,12 @@ import os
 import signal
 import statistics
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACT_ROOT = Path(os.environ.get("BENCH_ARTIFACT_DIR", "/tmp/rapid-mlx-bench"))
@@ -29,6 +27,7 @@ MODEL_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit"
 DRAFTER_35B = "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-DFlash"
 MODEL_27B = "/Users/samuelfajreldines/dev/models/Qwen3.6-27B-UD-Q4_K_XL-mlx"
 DRAFTER_27B = "/Users/samuelfajreldines/dev/models/Qwen3.6-27B-DFlash"
+SPEC_PREFILL_DRAFT = "/Users/samuelfajreldines/dev/models/Qwen3-1.7B-4bit-mlx"
 
 
 @dataclass(frozen=True)
@@ -120,6 +119,11 @@ def server_command(profile: Profile) -> list[str]:
                 "--structured-cot-tools",
                 "--agentic-guard",
                 "--pin-system-prompt",
+                "--speculative-prefill",
+                "--speculative-prefill-draft-model",
+                SPEC_PREFILL_DRAFT,
+                "--speculative-prefill-ratio",
+                "0.85",
             ]
         )
     cmd.extend(
@@ -524,6 +528,41 @@ def format_seconds(value: Any) -> str:
 
 def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> None:
     summaries = [(item, profile_summary(item)) for item in results]
+    total_runs = sum(summary["runs"] for _, summary in summaries)
+    total_valid = sum(summary["validation_success"] for _, summary in summaries)
+    optimized_valid = sum(
+        summary["validation_success"]
+        for item, summary in summaries
+        if item["profile"]["optimized"]
+    )
+    baseline_valid = sum(
+        summary["validation_success"]
+        for item, summary in summaries
+        if not item["profile"]["optimized"]
+    )
+    if total_runs and total_valid == total_runs:
+        conclusion = (
+            "5/ Conclusao: todos os perfis validaram. Compare a linha de speedup "
+            "por modelo para confirmar aceleracao fim-a-fim com qualidade igual."
+        )
+    elif optimized_valid and optimized_valid == baseline_valid:
+        conclusion = (
+            "5/ Conclusao: baseline e otimizado tiveram a mesma quantidade de "
+            "runs validados, mas nem todos os runs passaram; qualidade ainda exige "
+            "analise dos artefatos brutos."
+        )
+    elif optimized_valid:
+        conclusion = (
+            "5/ Conclusao: o perfil otimizado validou mais runs que o baseline "
+            "neste conjunto, mas qualidade igual so deve ser aceita quando os dois "
+            "perfis validarem os mesmos requisitos."
+        )
+    else:
+        conclusion = (
+            "5/ Conclusao: nenhum perfil otimizado atingiu sucesso completo. "
+            "Neste teste, throughput parcial nao basta se agente nao termina e "
+            "valida."
+        )
     lines = [
         "# Benchmark Rapid-MLX: agente local sem vs com otimizacao",
         "",
@@ -571,8 +610,8 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
             f"- Timeout do agente: `{args.pi_timeout}s`.",
             f"- Timeout por comando de validacao: `{args.validation_timeout}s`.",
             "- Baseline: target model sem drafter, sem DDTree, sem ngram fallback, sem structured-cot tool guard.",
-            "- Otimizado: target model + drafter DFlash pareado, DDTree budget 4, adaptive off, fallback ngram, thinking ngram, structured-cot e structured-cot-tools.",
-            "- `pi` usa provider local OpenAI-compatible via `PI_CODING_AGENT_DIR`, `rapid-mlx` em `http://127.0.0.1:8010/v1`, `temperature=0`, `max_tokens=2048`.",
+            "- Otimizado: target model + drafter DFlash pareado, Speculative Prefill conservador com draft pequeno, DDTree budget 4, adaptive off, fallback ngram, thinking ngram, structured-cot e structured-cot-tools.",
+            "- `pi` usa provider local OpenAI-compatible via `PI_CODING_AGENT_DIR`, `rapid-mlx` em `http://127.0.0.1:8010/v1`, `temperature=0`, `max_tokens=4096`.",
             "- Validacao: instala dependencias com package manager detectado, roda `test` quando existir ou for pedido, roda `build`/`lint` quando existirem.",
             "- Tok/s e diagnostico de servidor, nao criterio de sucesso. Runs longos podem trocar entradas antigas do `/v1/requests`; `BENCHMARK.py` agora faz polling para novos reruns.",
             "",
@@ -601,7 +640,7 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
             "",
             "4/ Resultado bom = run termina, projeto nasce em pasta limpa, testes passam, build passa. Resultado ruim = timeout, erro de tool-call, pacote incompleto, ou validacao quebrada.",
             "",
-            "5/ Conclusao: nenhum perfil atingiu sucesso completo. Neste teste, as otimizacoes nao produziram ganho fim-a-fim confiavel; throughput parcial nao basta se agente nao termina e valida.",
+            conclusion,
             "",
             f"6/ Artefatos brutos: `{ARTIFACT_ROOT}`. JSON completo: `{ARTIFACT_ROOT / 'results.json'}`.",
             "",
@@ -611,7 +650,10 @@ def write_markdown(results: list[dict[str, Any]], args: argparse.Namespace) -> N
 
 
 def run_profile(profile: Profile, args: argparse.Namespace) -> dict[str, Any]:
-    for path in [Path(profile.target), *( [Path(profile.drafter)] if profile.drafter else [] )]:
+    paths = [Path(profile.target), *([Path(profile.drafter)] if profile.drafter else [])]
+    if profile.optimized:
+        paths.append(Path(SPEC_PREFILL_DRAFT))
+    for path in paths:
         if not path.exists():
             raise FileNotFoundError(f"missing model path for {profile.key}: {path}")
 

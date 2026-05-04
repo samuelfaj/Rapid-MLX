@@ -1,13 +1,15 @@
 import asyncio
+import json
 
-from vllm_mlx.routes.chat import _iterate_with_idle_timeout
 from vllm_mlx.routes.chat import (
     _AGENTIC_TOOL_USE_SYSTEM_SUFFIX,
     _agentic_completion_needs_verification,
+    _agentic_diagnostic_tool_call,
     _agentic_failed_validation_present,
     _agentic_requested_artifacts_missing,
     _agentic_task_terminal_ready,
     _agentic_verification_present,
+    _iterate_with_idle_timeout,
     _last_tool_result_missing_dependency,
 )
 from vllm_mlx.service.helpers import _disconnect_guard
@@ -438,6 +440,124 @@ def test_agentic_requested_artifacts_missing_requires_tests_for_each_service():
     )
 
     assert missing == {"test"}
+
+
+def test_agentic_requested_artifacts_missing_accepts_dot_service_test_names():
+    assert not _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Create a REST app that is vertical sliced with models, "
+                    "seeders, migrations, services, and unit tests for each service."
+                ),
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/models/User.model.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/services/user.service.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/services/user.service.test.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/routes/user.routes.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/migrations/001-users.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path": "src/features/users/seeders/001-users.ts"}'
+                            ),
+                        }
+                    }
+                ],
+            },
+        ]
+    )
+
+
+def test_agentic_diagnostic_tool_call_uses_created_manifest_root():
+    tool_call = _agentic_diagnostic_tool_call(
+        [
+            {"role": "user", "content": "Create the project."},
+            {
+                "role": "tool",
+                "content": (
+                    "Successfully wrote 42 bytes to "
+                    "/tmp/rest-api-project/package.json"
+                ),
+            },
+            {
+                "role": "tool",
+                "content": (
+                    "Successfully wrote 42 bytes to "
+                    "/tmp/rest-api-project/src/features/users/services/user.service.ts"
+                ),
+            },
+        ]
+    )
+    arguments = json.loads(tool_call.function.arguments)
+
+    assert arguments["command"].startswith("cd /tmp/rest-api-project && ")
+    assert "VALIDATION_PASSED" in arguments["command"]
 
 
 def test_agentic_detection_reads_tool_transcript_when_original_user_pruned():

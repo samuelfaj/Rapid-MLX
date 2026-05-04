@@ -11,16 +11,31 @@ from vllm_mlx.api.models import ChatCompletionRequest
 from vllm_mlx.domain.events import StreamEvent
 from vllm_mlx.engine import GenerationOutput
 from vllm_mlx.routes.chat import (
-    _AGENTIC_DIAGNOSTIC_COMMAND,
+    _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT,
+    _AGENTIC_BUN_TEST_REPAIR_PROMPT,
     _AGENTIC_DEPENDENCY_INSTALL_COMMAND,
-    _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
+    _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT,
+    _AGENTIC_DIAGNOSTIC_COMMAND,
+    _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT,
     _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
+    _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC,
     _AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC,
+    _AGENTIC_MISSING_ARTIFACT_PROMPT,
     _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS,
     _AGENTIC_REPAIR_USER_PROMPT,
+    _AGENTIC_REPEATED_PATH_REPAIR_PROMPT,
+    _AGENTIC_REPEATED_TOOL_PROMPT,
+    _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT,
+    _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT,
+    _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT,
     _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS,
     _agentic_max_same_command_tools_since_latest_failure,
     _agentic_max_same_path_tools_since_latest_failure,
+    _agentic_max_same_path_tools_without_validation,
+    _agentic_missing_artifact_prompt,
+    _agentic_repair_prompt,
+    _agentic_requested_artifacts_missing,
+    _last_tool_result_indicates_failure,
     stream_chat_completion,
 )
 from vllm_mlx.service.helpers import (
@@ -203,6 +218,7 @@ class _FakeStreamingPostProcessor:
 class _FakeRepeatedWritePostProcessor(_FakeStreamingPostProcessor):
     def process_chunk(self, output):
         if self.index == 0:
+            self.index += 1
             return [
                 StreamEvent(
                     type="tool_call",
@@ -428,6 +444,68 @@ class _FakeAgenticLongTextThenToolPostProcessor(_FakeStreamingPostProcessor):
                         "function": {
                             "name": "bash",
                             "arguments": '{"command":"npm test"}',
+                        },
+                    }
+                ],
+                finish_reason="tool_calls",
+                tool_calls_detected=True,
+            )
+        ]
+
+
+class _FakeDestructiveBashThenWritePostProcessor(_FakeStreamingPostProcessor):
+    def process_chunk(self, output):
+        if self.index == 0:
+            if getattr(self, "_emitted_delete", False):
+                return []
+            self._emitted_delete = True
+            return [
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_delete_src",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": "",
+                            },
+                        }
+                    ],
+                    tool_calls_detected=True,
+                ),
+                StreamEvent(
+                    type="tool_call",
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "function": {
+                                "arguments": (
+                                    '{"command":"rm -rf '
+                                    '/tmp/generated-api/src"}'
+                                ),
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                    tool_calls_detected=True,
+                ),
+            ]
+        if getattr(self, "_emitted_repair", False):
+            return []
+        self._emitted_repair = True
+        return [
+            StreamEvent(
+                type="tool_call",
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_repair_file",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": '{"path":"src/index.ts","content":"ok"}',
                         },
                     }
                 ],
@@ -715,6 +793,54 @@ async def test_tool_auto_allows_text_final_after_tool_result(monkeypatch):
     assert not any('"tool_calls"' in chunk for chunk in chunks)
 
 
+def test_agentic_local_import_failure_uses_import_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "error: Cannot find module '../../src/modules/users/services/user.service' "
+                "from '/tmp/app/src/modules/users/services/user.service.test.ts'"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT
+
+
+def test_agentic_bun_jest_failure_uses_bun_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "ReferenceError: jest is not defined\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_BUN_TEST_REPAIR_PROMPT
+
+
+def test_agentic_bun_jest_install_uses_manifest_repair_prompt():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "VALIDATION_FAILED\n"
+                "bun install v1.3.13\n"
+                "+ jest@29.7.0\n"
+                "+ ts-jest@29.4.9\n"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT
+    )
+
+
 @pytest.mark.asyncio
 async def test_structured_cot_tools_does_not_enable_agentic_guard(monkeypatch):
     """Structured CoT for tools should not force agentic retries by itself."""
@@ -884,6 +1010,85 @@ async def test_agentic_guard_allows_long_text_before_tool_call(monkeypatch):
     assert engine.calls == 1
     assert not any('"content":"' + ("x" * 20) in chunk for chunk in chunks)
     assert any("call_after_agentic_long_text" in chunk for chunk in chunks)
+
+
+@pytest.mark.asyncio
+async def test_agentic_guard_blocks_destructive_source_tree_delete(monkeypatch):
+    """Agentic guard should retry instead of streaming rm -rf for existing artifacts."""
+    from vllm_mlx.config import get_config, reset_config
+    from vllm_mlx.service import postprocessor
+
+    reset_config()
+    cfg = get_config()
+    cfg.agentic_guard = True
+    _FakeStreamingPostProcessor.instances = 0
+    monkeypatch.setattr(
+        postprocessor,
+        "StreamingPostProcessor",
+        _FakeDestructiveBashThenWritePostProcessor,
+    )
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_choice="auto",
+    )
+    engine = _EngineThatStreamsTwoChunks()
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/index.ts","content":"ok"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "Successfully wrote src/index.ts"},
+    ]
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert engine.calls == 2
+    assert (
+        engine.messages_seen[1][-1]["content"]
+        == _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT
+    )
+    assert not any("call_delete_src" in chunk for chunk in chunks)
+    assert any("call_repair_file" in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio
@@ -1267,12 +1472,380 @@ def test_agentic_diagnostic_and_repair_prompt_are_generic():
     assert "express" not in _AGENTIC_DIAGNOSTIC_COMMAND.lower()
     assert "sequelize" not in _AGENTIC_DIAGNOSTIC_COMMAND.lower()
     assert "Do not expand scope" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "migrations" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "seed data" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "unit tests for each service" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "not only controllers, routes, or models" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not require real external services" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "static data-model methods that require registration" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "register the data models in a local disposable test instance" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "including createdAt and updatedAt" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "Do not import production database singletons into" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "service unit test fails with ECONNREFUSED" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not edit the production database config to make tests pass" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "register only the explicit model classes the service uses" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fresh instance per test or close it in suite cleanup" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "replace unsupported mock-runner calls with simple" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "Bun reports jest is not defined" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "remove extra non-service tests that the user did not request" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fix every affected test file in one pass" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "Do not leave imports pointing at files that are absent" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "create the complete missing sibling feature slice" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "ReferenceError" in _AGENTIC_REPAIR_USER_PROMPT
     assert "package.json or install" not in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_REPAIR_USER_PROMPT
     assert "source and test directory structure" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "import the service/model from the same feature first" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "Count path segments when fixing imports" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "use ./serviceName, not ../../services" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "../models/modelName, not ../../models/modelName" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "src/config, use ../../../config, not ../../config" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "Do not put ../src or ./src in a relative import" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "remove or replace those integration tests with isolated unit tests" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "do not call router" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "pass actual handler functions" in _AGENTIC_REPAIR_USER_PROMPT
     assert "named import/export errors" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "package module does not export a named symbol" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "prefer deleting that symbol usage or replacing it with plain local checks" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "fix every importer using that package consistently" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
     assert "duplicate declarations" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "no default export" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "expects either a default export or a named export matching" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "export named symbol was not found" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "before initialization" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "do not use a read-only shell command" in _AGENTIC_REPAIR_USER_PROMPT
+    assert "latest tool output is source file contents" in (
+        _AGENTIC_REPAIR_USER_PROMPT
+    )
+    assert "model/ORM loader reports" in _AGENTIC_REPAIR_USER_PROMPT
     assert "no tests were found" in _AGENTIC_DIAGNOSTIC_COMMAND
+    assert "runtime configuration" in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    assert "stop alternating named and default exports" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
+    assert "register explicit model classes" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
+    assert "oldText was missing or edits overlapped" in (
+        _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
+    )
+    assert "stop toggling that file" in _AGENTIC_REPEATED_TOOL_PROMPT
+    assert "feature-sliced architecture" in _AGENTIC_MISSING_ARTIFACT_PROMPT
+    assert "regroup them under feature or domain directories" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "Do not rewrite or duplicate a category" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "seed files exist but migration files do not" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "Add missing categories to the existing feature/domain slices" in (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+    )
+    assert "do not invent a new feature" in _AGENTIC_MISSING_ARTIFACT_PROMPT
+    assert "REST/API request with no route files" in _AGENTIC_MISSING_ARTIFACT_PROMPT
+    assert "express" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
+    assert "sequelize" not in _AGENTIC_REPEATED_PATH_REPAIR_PROMPT.lower()
+
+
+def test_agentic_repair_prompt_prioritizes_service_db_test_failures():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "src/modules/tasks/services/task.service.test.ts:\n"
+                "SequelizeConnectionRefusedError: ECONNREFUSED\n"
+                "(fail) TaskService > create"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    assert "Do not edit, write, or rewrite src/config/database.ts" in (
+        _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    )
+    assert "Fix the failing *.service.test.ts files instead" in (
+        _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    )
+
+
+def test_agentic_repair_prompt_prioritizes_sequelize_column_order_failures():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "RUNNING_VALIDATION: bun test\n"
+                "error: @Column annotation is missing for "
+                '"createdAt" of class "User" or annotation order is wrong.\n'
+                "at /tmp/app/src/features/users/models/user.model.ts:40:11\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "Fix the model file named in the stack trace" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "@Column must be the decorator closest to the property" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+    assert "@PrimaryKey, then @Default(DataType.UUIDV4), then" in (
+        _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    )
+
+
+def test_agentic_repair_prompt_handles_missing_service_instance_methods():
+    messages = [
+        {
+            "role": "tool",
+            "content": (
+                "src/modules/orders/services/order.service.test.ts:\n"
+                "TypeError: order.update is not a function\n"
+                "at update (/tmp/app/src/modules/orders/services/order.service.ts:59:17)\n"
+                "VALIDATION_FAILED"
+            ),
+        }
+    ]
+
+    assert _agentic_repair_prompt(messages) == (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    )
+    assert "Fix the failing *.service.test.ts file" in (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    )
+    assert "includes the exact async instance method" in (
+        _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    )
+
+
+def test_agentic_guard_treats_typeerror_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "TypeError: undefined is not an object "
+                "(evaluating 'Object.getOwnPropertyDescriptor(target, propertyName)')"
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+    for index in range(
+        _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+    ):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "edit",
+                            "arguments": (
+                                '{"path":"src/models/user.ts",'
+                                f'"edits":[{{"oldText":"a{index}",'
+                                f'"newText":"b{index}"}}]}}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "tool", "content": "edit applied"})
+
+    assert _agentic_max_same_path_tools_since_latest_failure(messages) == (
+        _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+    )
+
+
+def test_agentic_guard_treats_import_export_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "SyntaxError: Export named 'Order' not found in module "
+                "'/tmp/src/order.model.ts'. Did you mean to import default?"
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_treats_uninitialized_model_runtime_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "Model not initialized: Member \"create\" cannot be called. "
+                "User needs to be added to a local instance."
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_treats_noop_edit_output_as_failure():
+    messages = [
+        {"role": "user", "content": "Build the requested project."},
+        {
+            "role": "tool",
+            "content": (
+                "No changes made to src/service.test.ts. The replacement "
+                "produced identical content."
+            ),
+        },
+    ]
+
+    assert _last_tool_result_indicates_failure(messages)
+
+
+def test_agentic_guard_keeps_vertical_slice_missing_for_root_architecture_files():
+    messages = [
+        {
+            "role": "user",
+            "content": "Create a vertical sliced API with models, services, and tests.",
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/features/user/routes/user.routes.ts"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": '{"path":"src/models/user.model.ts"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    assert "vertical_slice" in _agentic_requested_artifacts_missing(messages)
+
+
+def test_agentic_guard_names_missing_requested_artifacts_in_repair_prompt():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Create services, migrations, seeders, and unit tests for each service."
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": (
+                            '{"path":"src/features/users/tests/users.test.ts",'
+                            '"content":"test"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "Successfully wrote "
+                "src/features/users/tests/users.test.ts"
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": (
+                            '{"path":"src/features/users/migrations/create-users.ts",'
+                            '"content":"migration"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "Successfully wrote "
+                "src/features/users/migrations/create-users.ts"
+            ),
+        },
+    ]
+
+    missing = _agentic_requested_artifacts_missing(messages)
+    prompt = _agentic_missing_artifact_prompt(messages)
+
+    assert "seeder" in missing
+    assert "service" in missing
+    assert "test" in missing
+    assert "Missing requested artifact categories:" in prompt
+    assert "seeder" in prompt
+    assert "service" in prompt
+    assert "test" in prompt
 
 
 @pytest.mark.asyncio
@@ -1847,7 +2420,12 @@ async def test_agentic_guard_blocks_repeated_same_path_after_repair_prompt(monke
                 ],
             }
         )
-        messages.append({"role": "tool", "content": "write applied"})
+        messages.append(
+            {
+                "role": "tool",
+                "content": "Successfully wrote src/main.tsx",
+            }
+        )
 
     engine = _EngineThatRepeatsToolThenAnswers()
     try:
@@ -1927,6 +2505,47 @@ def test_agentic_same_path_count_anchors_on_command_exit_failure():
         messages.append({"role": "tool", "content": "write applied"})
 
     assert _agentic_max_same_path_tools_since_latest_failure(messages) == 2
+
+
+def test_agentic_same_path_count_without_validation_catches_preflight_loops():
+    messages = [{"role": "user", "content": "Build the requested project."}]
+    for index in range(4):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": (
+                                '{"path":"src/modules/users/tests/user.routes.test.ts",'
+                                f'"content":"changed {index}"}}'
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "content": (
+                    "Successfully wrote "
+                    "src/modules/users/tests/user.routes.test.ts"
+                ),
+            }
+        )
+
+    assert _agentic_max_same_path_tools_without_validation(messages) == 4
+
+    messages.append(
+        {
+            "role": "tool",
+            "content": "VALIDATION_FAILED: validation command exited with status 1",
+        }
+    )
+    assert _agentic_max_same_path_tools_without_validation(messages) == 0
 
 
 def test_agentic_same_command_count_includes_repeated_inspection_after_failure():
@@ -2108,6 +2727,92 @@ async def test_agentic_guard_keeps_working_when_requested_artifact_missing():
         },
         {"role": "tool", "content": "1 pass\n0 fail"},
     ]
+    engine = _EngineThatAlwaysNarrates()
+
+    try:
+        chunks = [
+            chunk
+            async for chunk in stream_chat_completion(
+                engine,
+                messages,
+                request,
+                tool_continuation_retry=False,
+                max_tokens=16,
+            )
+        ]
+    finally:
+        reset_config()
+
+    assert any(
+        "artifact categories that are still absent" in message.get("content", "")
+        for message in engine.messages_seen[0]
+        if message.get("role") == "user"
+    )
+    assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_agentic_guard_prioritizes_missing_artifacts_before_diagnostic_loop():
+    from vllm_mlx.config import get_config, reset_config
+
+    reset_config()
+    get_config().agentic_guard = True
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "oi"}],
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        tool_choice="auto",
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Create services, migrations, seeders, and unit tests for each service.",
+        },
+    ]
+    for index in range(_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC):
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": (
+                                    '{"path":"src/modules/users/services/'
+                                    f'user{index}.service.ts"}}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": (
+                        "Successfully wrote "
+                        f"src/modules/users/services/user{index}.service.ts"
+                    ),
+                },
+            ]
+        )
     engine = _EngineThatAlwaysNarrates()
 
     try:

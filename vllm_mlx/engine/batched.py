@@ -12,15 +12,33 @@ LLM engine), so text-only requests must also be routed through it.
 """
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+from ..agentic_policy import classify_agentic_phase
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_output_text, extract_multimodal_content, is_mllm_model
+from ..speculative.prefill import (
+    SpeculativePrefillCompressor,
+    SpeculativePrefillConfig,
+)
 from ..utils.chat_template import apply_chat_template as shared_apply_chat_template
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+_TOOL_RESULT_COMPACT_KEEP_LAST = 4
+_TOOL_RESULT_COMPACT_MAX_CHARS = 1200
+_TOOL_RESULT_FAILURE_MARKERS = (
+    "error",
+    "failed",
+    "failure",
+    "traceback",
+    "exception",
+    "cannot find",
+    "not found",
+    "validation_failed",
+)
 
 # Check for guided generation availability
 try:
@@ -148,6 +166,7 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         force_mllm: bool = False,
         gpu_memory_utilization: float = 0.90,
+        speculative_prefill_config: SpeculativePrefillConfig | None = None,
     ):
         """
         Initialize the batched engine.
@@ -170,6 +189,9 @@ class BatchedEngine(BaseEngine):
         self._tool_logits_processor_factory = None
         self._structured_cot_enabled = False
         self._structured_cot_token_budget = 256
+        self._speculative_prefill = SpeculativePrefillCompressor(
+            speculative_prefill_config
+        )
 
         self._model = None
         self._processor = None  # For MLLM
@@ -481,6 +503,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -560,6 +584,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        prompt = self._maybe_compress_prompt(prompt, kwargs)
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all streaming when model is multimodal
             request_id = await self._mllm_scheduler.add_request_async(
@@ -597,10 +623,12 @@ class BatchedEngine(BaseEngine):
         logits_processor_factories = kwargs.pop("logits_processor_factories", None)
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        prefix_boundaries = kwargs.pop("prefix_boundaries", None)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            prefix_boundaries=prefix_boundaries,
             logits_processor_factories=logits_processor_factories,
         )
 
@@ -668,6 +696,18 @@ class BatchedEngine(BaseEngine):
             )
         )
 
+        messages = self._maybe_compress_last_user_message(
+            messages, tools_requested=bool(tools)
+        )
+        messages = self._maybe_compact_tool_results(messages)
+        from ..config.server_config import get_config
+
+        cfg = get_config()
+        if cfg.agentic_speculative_policy == "auto" and tools:
+            kwargs["agentic_speculative_policy"] = "auto"
+            kwargs["agentic_phase"] = classify_agentic_phase(messages, True)
+            kwargs["tool_call_expected"] = True
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -696,6 +736,7 @@ class BatchedEngine(BaseEngine):
                 if structured_cot
                 else None
             ),
+            speculative_prefill_applied=self._speculative_prefill.config.enabled,
             **kwargs,
         )
 
@@ -750,6 +791,92 @@ class BatchedEngine(BaseEngine):
         except Exception:
             return 0
 
+    def _maybe_compact_tool_results(
+        self,
+        messages: list[dict[str, Any]],
+        keep_last: int = _TOOL_RESULT_COMPACT_KEEP_LAST,
+    ) -> list[dict[str, Any]]:
+        tool_indexes = [
+            idx for idx, message in enumerate(messages) if message.get("role") == "tool"
+        ]
+        if len(tool_indexes) <= keep_last:
+            return messages
+        keep = set(tool_indexes[-keep_last:])
+        changed = False
+        compacted = list(messages)
+        for idx in tool_indexes:
+            if idx in keep:
+                continue
+            message = messages[idx]
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if len(content) <= _TOOL_RESULT_COMPACT_MAX_CHARS:
+                continue
+            lowered = content.lower()
+            if any(marker in lowered for marker in _TOOL_RESULT_FAILURE_MARKERS):
+                continue
+            paths = re.findall(r"(?:<path>|filePath['\"]?:\s*['\"])([^'\"<>\n]+)", content)
+            title = ""
+            if "Wrote file successfully" in content:
+                title = "Wrote file successfully."
+            elif "no output" in lowered:
+                title = "(no output)"
+            elif "installed" in lowered or "saved lockfile" in lowered:
+                title = "Command completed; dependencies/log output compacted."
+            else:
+                title = "Tool output compacted."
+            path_text = ""
+            if paths:
+                path_text = "\nPaths: " + ", ".join(sorted(set(paths))[:8])
+            compacted[idx] = {
+                **message,
+                "content": f"{title}{path_text}\n[older successful tool output compacted]",
+            }
+            changed = True
+        return compacted if changed else messages
+
+    def _compute_prefix_boundaries(
+        self,
+        prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        enable_thinking: bool | None = None,
+    ) -> list[int]:
+        try:
+            full_tokens = list(self.tokenizer.encode(prompt))
+        except Exception:
+            return []
+        if len(full_tokens) < 2:
+            return []
+
+        template_tools = convert_tools_for_template(tools) if tools else None
+        boundaries: list[int] = []
+        # Tool workflows repeatedly append assistant/tool pairs.  Cache every
+        # verified message boundary that is an actual token prefix of the full
+        # rendered prompt, so hybrid caches never need unsafe trimming.
+        for idx in range(1, len(messages)):
+            role = messages[idx - 1].get("role")
+            if role not in {"user", "assistant", "tool"}:
+                continue
+            try:
+                prefix_prompt = self._apply_chat_template(
+                    messages[:idx],
+                    template_tools,
+                    enable_thinking=enable_thinking,
+                )
+                prefix_tokens = list(self.tokenizer.encode(prefix_prompt))
+            except Exception:
+                continue
+            boundary = len(prefix_tokens)
+            if 0 < boundary < len(full_tokens) and full_tokens[:boundary] == prefix_tokens:
+                boundaries.append(boundary)
+
+        primary = self._compute_prefix_boundary(messages, tools)
+        if primary > 0:
+            boundaries.append(primary)
+        return sorted(set(boundaries))
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -800,6 +927,18 @@ class BatchedEngine(BaseEngine):
             )
         )
 
+        messages = self._maybe_compress_last_user_message(
+            messages, tools_requested=bool(tools)
+        )
+        messages = self._maybe_compact_tool_results(messages)
+        from ..config.server_config import get_config
+
+        cfg = get_config()
+        if cfg.agentic_speculative_policy == "auto" and tools:
+            kwargs["agentic_speculative_policy"] = "auto"
+            kwargs["agentic_phase"] = classify_agentic_phase(messages, True)
+            kwargs["tool_call_expected"] = True
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -815,11 +954,21 @@ class BatchedEngine(BaseEngine):
         prefix_boundary = self._compute_prefix_boundary(messages, tools)
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+        prefix_boundaries = self._compute_prefix_boundaries(
+            prompt,
+            messages,
+            tools,
+            enable_thinking,
+        )
+        if prefix_boundaries:
+            kwargs["prefix_boundaries"] = prefix_boundaries
         kwargs["tools_requested"] = bool(tools)
         if structured_cot:
             kwargs["logits_processor_factories"] = [
                 self._make_structured_cot_factory(prompt, structured_cot_token_budget)
             ]
+        if self._speculative_prefill.config.enabled:
+            kwargs["speculative_prefill_applied"] = True
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -849,6 +998,43 @@ class BatchedEngine(BaseEngine):
 
         return factory
 
+    def _maybe_compress_prompt(self, prompt: str, kwargs: dict[str, Any]) -> str:
+        if kwargs.pop("speculative_prefill_applied", False):
+            return prompt
+        if not self._speculative_prefill.config.enabled:
+            return prompt
+        result = self._speculative_prefill.compress(prompt, self.tokenizer)
+        return result.prompt
+
+    def _maybe_compress_last_user_message(
+        self, messages: list[dict[str, Any]], tools_requested: bool = False
+    ) -> list[dict[str, Any]]:
+        if not self._speculative_prefill.config.enabled:
+            return messages
+        has_tool_result = any(message.get("role") == "tool" for message in messages)
+        if tools_requested and has_tool_result:
+            self._speculative_prefill.last_result = None
+            return messages
+        last_user_idx = None
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+        if last_user_idx is None:
+            return messages
+        content = messages[last_user_idx].get("content")
+        if not isinstance(content, str):
+            return messages
+        result = self._speculative_prefill.compress(content, self.tokenizer)
+        if not result.applied:
+            return messages
+        compressed_messages = list(messages)
+        compressed_messages[last_user_idx] = {
+            **messages[last_user_idx],
+            "content": result.prompt,
+        }
+        return compressed_messages
+
     def get_stats(self) -> dict[str, Any]:
         """Get engine statistics."""
         stats = {
@@ -857,6 +1043,22 @@ class BatchedEngine(BaseEngine):
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
             "stream_interval": self._stream_interval,
+        }
+        prefill_result = self._speculative_prefill.last_result
+        stats["speculative_prefill"] = {
+            "enabled": self._speculative_prefill.config.enabled,
+            "last_applied": bool(prefill_result and prefill_result.applied),
+            "last_reason": prefill_result.reason if prefill_result else None,
+            "last_original_tokens": (
+                prefill_result.original_tokens if prefill_result else 0
+            ),
+            "last_compressed_tokens": (
+                prefill_result.compressed_tokens if prefill_result else 0
+            ),
+            "last_tokens_saved": prefill_result.tokens_saved if prefill_result else 0,
+            "last_draft_model_used": (
+                bool(prefill_result and prefill_result.draft_model_used)
+            ),
         }
 
         if self._mllm_scheduler:

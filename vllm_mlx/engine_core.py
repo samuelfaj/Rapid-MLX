@@ -285,6 +285,7 @@ class EngineCore:
         images: list[Any] | None = None,
         videos: list[Any] | None = None,
         prefix_boundary: int = 0,
+        prefix_boundaries: list[int] | None = None,
         logits_processor_factories: list[Any] | None = None,
     ) -> str:
         """
@@ -314,6 +315,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            prefix_boundaries=prefix_boundaries,
             logits_processor_factories=logits_processor_factories,
         )
 

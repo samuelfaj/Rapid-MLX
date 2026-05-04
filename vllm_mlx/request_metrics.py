@@ -110,6 +110,14 @@ class RequestRecorder:
         speculative_accepted_tokens: int | None = None,
         speculative_proposed_tokens: int | None = None,
         speculative_steps: int | None = None,
+        cached_tokens: int | None = None,
+        remaining_prefill_tokens: int | None = None,
+        tool_call_expected: bool | None = None,
+        tool_call_emitted: bool | None = None,
+        agentic_phase: str | None = None,
+        agentic_policy_decision: str | None = None,
+        agentic_policy_reason: str | None = None,
+        retry_or_parse_error: str | None = None,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -213,6 +221,14 @@ class RequestRecorder:
                 "speculative_accepted_tokens": speculative_accepted_tokens,
                 "speculative_proposed_tokens": speculative_proposed_tokens,
                 "speculative_steps": speculative_steps,
+                "cached_tokens": cached_tokens,
+                "remaining_prefill_tokens": remaining_prefill_tokens,
+                "tool_call_expected": tool_call_expected,
+                "tool_call_emitted": tool_call_emitted,
+                "agentic_phase": agentic_phase,
+                "agentic_policy_decision": agentic_policy_decision,
+                "agentic_policy_reason": agentic_policy_reason,
+                "retry_or_parse_error": retry_or_parse_error,
             }
             self._entries.append(record)
 

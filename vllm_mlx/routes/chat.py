@@ -99,8 +99,8 @@ _TOOL_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 4096
 _AGENTIC_TEXT_BEFORE_TOOL_CALL_MAX_CHARS = 20000
 _TOOL_CALL_REPEAT_BUFFER_MAX_ARGUMENT_CHARS = 65536
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
-_AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 8
-_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 6
+_AGENTIC_MAX_TOOL_RESULTS_BEFORE_DIAGNOSTIC = 4
+_AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 3
 _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC = 2
 _AGENTIC_RETRY_MAX_TOKENS = 4096
 _AGENTIC_NO_TOOL_RETRY_MAX_TOKENS = _AGENTIC_RETRY_MAX_TOKENS
@@ -137,6 +137,12 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "planning text, summaries, apologies, or any prose. Do not run the same "
     "diagnostic command again yet. Use write or edit now to fix the reported "
     "files, configuration, dependencies, or test failures. "
+    "Keep the original user request in scope: if it named artifact categories "
+    "such as source modules, tests, migrations, seed data, routes, controllers, "
+    "or configuration, the file inventory must include those categories before "
+    "you give a final answer. If the request asked for unit tests for each "
+    "service, create tests that exercise each service layer, not only "
+    "controllers, routes, or models. "
     "Fix the exact latest error before making unrelated changes. Do not expand scope "
     "with new features, entities, files, or frameworks unless the user request or "
     "the current validation error requires it. Read the latest tool output first; "
@@ -146,29 +152,237 @@ _AGENTIC_REPAIR_USER_PROMPT = (
     "changes, or because oldText was not unique, use write with the complete "
     "corrected file content instead of guessing another oldText block. If validation reports that no tests were found, create test files "
     "using the project's test naming convention before running validation again. "
+    "If validation already names the failing file, module, export, loader, or "
+    "initialization error, do not use a read-only shell command such as cat, sed, "
+    "ls, find, or grep as your next action unless the exact failing file is still "
+    "unknown. If the latest tool output is source file contents after a failed "
+    "validation, use write or edit to repair that file now. "
     "If the diagnostic inventory contains only manifests or root documentation "
     "while the requested task requires implementation files, create the missing "
     "source and test directory structure now. For module-not-found/import errors, "
     "calculate imports relative to the file being edited and the files that actually "
-    "exist on disk; do not guess from the repository root. If validation says a "
+    "exist on disk; do not guess from the repository root. When a unit test lives "
+    "inside a feature or module directory and is testing that feature's service, "
+    "import the service/model from the same feature first. Do not import a "
+    "sibling feature's service from that unit test unless the failing test is "
+    "explicitly testing cross-feature integration. Count path segments when "
+    "fixing imports: from src/features/<name>/file.ts to src/config use "
+    "../../config, from src/features/<name>/<subdir>/file.ts to src/config use "
+    "../../../config, from src/modules/<name>/file.ts to src/config use "
+    "../../config, from src/modules/<name>/<subdir>/file.ts to src/config use "
+    "../../../config, and from a feature-root file to that same feature's routes "
+    "or services use ./routes or ./services. If a test file sits in the same "
+    "directory as the source file it imports, use ./name, not ../name. From a test file inside a service "
+    "directory to the service beside it, use ./serviceName, not ../../services. "
+    "From src/modules/<name>/{services,models,migrations,seeds}/*.test.ts to "
+    "src/config, use ../../../config, not ../../config. "
+    "From src/modules/<name>/services/*.test.ts to the same module's models, use "
+    "../models/modelName, not ../../models/modelName. "
+    "Do not put ../src or ./src in a "
+    "relative import from a file already under src; imports are relative to the "
+    "current file, not to the project root. If the user asked for unit tests and "
+    "you created integration tests that fail from real database or cross-module "
+    "setup, remove or replace those integration tests with isolated unit tests "
+    "for the requested service layer. For HTTP route tests, do not call router "
+    "registration methods such as router.get(), router.post(), router.put(), or "
+    "router.delete() as if they execute requests; mount the router on a test app "
+    "and use the framework's request helper, or test handlers as plain functions. "
+    "If a route registration error says a callback function is required but an "
+    "object was provided, change the route module to pass actual handler "
+    "functions, not controller/service objects. If validation says a "
     "package cannot be found and the manifest already lists that dependency, run "
     "the package manager install command instead of editing tests to mock the "
     "missing dependency. For named import/export "
     "errors, only import symbols confirmed to exist in the dependency and remove or "
-    "replace any invalid symbol usages. Do not leave duplicate class fields, "
+    "replace any invalid symbol usages. If validation says a package module does "
+    "not export a named symbol, do not move that symbol to another package unless "
+    "the latest tool output confirms that package exports it. If the missing "
+    "symbol is optional validation or query-helper code, prefer deleting that "
+    "symbol usage or replacing it with plain local checks over importing it from "
+    "an unrelated framework package. When the same "
+    "missing export appears in multiple files, fix every importer using that "
+    "package consistently instead of changing one file at a time. Do not leave "
+    "duplicate class fields, "
     "duplicate functions, or duplicate declarations after edits. For missing runtime "
     "packages, update the project manifest or install the package before retrying. "
+    "For unit tests, do not require real external services such as databases, "
+    "network APIs, queues, or servers unless the user explicitly asked for an "
+    "integration test. If validation shows connection refused, model not "
+    "initialized, static data-model methods that require registration, or "
+    "similar external setup failures, change the test setup to mock the boundary "
+    "or initialize and register the data models in a local disposable test "
+    "instance before tests run. For service unit tests, call the service methods "
+    "under test; do not replace the service test with direct ORM model CRUD calls "
+    "unless that is the service API. For sequelize-typescript tests that use "
+    "static model methods, register every model on the local test Sequelize "
+    "instance with models: [Model] or sequelize.addModels([Model]) before the "
+    "first static call. For sequelize-typescript model tests, every "
+    "declared field used as a persisted column, including createdAt and "
+    "updatedAt, must have the appropriate sequelize-typescript decorator such "
+    "as @Column, @CreatedAt, or @UpdatedAt. Do not import production database singletons into "
+    "unit tests when those singletons connect to external services or can be "
+    "closed across tests; instead construct an isolated in-memory or local test "
+    "instance inside the test file and close it only after all tests that use it. "
+    "For sequelize-typescript unit or model tests, prefer creating the local "
+    "Sequelize instance directly in the test file and adding only the models under "
+    "test; do not import the production config/database singleton. "
+    "If a service unit test fails with ECONNREFUSED, ConnectionRefusedError, "
+    "or a closed ConnectionManager after a production database import, do not "
+    "edit the production database config to make tests pass. Rewrite every "
+    "affected service test to avoid the production config/database singleton: "
+    "mock the ORM/model boundary, or create a local in-memory test Sequelize "
+    "instance in that test file, register only the explicit model classes the "
+    "service uses, sync it in setup, and close it in that suite's final cleanup. "
+    "If validation says a connection manager, pool, client, or local test "
+    "instance was already closed, stop reusing the closed instance and create a "
+    "fresh instance per test or close it in suite cleanup after the final test. If "
+    "validation raises ReferenceError for a variable that is not defined, do "
+    "not assume globals; import it from an existing module or define it in the "
+    "failing file's setup. If validation shows mocked methods are undefined, "
+    "mock cleanup APIs do not exist, or response/request test doubles are "
+    "missing methods, replace unsupported mock-runner calls with simple "
+    "hand-written fakes or functions supported by the current test runner. When "
+    "Bun reports jest is not defined, do not use Jest globals; import mock, "
+    "spyOn, beforeEach, afterEach, describe, expect, and test from bun:test as "
+    "needed, or remove extra non-service tests that the user did not request. "
+    "If the user requested unit tests for each service, service tests are required; "
+    "migration, seed, model, route, and controller tests are optional and should "
+    "not block validation with unsupported test-runner APIs. When "
+    "the same test-double failure appears in multiple test files, fix every "
+    "affected test file in one pass. Do not leave imports pointing at files "
+    "that are absent from the inventory. If validation says a sibling "
+    "feature/module file cannot be found, either create the complete missing "
+    "sibling feature slice if it is part of the current requested project, or "
+    "remove the optional association/import and make the current feature "
+    "self-contained. If validation says a model imports an optional sibling "
+    "association that is absent, remove the optional association/import when the "
+    "user did not explicitly request that sibling domain; do not create a partial "
+    "sibling model only to satisfy the import. If validation says a config module such as config/database "
+    "cannot be found and the inventory has no matching config file, create the "
+    "missing config file instead of repeatedly changing relative import depth. "
+    "Do not keep tests blocked by an import to a feature directory that has no "
+    "model, service, route, migration, seed, and tests of its own. "
     "Only after changing files may you run validation again."
+    " If a module loader says no default export is defined or an export does "
+    "not satisfy a filename, fix the exporting module or explicit registration "
+    "that the loader uses; do not keep changing unrelated tests. If a loader "
+    "discovers files by filename and expects either a default export or a named "
+    "export matching the filename stem, make every discovered file follow that "
+    "same convention consistently. If validation "
+    "says an export named symbol was not found and suggests importing default, "
+    "inspect both the exporting file and all importers, then make the export "
+    "style consistent in one file change instead of toggling named and default "
+    "imports across retries. If validation "
+    "reports a value cannot be accessed before initialization, inspect circular "
+    "imports and move shared setup or lazy initialization to a module that does "
+    "not import the dependent feature back. If a model/ORM loader reports that a "
+    "file has no default export or no export matching its filename, rewrite that "
+    "model file so it exports a concrete class in the loader's expected style and "
+    "update related imports consistently."
 )
 _AGENTIC_FINAL_USER_PROMPT = (
     "The requested work is complete and the latest validation passed. "
     "Do not call any tools. Answer with a concise final summary only."
 )
+_AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT = (
+    "The latest validation failure is a service unit test trying to connect to "
+    "a real database (ECONNREFUSED, ConnectionRefusedError, or closed "
+    "ConnectionManager). Your entire next response must be one valid write or "
+    "edit tool call only. Do not edit, write, or rewrite src/config/database.ts "
+    "or any production database configuration to make unit tests pass. Fix the "
+    "failing *.service.test.ts files instead. Rewrite every affected service "
+    "unit test so it avoids production config/database imports and either mocks "
+    "the ORM/model boundary or creates a local in-memory test Sequelize instance "
+    "inside that test file, registers only the explicit model classes used by "
+    "that service, syncs it during setup, and closes it only in suite cleanup. "
+    "Use correct relative imports from the service test directory: service "
+    "beside the test uses ./serviceName, same-module models use "
+    "../models/modelName, and src/config from a nested services directory uses "
+    "../../../config only if a config import is truly needed."
+)
+_AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT = (
+    "The latest validation failure is a sequelize-typescript decorator order "
+    "error: '@Column annotation is missing'. Your entire next response must be "
+    "one valid write or edit tool call only. Fix the model file named in the "
+    "stack trace, not the service test. In sequelize-typescript, @Column must "
+    "be the decorator closest to the property in source order so its runtime "
+    "decorator call runs first. For UUID primary keys, use the exact source "
+    "order @PrimaryKey, then @Default(DataType.UUIDV4), then "
+    "@Column(DataType.UUID), then the property declaration. Put validation or "
+    "option decorators such as @CreatedAt, @UpdatedAt, @Default, @Length, "
+    "@IsEmail, @Min, @IsFloat, @ForeignKey, @BelongsTo, or @HasMany above "
+    "@Column, never below it. For timestamps, use the order "
+    "@CreatedAt, then @Default if needed, then @Column(DataType.DATE), then "
+    "the property declaration. Apply the same pattern to every property in the "
+    "failing model that combines @Column with other decorators. Do not run "
+    "validation again until the model file has changed."
+)
+_AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT = (
+    "The latest validation failure is a service unit test mock returning a "
+    "plain object that lacks an instance method called by the service, such as "
+    "update or destroy. Your entire next response must be one valid write or "
+    "edit tool call only. Fix the failing *.service.test.ts file, not the "
+    "service implementation, unless the service stack trace proves production "
+    "logic is wrong. Ensure every mocked findByPk/findOne result used by an "
+    "update, delete, save, destroy, or similar service path includes the exact "
+    "async instance method the service calls, and assert that method was called "
+    "with expected data. Do not run validation again until the test mock file "
+    "has changed."
+)
 _AGENTIC_REPEATED_TOOL_PROMPT = (
     "You repeated a validation or diagnostic tool call without fixing files. "
     "That is a loop. Use the existing tool output. Your next response must be "
     "a write or edit tool call that changes the project files needed to fix the "
-    "failure. Do not call bash again until after a file change."
+    "failure. Do not call bash again until after a file change. If the repeated "
+    "tool calls are changing the same file after an import/export, loader, or "
+    "initialization error, stop toggling that file. Either write the complete "
+    "file once with a consistent export style, or change the related loader, "
+    "registration, config, or importer that is actually enforcing the convention."
+)
+_AGENTIC_NO_CHANGE_REPAIR_PROMPT = (
+    "The previous tool result says the edit made no changes. That is not a "
+    "repair. Your entire next response must be one valid tool call only. Do "
+    "not use the same edit again. If the target file is still the file that "
+    "must change, use write with the complete corrected file content. If the "
+    "latest validation error points to a different file, edit or write that "
+    "different file instead. Do not run validation again until a file actually "
+    "changes."
+)
+_AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT = (
+    "The latest validation failure is a local import path error. Your entire "
+    "next response must be one valid write or edit tool call only. Do not "
+    "install a package for a relative path. Fix the import in the failing file "
+    "by calculating the path from that file's directory to the existing target "
+    "file. If the failing file already lives under src, do not import through "
+    "../src or ./src. Use ./ for same-directory modules and ../ only for real "
+    "parent directories. Do not run validation again until the import path has "
+    "changed."
+)
+_AGENTIC_BUN_TEST_REPAIR_PROMPT = (
+    "The latest validation failure is a Bun test using Jest APIs or Jest-only "
+    "types. Your entire next response must be one valid write or edit tool "
+    "call only. Do not install Jest to fix a Bun test. Replace jest.fn, "
+    "jest.clearAllMocks, jest.mock, and imports from jest with Bun-supported "
+    "test utilities from bun:test, such as mock, beforeEach, afterEach, "
+    "describe, expect, and test. Remove Jest-only type dependencies or globals "
+    "from the failing test files if they are only there for tests."
+)
+_AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT = (
+    "The latest tool output shows a Bun project installing or declaring Jest "
+    "test tooling. Your entire next response must be one valid write or edit "
+    "tool call only. Do not add new source features. Edit package.json to "
+    "remove jest, ts-jest, @types/jest, Jest scripts, and Jest config. Keep "
+    "Bun's test runner and bun:test types instead. If existing tests import "
+    "or call Jest APIs, update those tests to bun:test in the same file change "
+    "only when that file is the target."
+)
+_AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT = (
+    "Your previous shell tool call would delete source or generated project "
+    "artifacts that are still needed for the requested implementation. Do not "
+    "delete or reset the project tree. Your next response must be one valid tool "
+    "call only: write or edit the specific missing or broken files, or run a "
+    "non-destructive command only if it is required to create directories, "
+    "install dependencies, or validate after a file change."
 )
 _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "You repeatedly changed the same path after validation or diagnostic output "
@@ -178,18 +392,60 @@ _AGENTIC_REPEATED_PATH_REPAIR_PROMPT = (
     "path, use write with the complete corrected file content; do not use edit "
     "on that path again. If required implementation or test files are missing "
     "from the inventory, create those missing files now. "
+    "If the latest stack trace points at compiler, transpiler, test runner, or "
+    "runtime configuration instead of the edited source logic, change the "
+    "relevant config, manifest, or dependency setup rather than editing that "
+    "same source file again. "
+    "If the same import/export mismatch repeats, stop alternating named and "
+    "default exports. Inspect the runtime loader convention and every importer, "
+    "then rewrite the exporting file and affected imports consistently. If a "
+    "loader accepts either a default export or filename-matching named export "
+    "but the same file still fails after multiple rewrites, change the loader "
+    "registration/config to register explicit model classes or update all "
+    "importers instead of rewriting that same model file again. If an "
+    "edit failed because oldText was missing or edits overlapped, use write with "
+    "the complete corrected file content on the next attempt. "
     "If the latest error names a different file, edit that file. If you cannot "
     "identify the next file to change, run a targeted validation command that "
     "prints the exact failing file and error."
 )
 _AGENTIC_MISSING_ARTIFACT_PROMPT = (
-    "Validation output now appears successful, but the original request named "
-    "artifact categories that are still absent from the file inventory or from "
-    "the paths you created. Your next response must be one valid tool call only. "
+    "The original request named artifact categories that are still absent from "
+    "the file inventory or from the paths you created. Your next response must "
+    "be one valid tool call only. "
     "Inspect the original request and the current file inventory, then create the "
-    "missing requested artifact files. Do not give a final answer yet. After "
+    "missing requested artifact files. Do not rewrite or duplicate a category "
+    "that is already present while another requested category is still absent; "
+    "for example, if seed files exist but migration files do not, create the "
+    "migration files next instead of editing seed files again. If the request asked for unit tests for "
+    "each service, create service-layer tests for every service, not only "
+    "controller, route, or model tests. If the request asked for a vertical or "
+    "feature-sliced architecture and the inventory has root-level service, model, "
+    "route, controller, migration, or seed files, regroup them under feature or "
+    "domain directories so each feature owns its model/service/route/test and "
+    "related data setup instead of leaving shared root folders as the primary "
+    "structure. Add missing categories to the existing feature/domain slices "
+    "first; do not invent a new feature, domain, entity, or resource only to "
+    "satisfy a missing category unless the original request named it or no "
+    "feature slice exists yet. For a REST/API request with no route files, create "
+    "route/router files and wire them to the existing feature service before "
+    "adding another model or test. Do not give a final answer yet. After "
     "creating the missing artifacts, run validation again."
 )
+
+
+def _agentic_missing_artifact_prompt(messages: list) -> str:
+    missing = sorted(_agentic_requested_artifacts_missing(messages))
+    if not missing:
+        return _AGENTIC_MISSING_ARTIFACT_PROMPT
+    missing_text = ", ".join(missing)
+    return (
+        _AGENTIC_MISSING_ARTIFACT_PROMPT
+        + "\nMissing requested artifact categories: "
+        + missing_text
+        + ". Create files for one or more of these categories next, and do not "
+        "spend the next tool call on categories that are already present."
+    )
 _AGENTIC_DIAGNOSTIC_COMMAND = (
     "printf 'AGENTIC_DIAGNOSTIC\\n'; "
     "pwd; "
@@ -470,6 +726,14 @@ def _agentic_requested_artifact_terms(messages: list) -> set[str]:
     return requested
 
 
+def _agentic_user_request_text(messages: list) -> str:
+    return "\n".join(
+        _message_content_text(message)
+        for message in messages
+        if _agentic_message_role(message) == "user"
+    ).lower()
+
+
 def _agentic_created_artifact_paths(messages: list) -> list[str]:
     paths: list[str] = []
     for message in messages:
@@ -491,21 +755,79 @@ def _agentic_created_artifact_paths(messages: list) -> list[str]:
     return paths
 
 
+_AGENTIC_PROJECT_MANIFESTS = {
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "go.mod",
+    "cargo.toml",
+    "pom.xml",
+    "build.gradle",
+}
+
+
+def _agentic_project_root_from_messages(messages: list) -> str | None:
+    paths = _agentic_created_artifact_paths(messages)
+    for path in reversed(paths):
+        manifest_path = Path(path)
+        if manifest_path.name.lower() in _AGENTIC_PROJECT_MANIFESTS:
+            parent = str(manifest_path.parent)
+            return parent if parent and parent != "." else None
+
+    roots: Counter[str] = Counter()
+    for path in paths:
+        lower = path.lower()
+        marker = "/src/"
+        if marker in lower:
+            roots[path[: lower.index(marker)]] += 1
+        elif lower.startswith("src/"):
+            roots["."] += 1
+
+    for root, _count in roots.most_common():
+        if root and root != ".":
+            return root
+    return None
+
+
+def _agentic_diagnostic_command(messages: list | None = None) -> str:
+    root = _agentic_project_root_from_messages(messages or [])
+    if not root:
+        return _AGENTIC_DIAGNOSTIC_COMMAND
+    return f"cd {shlex.quote(root)} && {_AGENTIC_DIAGNOSTIC_COMMAND}"
+
+
+def _agentic_service_artifact_name(path: str) -> str:
+    stem = Path(path).stem.lower()
+    stem = re.sub(r"(?:[._-]?(?:test|spec))$", "", stem)
+    stem = re.sub(r"(?:[._-]?service)$", "", stem)
+    return stem.rstrip("._-")
+
+
 def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
     requested = _agentic_requested_artifact_terms(messages)
     if not requested:
         return set()
     paths = _agentic_created_artifact_paths(messages)
+    user_request = _agentic_user_request_text(messages)
     missing: set[str] = set()
     for term in requested:
         if term == "vertical_slice":
-            if not any(
+            has_feature_owned_path = any(
                 re.search(
                     r"(?:^|/)src/(?:modules|features|domains|slices)/[^/]+/",
                     path,
                 )
                 for path in paths
-            ):
+            )
+            has_root_architecture_path = any(
+                re.search(
+                    r"(?:^|/)src/(?:models|services|routes|controllers|repositories)/",
+                    path,
+                )
+                for path in paths
+            )
+            if not has_feature_owned_path or has_root_architecture_path:
                 missing.add(term)
             continue
         variants = _AGENTIC_REQUESTED_ARTIFACT_TERMS[term]
@@ -513,16 +835,21 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
             missing.add(term)
     if "service" in requested and "test" in requested:
         service_names = {
-            re.sub(r"(?:service|\.service)$", "", Path(path).stem).lower()
+            _agentic_service_artifact_name(path)
             for path in paths
             if "service" in path and "test" not in path and "spec" not in path
         }
         tested_names = {
-            re.sub(r"(?:service|\.service|test|spec)$", "", Path(path).stem).lower()
+            _agentic_service_artifact_name(path)
             for path in paths
             if ("test" in path or "spec" in path) and "service" in path
         }
         if service_names and not service_names.issubset(tested_names):
+            missing.add("test")
+        if (
+            re.search(r"\btests?\s+for\s+each\s+service\b", user_request)
+            and not tested_names
+        ):
             missing.add("test")
     return missing
 
@@ -679,6 +1006,8 @@ def _last_tool_result_missing_dependency(messages: list) -> str | None:
             package_name = package_match.group(1)
             if package_name.startswith((".", "/")) or package_name.startswith("file:"):
                 return None
+            if package_name == "jest" and "bun test" in lower_text:
+                return None
             return package_name
         if "dependencies_missing" in lower_text:
             return ""
@@ -708,6 +1037,179 @@ def _last_tool_result_missing_dependency(messages: list) -> str | None:
             return ""
         return None
     return None
+
+
+def _last_tool_result_service_db_test_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        has_db_failure = any(
+            marker in text
+            for marker in (
+                "econnrefused",
+                "connectionrefusederror",
+                "connection manager was closed",
+                "connectionmanager.getconnection",
+            )
+        )
+        has_service_test_context = (
+            ".service.test" in text
+            or "/services/" in text
+            or re.search(r"\b\w*service\s*>", text) is not None
+        )
+        return has_db_failure and has_service_test_context
+    return False
+
+
+def _last_tool_result_sequelize_column_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return "@column annotation is missing" in text
+    return False
+
+
+def _last_tool_result_service_instance_mock_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        has_service_test_context = ".service.test" in text or "/services/" in text
+        has_missing_instance_method = re.search(
+            r"typeerror:\s+\w+\.(?:update|destroy|save|reload|restore)\s+is not a function",
+            text,
+        )
+        return has_service_test_context and has_missing_instance_method is not None
+    return False
+
+
+def _last_tool_result_no_change(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        return (
+            "no changes made" in text
+            or "replacement produced identical content" in text
+            or "oldtext was not found" in text
+            or "oldtext must be unique" in text
+        )
+    return False
+
+
+def _last_tool_result_local_import_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "cannot find module" not in text:
+            return False
+        module_match = re.search(r"cannot find module\s+['\"]([^'\"]+)['\"]", text)
+        if not module_match:
+            return False
+        module_name = module_match.group(1)
+        return (
+            module_name.startswith((".", "/"))
+            or "/src/" in module_name
+            or module_name.startswith("src/")
+        )
+    return False
+
+
+def _last_tool_result_bun_jest_failure(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "bun test" not in text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "jest is not defined",
+                "jest.fn is not a function",
+                "jest.clearallmocks is not a function",
+                "cannot find package 'jest'",
+                'cannot find package "jest"',
+            )
+        )
+    return False
+
+
+def _last_tool_result_bun_jest_manifest(messages: list) -> bool:
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "tool":
+            continue
+        text = _message_content_text(message).lower()
+        if "bun " not in text and "bun-types" not in text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "+ jest@",
+                "+ ts-jest@",
+                "+ @types/jest@",
+                '"jest"',
+                '"ts-jest"',
+                '"@types/jest"',
+            )
+        )
+    return False
+
+
+def _agentic_repair_prompt(messages: list) -> str:
+    if _last_tool_result_no_change(messages):
+        return _AGENTIC_NO_CHANGE_REPAIR_PROMPT
+    if _last_tool_result_local_import_failure(messages):
+        return _AGENTIC_LOCAL_IMPORT_REPAIR_PROMPT
+    if _last_tool_result_bun_jest_manifest(messages):
+        return _AGENTIC_BUN_JEST_MANIFEST_REPAIR_PROMPT
+    if _last_tool_result_bun_jest_failure(messages):
+        return _AGENTIC_BUN_TEST_REPAIR_PROMPT
+    if _last_tool_result_sequelize_column_failure(messages):
+        return _AGENTIC_SEQUELIZE_COLUMN_REPAIR_PROMPT
+    if _last_tool_result_service_instance_mock_failure(messages):
+        return _AGENTIC_SERVICE_INSTANCE_MOCK_REPAIR_PROMPT
+    if _last_tool_result_service_db_test_failure(messages):
+        return _AGENTIC_SERVICE_DB_TEST_REPAIR_PROMPT
+    return _AGENTIC_REPAIR_USER_PROMPT
 
 
 def _last_tool_result_needs_dependency_install(messages: list) -> bool:
@@ -757,7 +1259,9 @@ def _agentic_tool_result_count_since_latest_failure(messages: list) -> int:
                 "failed",
                 " fail",
                 "error:",
+                "typeerror",
                 "referenceerror",
+                "undefined is not an object",
                 "couldn't find",
                 "cannot find",
                 "is not defined",
@@ -799,7 +1303,9 @@ def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
                     "failed",
                     " fail",
                     "error:",
+                    "typeerror",
                     "referenceerror",
+                    "undefined is not an object",
                     "couldn't find",
                     "cannot find",
                     "is not defined",
@@ -809,6 +1315,8 @@ def _agentic_max_same_path_tools_since_latest_failure(messages: list) -> int:
                     "no test files found",
                     "no tests found",
                     "no package.json",
+                    "no changes made",
+                    "replacement produced identical content",
                 )
             ):
                 seen_failure = True
@@ -843,7 +1351,9 @@ def _agentic_max_same_command_tools_since_latest_failure(messages: list) -> int:
                     "failed",
                     " fail",
                     "error:",
+                    "typeerror",
                     "referenceerror",
+                    "undefined is not an object",
                     "couldn't find",
                     "cannot find",
                     "is not defined",
@@ -866,6 +1376,21 @@ def _agentic_max_same_command_tools_since_latest_failure(messages: list) -> int:
     return max(counts.values(), default=0) if seen_failure else 0
 
 
+def _agentic_max_same_path_tools_without_validation(messages: list) -> int:
+    if _agentic_verification_present(messages) or _agentic_failed_validation_present(
+        messages
+    ):
+        return 0
+    counts: dict[tuple[str, str], int] = {}
+    for message in messages:
+        if _agentic_message_role(message) != "assistant":
+            continue
+        signature = _assistant_tool_call_path_signature(message)
+        if signature:
+            counts[signature] = counts.get(signature, 0) + 1
+    return max(counts.values(), default=0)
+
+
 def _last_tool_result_indicates_failure(messages: list) -> bool:
     for message in reversed(messages):
         role = (
@@ -882,10 +1407,19 @@ def _last_tool_result_indicates_failure(messages: list) -> bool:
                 "validation_failed",
                 "failed",
                 "error:",
-                "cannot find",
-                "not found",
-                "no such file",
+                "typeerror",
+                "model not initialized",
+                "undefined is not an object",
+                    "cannot find",
+                    "not found",
+                    "export named",
+                    "no default export",
+                    "does not satisfy filename",
+                    "before initialization",
+                    "no such file",
                 "oldtext",
+                "no changes made",
+                "replacement produced identical content",
                 "exit code 1",
                 "exited with code 1",
             )
@@ -922,14 +1456,14 @@ def _tool_names(tools) -> set[str]:
     return names
 
 
-def _agentic_diagnostic_tool_call() -> ToolCall:
+def _agentic_diagnostic_tool_call(messages: list | None = None) -> ToolCall:
     return ToolCall(
         id=f"call_{uuid.uuid4().hex[:8]}",
         function=FunctionCall(
             name="bash",
             arguments=json.dumps(
                 {
-                    "command": _AGENTIC_DIAGNOSTIC_COMMAND,
+                    "command": _agentic_diagnostic_command(messages),
                     "timeout": 120,
                 }
             ),
@@ -1110,6 +1644,83 @@ def _assembled_tool_call_path_signatures(
     return signatures
 
 
+def _assembled_tool_call_functions(
+    buffered_events: list[tuple],
+) -> list[tuple[str, object]]:
+    calls: dict[int, dict[str, object]] = {}
+    for event, _ in buffered_events:
+        for tool_call in getattr(event, "tool_calls", None) or []:
+            index = _tool_call_value(tool_call, "index")
+            if not isinstance(index, int):
+                index = len(calls)
+            assembled = calls.setdefault(index, {"name": None, "arguments": ""})
+
+            function = _tool_call_value(tool_call, "function", {}) or {}
+            name = _tool_call_value(function, "name")
+            if name:
+                assembled["name"] = str(name)
+
+            arguments = _tool_call_value(function, "arguments")
+            if arguments is not None:
+                assembled["arguments"] = str(assembled["arguments"] or "") + str(
+                    arguments
+                )
+
+    return [
+        (str(assembled.get("name") or ""), assembled.get("arguments"))
+        for assembled in calls.values()
+        if assembled.get("name")
+    ]
+
+
+def _decoded_tool_arguments(arguments: object) -> object:
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except (TypeError, ValueError):
+            return arguments
+    return arguments
+
+
+def _command_removes_artifact_tree(command: str) -> bool:
+    lower_command = command.lower()
+    if not re.search(
+        r"(?:^|[;&|]\s*)rm\s+-[a-z]*r[a-z]*f?",
+        lower_command,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(^|[\s'\"])(?:\./)?src(?:/|[\s'\"]|$)|"
+            r"/src(?:/|[\s'\"]|$)|"
+            r"(^|[\s'\"])\.(?:[\s'\"]|$)",
+            lower_command,
+        )
+    )
+
+
+def _buffered_agentic_destructive_command(
+    buffered_events: list[tuple],
+    messages: list,
+) -> bool:
+    if not _agentic_created_artifact_paths(messages):
+        return False
+    for name, arguments in _assembled_tool_call_functions(buffered_events):
+        if name not in {"bash", "shell", "exec", "run_command"}:
+            continue
+        decoded = _decoded_tool_arguments(arguments)
+        command = ""
+        if isinstance(decoded, dict):
+            candidate = decoded.get("command") or decoded.get("cmd")
+            if isinstance(candidate, str):
+                command = candidate
+        elif isinstance(decoded, str):
+            command = decoded
+        if command and _command_removes_artifact_tree(command):
+            return True
+    return False
+
+
 def _partial_tool_path_signature(name: str | None, arguments: str) -> tuple[str, str] | None:
     if not name:
         return None
@@ -1167,6 +1778,19 @@ def _buffered_tool_call_argument_chars(buffered_events: list[tuple]) -> int:
     return total
 
 
+def _first_tool_call_only(tool_calls: list[dict] | None) -> list[dict] | None:
+    if not tool_calls:
+        return tool_calls
+    filtered = []
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        index = tool_call.get("index", 0)
+        if index in (0, None):
+            filtered.append(tool_call)
+    return filtered or None
+
+
 def _stream_tool_call_repeats_recent(event, recent_signature) -> bool:
     if not recent_signature:
         return False
@@ -1209,29 +1833,43 @@ def _buffered_tool_call_repeats_recent_path(
     )
 
 
-async def _iterate_with_idle_timeout(async_iter, timeout: float):
+_STREAM_HEARTBEAT = object()
+
+
+async def _iterate_with_idle_timeout(
+    async_iter, timeout: float, heartbeat_interval: float = 15.0
+):
     iterator = async_iter.__aiter__()
     while True:
         task = asyncio.create_task(iterator.__anext__())
+        started = time.perf_counter()
         try:
-            done, _ = await asyncio.wait({task}, timeout=timeout)
-            if task not in done:
-                task.cancel()
-                try:
-                    await asyncio.wait_for(task, timeout=1.0)
-                except (
-                    asyncio.CancelledError,
-                    RuntimeError,
-                    StopAsyncIteration,
-                    TimeoutError,
-                ):
-                    pass
-                if hasattr(iterator, "aclose"):
+            while True:
+                remaining = timeout - (time.perf_counter() - started)
+                if remaining <= 0:
+                    task.cancel()
                     try:
-                        await asyncio.wait_for(iterator.aclose(), timeout=1.0)
-                    except (asyncio.CancelledError, RuntimeError, TimeoutError):
+                        await asyncio.wait_for(task, timeout=1.0)
+                    except (
+                        asyncio.CancelledError,
+                        RuntimeError,
+                        StopAsyncIteration,
+                        TimeoutError,
+                    ):
                         pass
-                raise TimeoutError
+                    if hasattr(iterator, "aclose"):
+                        try:
+                            await asyncio.wait_for(iterator.aclose(), timeout=1.0)
+                        except (asyncio.CancelledError, RuntimeError, TimeoutError):
+                            pass
+                    raise TimeoutError
+
+                done, _ = await asyncio.wait(
+                    {task}, timeout=min(heartbeat_interval, remaining)
+                )
+                if task in done:
+                    break
+                yield _STREAM_HEARTBEAT
             yield task.result()
         except StopAsyncIteration:
             return
@@ -1773,7 +2411,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 {
                     "role": "user",
                     "content": (
-                        _AGENTIC_REPAIR_USER_PROMPT
+                        _agentic_repair_prompt(messages)
                         if _agentic_failed_validation_present(messages)
                         else "You are not finished. Use the next required tool now."
                     ),
@@ -1996,13 +2634,18 @@ async def stream_chat_completion(
                 return [_fast_sse_chunk(event.reasoning, "reasoning_content")]
 
             if event.type == "tool_call":
+                tool_calls = event.tool_calls
+                if agentic_single_tool_call_mode:
+                    tool_calls = _first_tool_call_only(tool_calls)
+                    if not tool_calls:
+                        return []
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=_resolve_model_name(request.model),
                     choices=[
                         ChatCompletionChunkChoice(
                             delta=ChatCompletionChunkDelta(
-                                tool_calls=event.tool_calls,
+                                tool_calls=tool_calls,
                             ),
                             finish_reason=event.finish_reason,
                         )
@@ -2032,6 +2675,8 @@ async def stream_chat_completion(
                 return [f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"]
 
             return []
+
+        agentic_single_tool_call_mode = False
 
         def _format_forced_tool_call(tool_calls: list[ToolCall], output) -> str:
             stream_tool_calls = []
@@ -2071,6 +2716,19 @@ async def stream_chat_completion(
         agentic_repair_mode = (
             agentic_stream_guard and _agentic_failed_validation_present(messages)
         )
+        agentic_missing_requested_artifacts_without_validation = (
+            agentic_stream_guard
+            and not _agentic_verification_present(messages)
+            and bool(_agentic_requested_artifacts_missing(messages))
+            and _agentic_tool_result_count(messages)
+            >= _AGENTIC_MAX_TOOL_RESULTS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+            and not _last_tool_result_is_agentic_diagnostic(messages)
+        )
+        agentic_single_tool_call_mode = bool(
+            agentic_repair_mode
+            or agentic_missing_requested_artifacts
+            or agentic_missing_requested_artifacts_without_validation
+        )
         agentic_tool_results_since_failure = (
             _agentic_tool_result_count_since_latest_failure(messages)
         )
@@ -2079,6 +2737,9 @@ async def stream_chat_completion(
         )
         agentic_same_command_tools_since_failure = (
             _agentic_max_same_command_tools_since_latest_failure(messages)
+        )
+        agentic_same_path_tools_without_validation = (
+            _agentic_max_same_path_tools_without_validation(messages)
         )
         agentic_repeated_path_repair_mode = (
             agentic_stream_guard
@@ -2138,10 +2799,16 @@ async def stream_chat_completion(
                     )
                     >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
                 )
+                or (
+                    not _agentic_failed_validation_present(messages)
+                    and agentic_same_path_tools_without_validation
+                    >= _AGENTIC_MAX_SAME_PATH_TOOLS_AFTER_FAILURE_BEFORE_DIAGNOSTIC
+                )
             )
         )
         if (
             agentic_diagnostic_needed
+            and not agentic_missing_requested_artifacts_without_validation
         ):
             logger.info(
                 "[agentic-guard] forcing diagnostic after %d tool results without "
@@ -2152,7 +2819,10 @@ async def stream_chat_completion(
                 agentic_same_path_tools_since_failure,
                 agentic_same_command_tools_since_failure,
             )
-            yield _format_forced_tool_call([_agentic_diagnostic_tool_call()], None)
+            yield _format_forced_tool_call(
+                [_agentic_diagnostic_tool_call(messages)],
+                None,
+            )
             if include_usage:
                 usage_chunk = ChatCompletionChunk(
                     id=response_id,
@@ -2176,9 +2846,12 @@ async def stream_chat_completion(
                     "content": (
                         _AGENTIC_REPEATED_PATH_REPAIR_PROMPT
                         if agentic_repeated_path_repair_mode
-                        else _AGENTIC_MISSING_ARTIFACT_PROMPT
-                        if agentic_missing_requested_artifacts
-                        else _AGENTIC_REPAIR_USER_PROMPT
+                        else _agentic_missing_artifact_prompt(messages)
+                        if (
+                            agentic_missing_requested_artifacts
+                            or agentic_missing_requested_artifacts_without_validation
+                        )
+                        else _agentic_repair_prompt(messages)
                     ),
                 }
             ]
@@ -2186,6 +2859,7 @@ async def stream_chat_completion(
                 agentic_repair_mode
                 or agentic_repeated_path_repair_mode
                 or agentic_missing_requested_artifacts
+                or agentic_missing_requested_artifacts_without_validation
             )
             else messages
         )
@@ -2203,6 +2877,7 @@ async def stream_chat_completion(
                 agentic_repair_mode
                 or agentic_repeated_path_repair_mode
                 or agentic_missing_requested_artifacts
+                or agentic_missing_requested_artifacts_without_validation
             )
             else kwargs
         )
@@ -2230,18 +2905,13 @@ async def stream_chat_completion(
             and last_content == _TOOL_CONTINUATION_REPEATED_TOOL_PROMPT
         )
         agentic_task_complete = (
-            cfg.agentic_guard
-            and bool(request.tools)
+            bool(request.tools)
             and _agentic_completion_needs_verification(messages)
             and _agentic_verification_present(messages)
             and not _agentic_requested_artifacts_missing(messages)
         )
         structured_agentic_continuation = (
-            (
-                tool_continuation_retry
-                or agentic_stream_guard
-            )
-            and (cfg.structured_cot_tools or agentic_stream_guard)
+            (cfg.structured_cot_tools or agentic_stream_guard)
             and bool(request.tools)
             and not repeated_tool_continuation
             and not agentic_task_complete
@@ -2343,6 +3013,15 @@ async def stream_chat_completion(
                     engine.stream_chat(messages=active_messages, **active_kwargs),
                     stream_idle_timeout,
                 ):
+                    if output is _STREAM_HEARTBEAT:
+                        yield (
+                            f'data: {{"id":"{response_id}",'
+                            '"object":"chat.completion.chunk",'
+                            f'"created":{_sse_created},'
+                            f'"model":{_model_escaped},'
+                            '"choices":[{"index":0,"delta":{}}]}\n\n'
+                        )
+                        continue
                     last_output = output
                     if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                         prompt_tokens = output.prompt_tokens
@@ -2421,7 +3100,10 @@ async def stream_chat_completion(
                                     repeat_tool_detection_enabled
                                     or agentic_repeated_path_detection_enabled
                                 )
-                                and not latest_result_mentions_recent_path
+                                and (
+                                    agentic_repeated_path_detection_enabled
+                                    or not latest_result_mentions_recent_path
+                                )
                                 and _buffered_tool_call_repeats_recent_path(
                                     buffered_tool_call_events,
                                     recent_tool_call_path_signature,
@@ -2500,13 +3182,18 @@ async def stream_chat_completion(
                                 yield _sse
                         buffered_events.clear()
 
+                        tool_calls = event.tool_calls
+                        if agentic_single_tool_call_mode:
+                            tool_calls = _first_tool_call_only(tool_calls)
+                            if not tool_calls:
+                                continue
                         tool_chunk = ChatCompletionChunk(
                             id=response_id,
                             model=_resolve_model_name(request.model),
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
-                                        tool_calls=event.tool_calls,
+                                        tool_calls=tool_calls,
                                     ),
                                     finish_reason="tool_calls",
                                 )
@@ -2520,7 +3207,21 @@ async def stream_chat_completion(
 
             if not retry_reason and buffered_tool_call_events:
                 if _buffered_tool_calls_complete(buffered_tool_call_events):
-                    buffered_repeats_recent_tool = (
+                    if (
+                        agentic_stream_guard
+                        and _buffered_agentic_destructive_command(
+                            buffered_tool_call_events,
+                            messages,
+                        )
+                    ):
+                        retry_reason = "destructive shell command"
+                        logger.info(
+                            "[agentic-guard] blocked destructive shell command "
+                            "against existing project artifacts"
+                        )
+                        buffered_tool_call_events.clear()
+                        deferred_finish = None
+                    elif (
                         (
                             repeat_tool_detection_enabled
                             or agentic_repeated_inspection_detection_enabled
@@ -2529,8 +3230,7 @@ async def stream_chat_completion(
                             buffered_tool_call_events,
                             recent_tool_call_signature,
                         )
-                    )
-                    buffered_repeats_recent_path = (
+                    ) or (
                         (
                             repeat_tool_detection_enabled
                             or agentic_repeated_path_detection_enabled
@@ -2539,8 +3239,7 @@ async def stream_chat_completion(
                             buffered_tool_call_events,
                             recent_tool_call_path_signature,
                         )
-                    )
-                    if buffered_repeats_recent_tool or buffered_repeats_recent_path:
+                    ):
                         retry_reason = "repeated tool call"
                     else:
                         emitted_tool_call = True
@@ -2568,6 +3267,14 @@ async def stream_chat_completion(
 
             if not retry_reason and deferred_finish and not emitted_tool_call:
                 retry_reason = "text-only stop"
+            elif (
+                not retry_reason
+                and last_output is not None
+                and getattr(last_output, "finish_reason", None) == "length"
+                and bool(request.tools)
+                and not emitted_tool_call
+            ):
+                retry_reason = "length without tool call"
             elif not retry_reason and buffered_events and not emitted_tool_call:
                 retry_reason = "stream exhausted without tool call"
 
@@ -2599,6 +3306,10 @@ async def stream_chat_completion(
                     _TOOL_CALL_JSON_RETRY_PROMPT
                     if retry_reason == "incomplete tool call JSON"
                     else (
+                        _AGENTIC_DESTRUCTIVE_COMMAND_REPAIR_PROMPT
+                        if agentic_stream_guard
+                        and retry_reason == "destructive shell command"
+                        else
                         (
                             _AGENTIC_REPEATED_TOOL_PROMPT
                             if agentic_stream_guard
@@ -2606,7 +3317,10 @@ async def stream_chat_completion(
                         )
                         if retry_reason == "repeated tool call"
                         else (
-                            _AGENTIC_REPAIR_USER_PROMPT
+                            _agentic_missing_artifact_prompt(messages)
+                            if agentic_stream_guard
+                            and bool(_agentic_requested_artifacts_missing(messages))
+                            else _agentic_repair_prompt(messages)
                             if agentic_stream_guard
                             and _agentic_failed_validation_present(messages)
                             else retry_prompt
@@ -2666,7 +3380,7 @@ async def stream_chat_completion(
                         retry_reason,
                     )
                 yield _format_forced_tool_call(
-                    [_agentic_diagnostic_tool_call()],
+                    [_agentic_diagnostic_tool_call(messages)],
                     last_output,
                 )
                 break

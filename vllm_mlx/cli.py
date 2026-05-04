@@ -422,8 +422,19 @@ def serve_command(args):
             structured_cot=getattr(args, "structured_cot", False),
             structured_cot_tools=getattr(args, "structured_cot_tools", False),
             agentic_guard=getattr(args, "agentic_guard", False),
+            agentic_speculative_policy=getattr(
+                args, "agentic_speculative_policy", "off"
+            ),
             structured_cot_token_budget=getattr(
                 args, "structured_cot_token_budget", 256
+            ),
+            speculative_prefill=getattr(args, "speculative_prefill", False),
+            speculative_prefill_draft_model=getattr(
+                args, "speculative_prefill_draft_model", None
+            ),
+            speculative_prefill_ratio=getattr(args, "speculative_prefill_ratio", 0.85),
+            speculative_prefill_min_tokens=getattr(
+                args, "speculative_prefill_min_tokens", 128
             ),
         )
     except Exception as e:
@@ -1421,10 +1432,49 @@ Examples:
         help="Enable benchmark-specific agentic repair guard for tool workflows.",
     )
     serve_parser.add_argument(
+        "--agentic-speculative-policy",
+        choices=["off", "auto"],
+        default="off",
+        help=(
+            "Automatically gate DFlash/DDTree/n-gram and speculative prefill "
+            "for tool-heavy agentic workflows."
+        ),
+    )
+    serve_parser.add_argument(
         "--structured-cot-token-budget",
         type=int,
         default=256,
         help="Approximate token budget for structured CoT lines.",
+    )
+    serve_parser.add_argument(
+        "--speculative-prefill",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable conservative draft-scored prompt compression before target "
+            "prefill. If safety checks fail, the original prompt is used."
+        ),
+    )
+    serve_parser.add_argument(
+        "--speculative-prefill-draft-model",
+        type=str,
+        default=None,
+        help=(
+            "Optional small MLX/HF model path for token-importance scoring "
+            "during speculative prefill."
+        ),
+    )
+    serve_parser.add_argument(
+        "--speculative-prefill-ratio",
+        type=float,
+        default=0.85,
+        help="Target compressed prompt token ratio (default: 0.85).",
+    )
+    serve_parser.add_argument(
+        "--speculative-prefill-min-tokens",
+        type=int,
+        default=128,
+        help="Minimum prompt tokens before speculative prefill may apply.",
     )
     # GC control (Tier 0 optimization)
     serve_parser.add_argument(

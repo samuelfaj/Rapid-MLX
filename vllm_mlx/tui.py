@@ -169,6 +169,10 @@ def _spec_path(item: dict) -> str:
     ngram_cycles = _integer(item.get("ngram_cycles", 0))
     fallback_cycles = _integer(item.get("ngram_fallback_cycles", 0))
     tool_guard_cycles = _integer(item.get("ngram_tool_guard_cycles", 0))
+    proposed = _integer(
+        item.get("speculative_proposed_tokens", item.get("proposed_tokens", 0))
+    )
+    steps = _integer(item.get("speculative_steps", 0))
     if mode == "ddtree-ngram":
         if ngram_cycles > 0 and fallback_cycles > 0:
             return f"ng+tree {ngram_cycles}/{fallback_cycles}"
@@ -177,11 +181,16 @@ def _spec_path(item: dict) -> str:
         if fallback_cycles > 0:
             suffix = " guard" if tool_guard_cycles > 0 else ""
             return f"ddtree {fallback_cycles}{suffix}"
-        if _integer(item.get("speculative_proposed_tokens", item.get("proposed_tokens", 0))) > 0:
+        if proposed > 0 or steps > 0:
             return "ddtree"
-    if mode:
-        return mode
-    return "n/a"
+        return "-"
+    if mode == "ddtree":
+        return "ddtree" if proposed > 0 or steps > 0 else "-"
+    if mode == "dflash":
+        return "dflash" if proposed > 0 or steps > 0 else "-"
+    if mode in {"target-fallback", "target-prefix-cache"}:
+        return "-"
+    return mode or "-"
 
 
 def _build_screen(

@@ -693,6 +693,7 @@ _AGENTIC_REQUESTED_ARTIFACT_TERMS = {
     "route": ("api", "endpoint", "endpoints", "rest", "route", "routes", "router"),
     "middleware": ("middleware", "middlewares"),
     "test": ("test", "tests", "spec", "specs"),
+    "express_app": ("express",),
     "vertical_slice": (
         "feature slice",
         "feature sliced",
@@ -742,9 +743,33 @@ def _agentic_created_artifact_paths(messages: list) -> list[str]:
             _, path = signature
             paths.append(path.lower())
 
+        command_text = _agentic_tool_call_command_text(message)
+        if command_text:
+            for pattern in (
+                r"(?:^|[;&|]\s*)(?:cat|tee)\s+(?:>|>>)?\s*['\"]?([^'\"\s;|&]+)",
+                r"(?:^|[;&|]\s*)touch\s+['\"]?([^'\"\s;|&]+)",
+                r"(?:^|[;&|]\s*)bun\s+init\b",
+            ):
+                for match in re.finditer(pattern, command_text):
+                    path = match.group(1) if match.lastindex else "package.json"
+                    if path:
+                        paths.append(path.strip().rstrip(".:,;").lower())
+            for match in re.finditer(
+                r"['\"]?((?:src|tests?)/[^'\"\s;|&]+?\.(?:ts|tsx|js|jsx|json))",
+                command_text,
+            ):
+                paths.append(match.group(1).strip().rstrip(".:,;").lower())
+
         if _agentic_message_role(message) != "tool":
             continue
         content = _message_content_text(message)
+        for line in content.splitlines():
+            candidate = line.strip().strip("`'\"").rstrip(".:,;")
+            if re.match(
+                r"^(?:package\.json|(?:src|tests?)/.+\.(?:ts|tsx|js|jsx|json))$",
+                candidate,
+            ):
+                paths.append(candidate.lower())
         for match in re.finditer(
             r"(?:to|in)\s+([^\s]+(?:\.[A-Za-z0-9_./-]+)?)",
             content,
@@ -812,6 +837,18 @@ def _agentic_requested_artifacts_missing(messages: list) -> set[str]:
     user_request = _agentic_user_request_text(messages)
     missing: set[str] = set()
     for term in requested:
+        if term == "express_app":
+            has_http_entrypoint = any(
+                re.search(r"(?:^|/)(?:src/)?(?:app|server|index)\.(?:ts|js)$", path)
+                for path in paths
+            )
+            has_http_wiring = any(
+                any(marker in path for marker in ("route", "router", "controller", "handler"))
+                for path in paths
+            )
+            if not has_http_entrypoint or not has_http_wiring:
+                missing.add(term)
+            continue
         if term == "vertical_slice":
             has_feature_owned_path = any(
                 re.search(
@@ -928,10 +965,13 @@ def _agentic_failed_validation_present(messages: list) -> bool:
         "build passed",
         "lint passed",
     )
-    for message in reversed(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
         if _agentic_message_role(message) != "tool":
             continue
         tool_text = _message_content_text(message).lower()
+        if _agentic_tool_result_has_successful_validation_command(messages, index):
+            return False
         if any(marker in tool_text for marker in explicit_failure_markers):
             return True
         if any(marker in tool_text for marker in failure_markers):
@@ -2399,9 +2439,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
         cleaned_text = output.text
         tool_calls = []
+    agentic_missing_requested_artifacts = (
+        _agentic_requested_artifacts_missing(messages)
+        if agentic_verification_required
+        else set()
+    )
     if (
         agentic_verification_required
-        and not _agentic_verification_present(messages)
+        and (
+            not _agentic_verification_present(messages)
+            or bool(agentic_missing_requested_artifacts)
+        )
     ):
         retry_messages = list(messages)
 
@@ -2410,17 +2458,25 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 break
             logger.info(
                 "[agentic-guard] retrying text-only non-stream response "
-                "without verification evidence (attempt %d/6)",
+                "without completion evidence (attempt %d/6)",
                 retry_attempt + 1,
+            )
+            retry_prompt = (
+                _agentic_repair_prompt(messages)
+                if _agentic_failed_validation_present(messages)
+                else (
+                    "You are not finished. The requested artifact categories are "
+                    f"still missing: {', '.join(sorted(agentic_missing_requested_artifacts))}. "
+                    "Use the next required tool now to create or wire those files, "
+                    "then run validation again."
+                )
+                if agentic_missing_requested_artifacts
+                else "You are not finished. Use the next required tool now."
             )
             retry_messages = list(messages) + [
                 {
                     "role": "user",
-                    "content": (
-                        _agentic_repair_prompt(messages)
-                        if _agentic_failed_validation_present(messages)
-                        else "You are not finished. Use the next required tool now."
-                    ),
+                    "content": retry_prompt,
                 }
             ]
             retry_kwargs = {

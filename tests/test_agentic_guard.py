@@ -4,6 +4,7 @@ import json
 from vllm_mlx.routes.chat import (
     _AGENTIC_TOOL_USE_SYSTEM_SUFFIX,
     _agentic_completion_needs_verification,
+    _agentic_created_artifact_paths,
     _agentic_diagnostic_tool_call,
     _agentic_failed_validation_present,
     _agentic_requested_artifacts_missing,
@@ -91,6 +92,121 @@ def test_agentic_task_terminal_ready_rejects_latest_failure():
             {"role": "tool", "content": "bun test\n 1 fail"},
         ]
     )
+
+
+def test_agentic_created_artifact_paths_detects_shell_created_files():
+    paths = _agentic_created_artifact_paths(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": json.dumps(
+                                {
+                                    "command": (
+                                        "cat > src/features/users/service.ts <<'EOF'\n"
+                                        "export {}\nEOF\n"
+                                        "tee tests/features/users/service.test.ts "
+                                        ">/dev/null <<'EOF'\n"
+                                        "test('ok', () => {})\nEOF"
+                                    )
+                                }
+                            ),
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": (
+                    "FILES\n"
+                    "package.json\n"
+                    "src/features/users/model.ts\n"
+                    "tests/features/users/service.test.ts\n"
+                ),
+            },
+        ]
+    )
+
+    assert "src/features/users/service.ts" in paths
+    assert "tests/features/users/service.test.ts" in paths
+    assert "src/features/users/model.ts" in paths
+    assert "package.json" in paths
+
+
+def test_agentic_task_terminal_ready_accepts_shell_created_vertical_slice():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "create a REST api using express and bun and typescript and "
+                "sequelize-typescript. It must be vertical sliced. You should "
+                "create models, seeders and migrations. You must create unit "
+                "tests for each service."
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps(
+                            {
+                                "command": (
+                                    "cat > package.json <<'EOF'\n{}\nEOF\n"
+                                    "cat > src/features/users/model.ts <<'EOF'\nEOF\n"
+                                    "cat > src/features/users/service.ts <<'EOF'\nEOF\n"
+                                    "cat > src/features/users/routes.ts <<'EOF'\nEOF\n"
+                                    "cat > src/app.ts <<'EOF'\nEOF\n"
+                                    "cat > src/features/users/migration.ts <<'EOF'\nEOF\n"
+                                    "cat > src/features/users/seeder.ts <<'EOF'\nEOF\n"
+                                    "cat > tests/features/users/service.test.ts <<'EOF'\nEOF\n"
+                                )
+                            }
+                        ),
+                    }
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "Wrote package.json\n"
+                "Wrote src/features/users/model.ts\n"
+                "Wrote src/features/users/service.ts\n"
+                "Wrote src/features/users/routes.ts\n"
+                "Wrote src/app.ts\n"
+                "Wrote src/features/users/migration.ts\n"
+                "Wrote src/features/users/seeder.ts\n"
+                "Wrote tests/features/users/service.test.ts\n"
+            ),
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps({"command": "bun test"}),
+                    }
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                "bun test v1\n"
+                " 9 pass\n"
+                " 0 fail\n"
+                "Ran 9 tests across 1 files."
+            ),
+        },
+    ]
+
+    assert _agentic_task_terminal_ready(messages)
 
 
 def test_agentic_verification_accepts_marker_from_tool_context():
@@ -532,6 +648,43 @@ def test_agentic_requested_artifacts_missing_accepts_dot_service_test_names():
             },
         ]
     )
+
+
+def test_agentic_requested_artifacts_missing_requires_express_http_wiring():
+    missing = _agentic_requested_artifacts_missing(
+        [
+            {
+                "role": "user",
+                "content": (
+                    "create a REST api using express and bun and typescript and "
+                    "sequelize-typescript. It must be vertical sliced. You should "
+                    "create models, seeders and migrations. You must create unit "
+                    "tests for each service."
+                ),
+            },
+            {
+                "role": "tool",
+                "content": (
+                    "package.json\n"
+                    "index.ts\n"
+                    "src/config/database.ts\n"
+                    "src/features/users/models/user.model.ts\n"
+                    "src/features/users/services/user.service.ts\n"
+                    "src/features/products/models/product.model.ts\n"
+                    "src/features/products/services/product.service.ts\n"
+                    "src/migrations/20260504000001-create-users.ts\n"
+                    "src/migrations/20260504000002-create-products.ts\n"
+                    "src/seeders/20260504000001-seed-users.ts\n"
+                    "src/seeders/20260504000002-seed-products.ts\n"
+                    "tests/features/users/user.service.test.ts\n"
+                    "tests/features/products/product.service.test.ts\n"
+                ),
+            },
+        ]
+    )
+
+    assert "route" in missing
+    assert "express_app" in missing
 
 
 def test_agentic_diagnostic_tool_call_uses_created_manifest_root():

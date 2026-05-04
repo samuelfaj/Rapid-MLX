@@ -61,6 +61,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_greedy_sampling(temperature: float | None, top_p: float | None = None) -> bool:
+    temp = 0.0 if temperature is None else float(temperature)
+    return temp == 0.0
+
+
 def _init_dflash_step_thread() -> None:
     """Mirror engine_core._init_mlx_step_thread for our private executor."""
     import mlx.core as mx
@@ -132,6 +137,13 @@ class _DDTreePrefixCacheFetch:
     state: Any | None
     hit_type: str = "miss"
     cached_tokens: int = 0
+
+
+@dataclass
+class _TargetPrefixState:
+    prompt_tokens: tuple[int, ...]
+    prompt_cache: list[Any]
+    logprobs: Any
 
 
 class _DDTreePrefixStateCache:
@@ -327,7 +339,27 @@ class DFlashEngine(BatchedEngine):
         cache_entries = getattr(scheduler_config, "prefix_cache_size", 2) or 2
         cache_entries = int(os.environ.get("DFLASH_DDTREE_PREFIX_CACHE_ENTRIES", cache_entries))
         self._ddtree_prefix_cache = _DDTreePrefixStateCache(max_entries=cache_entries)
-        self._ddtree_capture_cache = _env_bool("DFLASH_DDTREE_CAPTURE_CACHE", False)
+        target_cache_entries = int(
+            os.environ.get(
+                "DFLASH_TARGET_PREFIX_CACHE_ENTRIES",
+                max(16, cache_entries),
+            )
+        )
+        self._target_prefix_cache = _DDTreePrefixStateCache(
+            max_entries=target_cache_entries
+        )
+        self._ddtree_capture_cache = _env_bool(
+            "DFLASH_DDTREE_CAPTURE_CACHE",
+            self._ddtree_budget > 0,
+        )
+        self._target_prefix_cache_enabled = _env_bool(
+            "DFLASH_TARGET_PREFIX_CACHE",
+            self._ddtree_budget > 0,
+        )
+        self._target_prefix_cache_stride = max(
+            0,
+            int(os.environ.get("DFLASH_TARGET_PREFIX_CACHE_STRIDE", "1024")),
+        )
         self._last_memory_stats = (0.0, 0.0, 0.0)
         self._start_time = time.time()
 
@@ -516,6 +548,25 @@ class DFlashEngine(BatchedEngine):
         except Exception:
             return 0
 
+    def _target_cached_token_count(self, prompt: str) -> int:
+        if not self._target_prefix_cache_enabled:
+            return 0
+        try:
+            encoded = self._tokenizer.encode(prompt)
+            return self._target_prefix_cache.peek_cached_tokens(list(encoded))
+        except Exception:
+            return 0
+
+    def _should_use_target_prefix_cache(
+        self,
+        temperature: float | None,
+        top_p: float | None,
+    ) -> bool:
+        return self._target_prefix_cache_enabled and _is_greedy_sampling(
+            temperature,
+            top_p,
+        )
+
     def _should_use_agentic_target_fallback(
         self,
         prompt: str,
@@ -578,10 +629,8 @@ class DFlashEngine(BatchedEngine):
 
         if phase in {"repair", "validation", "finalization", "tool_json"}:
             return "target-fallback", f"phase_{phase}", metadata
-        if remaining_prefill_tokens > int(
-            os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000")
-        ):
-            return "target-fallback", "prefill_too_large", metadata
+        prefill_limit = int(os.environ.get("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "8000"))
+        prefill_too_large = remaining_prefill_tokens > prefill_limit
         if self._agentic_policy_cooldown > 0:
             self._agentic_policy_cooldown -= 1
             metadata["cooldown"] = self._agentic_policy_cooldown
@@ -601,8 +650,24 @@ class DFlashEngine(BatchedEngine):
             and phase in {"initial_scaffold", "long_text_or_code"}
         ):
             if self._should_enable_ngram_first(prompt) or self._thinking_ngram_enabled:
-                return "ddtree-ngram", "long_generation_ngram", metadata
-            return "ddtree", "long_generation_ddtree", metadata
+                reason = (
+                    "long_prefill_suffix_speculative_prefill_ngram"
+                    if prefill_too_large
+                    and self._speculative_prefill.config.enabled
+                    else "long_generation_ngram"
+                )
+                if prefill_too_large and not self._speculative_prefill.config.enabled:
+                    return "target-fallback", "prefill_too_large", metadata
+                return "ddtree-ngram", reason, metadata
+            if prefill_too_large and not self._speculative_prefill.config.enabled:
+                return "target-fallback", "prefill_too_large", metadata
+            return (
+                "ddtree",
+                "long_prefill_suffix_speculative_prefill"
+                if prefill_too_large
+                else "long_generation_ddtree",
+                metadata,
+            )
         return "target-fallback", "short_or_non_greedy", metadata
 
     def _ddtree_cached_token_count(self, prompt: str) -> int:
@@ -734,6 +799,353 @@ class DFlashEngine(BatchedEngine):
                         )
             self._target_stream_generators.discard(gen)
 
+    def _stream_target_cached_sync(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        tools_requested: bool,
+        logits_processors: list[Any] | None = None,
+        prefix_boundaries: list[int] | None = None,
+    ):
+        import importlib
+
+        import mlx.core as mx
+
+        generate_mod = importlib.import_module("mlx_lm.generate")
+        generate_mod.generation_stream = mx.new_stream(mx.default_device())
+        from mlx_lm.models import cache as mlx_cache
+        from mlx_lm.sample_utils import make_sampler
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        tokenizer = self._tokenizer
+        if not isinstance(tokenizer, TokenizerWrapper):
+            tokenizer = TokenizerWrapper(tokenizer)
+        prompt_tokens = list(self._tokenizer.encode(prompt))
+        if not prompt_tokens:
+            return
+
+        fetch = self._target_prefix_cache.fetch(prompt_tokens)
+        cached_tokens = int(fetch.cached_tokens or 0)
+        state = fetch.state if isinstance(fetch.state, _TargetPrefixState) else None
+        suffix_tokens = prompt_tokens[cached_tokens:]
+        if state is None:
+            cached_tokens = 0
+            suffix_tokens = prompt_tokens
+        elif not suffix_tokens and (state.logprobs is None or tools_requested):
+            state = None
+            cached_tokens = 0
+            suffix_tokens = prompt_tokens
+        prompt_cache = (
+            copy.deepcopy(state.prompt_cache)
+            if state is not None
+            else mlx_cache.make_prompt_cache(self._model)
+        )
+        sampler = make_sampler(temp=float(temperature or 0.0), top_p=float(top_p or 0.0))
+        detokenizer = tokenizer.detokenizer
+        token_context = mx.array(prompt_tokens[:cached_tokens], dtype=mx.uint32)
+
+        def _apply_processors(input_tokens: mx.array, logits: mx.array) -> mx.array:
+            nonlocal token_context
+            if logits_processors and len(input_tokens) > 0:
+                token_context = (
+                    mx.concat([token_context, input_tokens])
+                    if token_context.size
+                    else input_tokens
+                )
+                for processor in logits_processors:
+                    logits = processor(token_context, logits)
+            return logits
+
+        def _model_call(input_tokens: mx.array):
+            return self._model(input_tokens[None], cache=prompt_cache)
+
+        def _step(input_tokens: mx.array):
+            with mx.stream(generate_mod.generation_stream):
+                logits = _model_call(input_tokens)[:, -1, :]
+                logits = _apply_processors(input_tokens, logits)
+                logprobs_2d = logits - mx.logsumexp(logits, keepdims=True)
+                sampled = sampler(logprobs_2d)
+                return sampled, logprobs_2d
+
+        prompt_started = time.perf_counter()
+        with generate_mod.wired_limit(self._model, [generate_mod.generation_stream]):
+            with mx.stream(generate_mod.generation_stream):
+                if state is not None and not suffix_tokens:
+                    logprobs_2d = copy.deepcopy(state.logprobs)
+                    y = sampler(logprobs_2d)
+                else:
+                    suffix = mx.array(suffix_tokens or prompt_tokens, dtype=mx.uint32)
+                    boundary_set = {
+                        int(boundary) - cached_tokens
+                        for boundary in (prefix_boundaries or [])
+                        if cached_tokens < int(boundary) < len(prompt_tokens)
+                    }
+                    stored_boundaries = 0
+                    processed_suffix_tokens = 0
+                    next_checkpoint = (
+                        self._target_prefix_cache_stride
+                        if self._target_prefix_cache_stride > 0
+                        else 0
+                    )
+                    while len(suffix) > 1:
+                        remaining_prefill = len(suffix) - 1
+                        next_boundary = min(
+                            (
+                                boundary
+                                for boundary in boundary_set
+                                if boundary > processed_suffix_tokens
+                            ),
+                            default=None,
+                        )
+                        n_to_process = min(2048, remaining_prefill)
+                        if next_boundary is not None:
+                            n_to_process = min(
+                                n_to_process,
+                                max(1, next_boundary - processed_suffix_tokens),
+                            )
+                        _model_call(suffix[:n_to_process])
+                        mx.eval([c.state for c in prompt_cache])
+                        token_context = (
+                            mx.concat([token_context, suffix[:n_to_process]])
+                            if token_context.size
+                            else suffix[:n_to_process]
+                        )
+                        processed_suffix_tokens += n_to_process
+                        absolute_processed = cached_tokens + processed_suffix_tokens
+                        if absolute_processed in (prefix_boundaries or ()):
+                            self._target_prefix_cache.store(
+                                prompt_tokens[:absolute_processed],
+                                _TargetPrefixState(
+                                    prompt_tokens=tuple(
+                                        prompt_tokens[:absolute_processed]
+                                    ),
+                                    prompt_cache=copy.deepcopy(prompt_cache),
+                                    logprobs=None,
+                                ),
+                            )
+                            stored_boundaries += 1
+                        if (
+                            next_checkpoint
+                            and absolute_processed >= next_checkpoint
+                            and absolute_processed < len(prompt_tokens)
+                        ):
+                            self._target_prefix_cache.store(
+                                prompt_tokens[:absolute_processed],
+                                _TargetPrefixState(
+                                    prompt_tokens=tuple(
+                                        prompt_tokens[:absolute_processed]
+                                    ),
+                                    prompt_cache=copy.deepcopy(prompt_cache),
+                                    logprobs=None,
+                                ),
+                            )
+                            stored_boundaries += 1
+                            next_checkpoint = (
+                                absolute_processed
+                                + self._target_prefix_cache_stride
+                            )
+                        suffix = suffix[n_to_process:]
+                        mx.clear_cache()
+                    y, logprobs_2d = _step(suffix)
+                    can_trim_cache = mlx_cache.can_trim_prompt_cache(prompt_cache)
+                    full_state: _TargetPrefixState | None = None
+                    if tools_requested or logits_processors:
+                        if can_trim_cache and len(prompt_tokens) > 1:
+                            first_token_cache = copy.deepcopy(prompt_cache)
+                            mlx_cache.trim_prompt_cache(first_token_cache, 1)
+                            self._target_prefix_cache.store(
+                                prompt_tokens[:-1],
+                                _TargetPrefixState(
+                                    prompt_tokens=tuple(prompt_tokens[:-1]),
+                                    prompt_cache=first_token_cache,
+                                    logprobs=None,
+                                ),
+                            )
+                    else:
+                        full_state = _TargetPrefixState(
+                            prompt_tokens=tuple(prompt_tokens),
+                            prompt_cache=copy.deepcopy(prompt_cache),
+                            logprobs=copy.deepcopy(logprobs_2d),
+                        )
+                        self._target_prefix_cache.store(prompt_tokens, full_state)
+                    if prefix_boundaries and can_trim_cache:
+                        boundary_source_cache = (
+                            full_state.prompt_cache
+                            if full_state is not None
+                            else prompt_cache
+                        )
+                        for boundary in prefix_boundaries:
+                            boundary = int(boundary)
+                            if boundary <= 0 or boundary >= len(prompt_tokens):
+                                continue
+                            boundary_cache = copy.deepcopy(boundary_source_cache)
+                            mlx_cache.trim_prompt_cache(
+                                boundary_cache,
+                                len(prompt_tokens) - boundary,
+                            )
+                            self._target_prefix_cache.store(
+                                prompt_tokens[:boundary],
+                                _TargetPrefixState(
+                                    prompt_tokens=tuple(prompt_tokens[:boundary]),
+                                    prompt_cache=boundary_cache,
+                                    logprobs=None,
+                                ),
+                            )
+                            stored_boundaries += 1
+                    logger.info(
+                        "[target-prefix-cache] store prompt_tokens=%d boundaries=%d",
+                        len(prompt_tokens),
+                        stored_boundaries,
+                    )
+                mx.eval(y, logprobs_2d)
+
+            prefill_seconds = max(time.perf_counter() - prompt_started, 1e-9)
+            decode_started = time.perf_counter()
+            generated = 0
+            eos_token_ids = set(getattr(tokenizer, "eos_token_ids", []) or [])
+            while generated < max_tokens:
+                token = int(y.item() if hasattr(y, "item") else y)
+                if token in eos_token_ids:
+                    break
+                detokenizer.add_token(token)
+                generated += 1
+                yield SimpleNamespace(
+                    text=detokenizer.last_segment,
+                    tokens=[token],
+                    prompt_tokens=len(prompt_tokens),
+                    prefill_seconds=prefill_seconds,
+                    generation_tokens=generated,
+                    generation_tps=generated
+                    / max(time.perf_counter() - decode_started, 1e-9),
+                    finish_reason=None,
+                    proposed_tokens=0,
+                    accepted_tokens=0,
+                    speculative_steps=0,
+                    avg_acceptance_ratio=0.0,
+                    block_size_history=(),
+                    avg_tree_node_count=0.0,
+                    ddtree_fast_path_ratio=0.0,
+                    tree_budget=0,
+                    ngram_acceptance_ratio=0.0,
+                    ngram_cycles=0,
+                    ngram_fallback_cycles=0,
+                    ngram_tool_guard_cycles=0,
+                    cache_hit_type=fetch.hit_type,
+                    cached_tokens=cached_tokens,
+                    phase_timings_us={},
+                )
+                y, logprobs_2d = _step(mx.array([token], dtype=mx.uint32))
+                mx.async_eval(y, logprobs_2d)
+                if generated % 256 == 0:
+                    mx.clear_cache()
+
+            detokenizer.finalize()
+            yield SimpleNamespace(
+                text=detokenizer.last_segment,
+                tokens=[],
+                prompt_tokens=len(prompt_tokens),
+                prefill_seconds=prefill_seconds,
+                generation_tokens=generated,
+                generation_tps=generated
+                / max(time.perf_counter() - decode_started, 1e-9),
+                finish_reason="stop",
+                proposed_tokens=0,
+                accepted_tokens=0,
+                speculative_steps=0,
+                avg_acceptance_ratio=0.0,
+                block_size_history=(),
+                avg_tree_node_count=0.0,
+                ddtree_fast_path_ratio=0.0,
+                tree_budget=0,
+                ngram_acceptance_ratio=0.0,
+                ngram_cycles=0,
+                ngram_fallback_cycles=0,
+                ngram_tool_guard_cycles=0,
+                cache_hit_type=fetch.hit_type,
+                cached_tokens=cached_tokens,
+                phase_timings_us={},
+            )
+
+    async def _stream_target_cached(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None,
+        tools_requested: bool,
+        logits_processor_factories: list[Any] | None = None,
+        prefix_boundaries: list[int] | None = None,
+    ):
+        loop = asyncio.get_running_loop()
+        executor = self._executor
+        assert executor is not None, "DFlashEngine not started"
+
+        def _make_processors():
+            processors = []
+            for factory in logits_processor_factories or ():
+                processor = factory()
+                if processor is not None:
+                    processors.append(processor)
+            return processors
+
+        processors = await loop.run_in_executor(executor, _make_processors)
+        gen = await loop.run_in_executor(
+            executor,
+            lambda: self._stream_target_cached_sync(
+                prompt,
+                max_tokens,
+                temperature,
+                top_p,
+                tools_requested,
+                processors,
+                prefix_boundaries,
+            ),
+        )
+        sentinel = object()
+        stop_after_strings = list(_TOOL_STOP_AFTER_STRINGS) if tools_requested else []
+        stop_strings = [*(stop or ()), *stop_after_strings]
+        cumulative = ""
+
+        def _next():
+            try:
+                return next(gen)
+            except StopIteration:
+                return sentinel
+
+        def _close_gen():
+            close = getattr(gen, "close", None)
+            if close is not None:
+                close()
+
+        try:
+            while True:
+                resp = await loop.run_in_executor(executor, _next)
+                if resp is sentinel:
+                    return
+                cumulative += resp.text or ""
+                finish_reason = resp.finish_reason
+                if stop_strings and any(marker in cumulative for marker in stop_strings):
+                    finish_reason = "stop"
+                if resp.cached_tokens:
+                    logger.info(
+                        "[target-prefix-cache] cache_fetch HIT cached_tokens=%d prompt_tokens=%d",
+                        resp.cached_tokens,
+                        resp.prompt_tokens,
+                    )
+                yield SimpleNamespace(
+                    **{**resp.__dict__, "finish_reason": finish_reason}
+                )
+                if finish_reason:
+                    return
+        finally:
+            try:
+                await loop.run_in_executor(executor, _close_gen)
+            except RuntimeError as exc:
+                logger.warning("[target-prefix-cache] close skipped: %s", exc)
+
     def _store_ddtree_cache_result(
         self,
         result: dict[str, Any],
@@ -853,6 +1265,12 @@ class DFlashEngine(BatchedEngine):
             if self._ddtree_capture_cache
             else SimpleNamespace(state=None, hit_type=None, cached_tokens=0)
         )
+        logger.info(
+            "[DDTree] cache_fetch %s cached_tokens=%d prompt_tokens=%d",
+            "HIT" if getattr(cache_fetch, "cached_tokens", 0) else "MISS",
+            int(getattr(cache_fetch, "cached_tokens", 0) or 0),
+            len(prompt_token_ids),
+        )
         if prompt_token_ids:
             prompt_token_ids = self._maybe_compress_ddtree_suffix(
                 prompt_token_ids,
@@ -933,7 +1351,7 @@ class DFlashEngine(BatchedEngine):
         agentic_phase: str | None = None,
     ):
         """Run the Rapid-MLX DDTree loop on the DFlash MLX worker thread."""
-        if temperature not in (0, 0.0) or top_p not in (0, 0.0, 1, 1.0):
+        if not _is_greedy_sampling(temperature, top_p):
             logger.debug(
                 "[DDTree] greedy DDTree path ignores sampler settings: temperature=%s top_p=%s",
                 temperature,
@@ -1094,13 +1512,14 @@ class DFlashEngine(BatchedEngine):
             raise ValueError("DFlash mode does not support images or videos.")
         prompt = self._maybe_compress_prompt(prompt, kwargs)
 
-        greedy_request = temperature in (0, 0.0)
+        greedy_request = _is_greedy_sampling(temperature, top_p)
         if self._ddtree_budget > 0 and greedy_request:
             self._inflight += 1
             try:
                 async with self._lock:
                     tools_requested = bool(kwargs.pop("tools_requested", False))
                     prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                    prefix_boundaries = kwargs.pop("prefix_boundaries", None)
                     agentic_phase = kwargs.pop("agentic_phase", None)
                     kwargs.pop("agentic_speculative_policy", None)
                     kwargs.pop("tool_call_expected", None)
@@ -1127,23 +1546,48 @@ class DFlashEngine(BatchedEngine):
                             prompt, tools_requested
                         )
                     ):
-                        self._track_request_start("target-fallback")
+                        use_prefix_cache = self._should_use_target_prefix_cache(
+                            temperature,
+                            top_p,
+                        )
+                        self._track_request_start(
+                            "target-prefix-cache"
+                            if use_prefix_cache
+                            else "target-fallback"
+                        )
                         if self._active is not None:
                             self._active.agentic_phase = agentic_phase
-                            self._active.agentic_policy_decision = "target-fallback"
+                            self._active.agentic_policy_decision = (
+                                "target-prefix-cache"
+                                if use_prefix_cache
+                                else "target-fallback"
+                            )
                             self._active.agentic_policy_reason = policy_reason
                         try:
                             last_resp = None
                             text_parts: list[str] = []
-                            async for resp in self._stream_target(
-                                prompt,
-                                max_tokens,
-                                temperature,
-                                top_p,
-                                stop,
-                                tools_requested,
-                                logits_processor_factories,
-                            ):
+                            if use_prefix_cache:
+                                response_stream = self._stream_target_cached(
+                                    prompt,
+                                    max_tokens,
+                                    temperature,
+                                    top_p,
+                                    stop,
+                                    tools_requested,
+                                    logits_processor_factories,
+                                    prefix_boundaries,
+                                )
+                            else:
+                                response_stream = self._stream_target(
+                                    prompt,
+                                    max_tokens,
+                                    temperature,
+                                    top_p,
+                                    stop,
+                                    tools_requested,
+                                    logits_processor_factories,
+                                )
+                            async for resp in response_stream:
                                 last_resp = resp
                                 if resp.text:
                                     text_parts.append(resp.text)
@@ -1299,13 +1743,14 @@ class DFlashEngine(BatchedEngine):
             async with self._lock:
                 tools_requested = bool(kwargs.pop("tools_requested", False))
                 prefix_boundary = int(kwargs.pop("prefix_boundary", 0) or 0)
+                prefix_boundaries = kwargs.pop("prefix_boundaries", None)
                 agentic_phase = kwargs.pop("agentic_phase", None)
                 kwargs.pop("agentic_speculative_policy", None)
                 kwargs.pop("tool_call_expected", None)
                 logits_processor_factories = kwargs.pop(
                     "logits_processor_factories", None
                 )
-                greedy_request = temperature in (0, 0.0)
+                greedy_request = _is_greedy_sampling(temperature, top_p)
                 forced_mode, policy_reason, policy_metadata = (
                     self._agentic_policy_decision(
                         prompt,
@@ -1333,7 +1778,14 @@ class DFlashEngine(BatchedEngine):
                         top_p,
                     )
                 if use_target_fallback:
-                    mode = "target-fallback"
+                    mode = (
+                        "target-prefix-cache"
+                        if self._should_use_target_prefix_cache(
+                            temperature,
+                            top_p,
+                        )
+                        else "target-fallback"
+                    )
                 else:
                     mode = forced_mode or (
                         "ddtree-ngram"
@@ -1383,6 +1835,17 @@ class DFlashEngine(BatchedEngine):
                             stop,
                             tools_requested,
                             logits_processor_factories,
+                        )
+                    elif mode == "target-prefix-cache":
+                        response_stream = self._stream_target_cached(
+                            prompt,
+                            max_tokens,
+                            temperature,
+                            top_p,
+                            stop,
+                            tools_requested,
+                            logits_processor_factories,
+                            prefix_boundaries,
                         )
                     elif mode in ("ddtree", "ddtree-ngram"):
                         stream = self._stream_ddtree
@@ -1664,6 +2127,8 @@ class DFlashEngine(BatchedEngine):
                 "agentic_target_fallback_enabled": _env_bool(
                     "DFLASH_AGENTIC_TARGET_FALLBACK", True
                 ),
+                "target_prefix_cache_enabled": self._target_prefix_cache_enabled,
+                "target_prefix_cache": self._target_prefix_cache.get_stats(),
                 "agentic_speculative_policy": self._agentic_speculative_policy,
                 "agentic_policy_cooldown": self._agentic_policy_cooldown,
                 "agentic_policy_last": self._last_agentic_policy,
@@ -1690,4 +2155,7 @@ class DFlashEngine(BatchedEngine):
         }
 
     def get_cache_stats(self) -> dict[str, Any] | None:
-        return self._ddtree_prefix_cache.get_stats()
+        return {
+            "ddtree": self._ddtree_prefix_cache.get_stats(),
+            "target": self._target_prefix_cache.get_stats(),
+        }

@@ -139,7 +139,11 @@ def _entry_prefill_tps(item: dict) -> float:
 
 
 def _entry_tokens_per_second(item: dict) -> float:
-    explicit = _num(item.get("generation_tps", 0.0))
+    for key in ("decode_tps", "tokens_per_second", "generation_tps"):
+        explicit = _num(item.get(key, 0.0))
+        if explicit > 0:
+            return explicit
+    explicit = _num(item.get("effective_tps", 0.0))
     if explicit > 0:
         return explicit
     elapsed = _entry_elapsed(item)

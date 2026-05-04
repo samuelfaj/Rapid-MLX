@@ -9,14 +9,27 @@ import types
 import numpy as np
 import pytest
 
-from vllm_mlx.engine.dflash import DFlashEngine
+from vllm_mlx.engine.dflash import DFlashEngine, _is_greedy_sampling
 from vllm_mlx.speculative.ddtree.engine import _looks_like_tool_call_draft
 from vllm_mlx.speculative.ddtree.tree import build_ddtree_tree_from_topk
+from vllm_mlx.speculative.prefill import SpeculativePrefillConfig
 
 
 class FakeTokenArray(list):
     def tolist(self):
         return list(self)
+
+
+class FakeTokenizer:
+    def encode(self, prompt):
+        return prompt.split()
+
+
+def test_none_sampling_is_greedy_for_default_temperature_zero():
+    assert _is_greedy_sampling(None, None) is True
+    assert _is_greedy_sampling(0, 0.9) is True
+    assert _is_greedy_sampling(0, 1) is True
+    assert _is_greedy_sampling(0.7, 1) is False
 
 
 @pytest.mark.asyncio
@@ -226,10 +239,6 @@ def test_dflash_agentic_target_fallback_only_for_long_tool_prompts(monkeypatch):
     monkeypatch.setenv("DFLASH_AGENTIC_TARGET_FALLBACK", "1")
     monkeypatch.setenv("DFLASH_AGENTIC_TARGET_FALLBACK_MIN_PROMPT_TOKENS", "4")
 
-    class FakeTokenizer:
-        def encode(self, prompt):
-            return prompt.split()
-
     engine = DFlashEngine(
         model_name="dummy",
         drafter_path="dummy-drafter",
@@ -247,6 +256,87 @@ def test_dflash_agentic_target_fallback_only_for_long_tool_prompts(monkeypatch):
     assert not engine._should_use_agentic_target_fallback(
         "one two three four", tools_requested=False
     )
+
+
+def test_ddtree_prefix_cache_enabled_by_default_and_env_can_disable(monkeypatch):
+    monkeypatch.delenv("DFLASH_DDTREE_CAPTURE_CACHE", raising=False)
+    enabled = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+    )
+    assert enabled._ddtree_capture_cache is True
+
+    monkeypatch.setenv("DFLASH_DDTREE_CAPTURE_CACHE", "0")
+    disabled = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+    )
+    assert disabled._ddtree_capture_cache is False
+
+
+def test_agentic_auto_allows_suffix_prefill_for_large_uncached_scaffold(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "4")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+        speculative_prefill_config=SpeculativePrefillConfig(enabled=True),
+    )
+    engine._tokenizer = FakeTokenizer()
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four five six",
+        tools_requested=True,
+        max_tokens=1024,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=2,
+    )
+
+    assert mode == "ddtree"
+    assert reason == "long_generation_ddtree"
+    assert metadata["cached_tokens"] == 2
+    assert metadata["remaining_prefill_tokens"] == 4
+
+    mode, reason, metadata = engine._agentic_policy_decision(
+        "one two three four five six seven",
+        tools_requested=True,
+        max_tokens=1024,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=2,
+    )
+
+    assert mode == "ddtree"
+    assert reason == "long_prefill_suffix_speculative_prefill"
+    assert metadata["remaining_prefill_tokens"] == 5
+
+
+def test_agentic_auto_targets_only_for_large_uncached_scaffold_without_prefill(monkeypatch):
+    monkeypatch.setenv("DFLASH_AGENTIC_POLICY_MAX_PREFILL", "4")
+    engine = DFlashEngine(
+        model_name="dummy",
+        drafter_path="dummy-drafter",
+        ddtree_budget=4,
+        agentic_speculative_policy="auto",
+        speculative_prefill_config=SpeculativePrefillConfig(enabled=False),
+    )
+    engine._tokenizer = FakeTokenizer()
+
+    mode, reason, _ = engine._agentic_policy_decision(
+        "one two three four five six seven",
+        tools_requested=True,
+        max_tokens=1024,
+        greedy_request=True,
+        phase="initial_scaffold",
+        cached_tokens=2,
+    )
+
+    assert mode == "target-fallback"
+    assert reason == "prefill_too_large"
 
 
 @pytest.mark.asyncio

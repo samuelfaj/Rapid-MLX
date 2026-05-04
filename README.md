@@ -6,13 +6,15 @@ This fork keeps the original Rapid-MLX goal: serve local models with a simple `/
 
 ## Status
 
-The current best validated profile for opencode-style coding agents is not a forced DFlash/DDTree profile. It is the target model with prefix cache enabled, tool-result compaction enabled by the server, deterministic decoding, the correct tool parser, and:
+The current best validated profile for opencode-style coding agents is target decode with prefix cache first, DDTree/n-gram only when `auto` decides decode speculation is useful, deterministic decoding, the correct tool parser, and:
 
 ```bash
 --agentic-speculative-policy auto
+--drafter /path/to/DFlash-drafter
+--dflash-ddtree-budget 4
 ```
 
-For the tested Qwen3.6 35B A3B 4-bit model, this profile was very fast because repeated tool turns were prefill-bound, not decode-bound. In that shape, avoiding speculative decode overhead matters more than trying to draft every token.
+For the tested Qwen3.6 27B model, this profile beat raw Rapid-MLX on the opencode REST API benchmark while preserving validation quality. Final 3-run results are in [`BENCHMARK6.md`](BENCHMARK6.md): raw averaged 905s and 6.20 tok/s with 3/3 timeouts; this repo averaged 758s and 15.07 tok/s with 0/3 timeouts and 3/3 validation passes.
 
 ## Install
 
@@ -76,42 +78,49 @@ print(response.choices[0].message.content)
 Use this for opencode/Codex-style local coding workloads with many tool calls:
 
 ```bash
-uv run rapid-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
+uv run rapid-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-27B-UD-Q4_K_XL-mlx \
   --served-model-name local \
   --port 8010 \
   --default-temperature 0 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder_xml \
   --agentic-speculative-policy auto \
+  --drafter /Users/samuelfajreldines/dev/models/Qwen3.6-27B-DFlash \
+  --dflash-ddtree-budget 4 \
   --max-tokens 4096 \
-  --timeout 300
+  --timeout 300 \
+  --tui
 ```
 
 Equivalent installed command:
 
 ```bash
-lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
+lightning-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-27B-UD-Q4_K_XL-mlx \
   --served-model-name local \
   --port 8010 \
   --default-temperature 0 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder_xml \
   --agentic-speculative-policy auto \
+  --drafter /Users/samuelfajreldines/dev/models/Qwen3.6-27B-DFlash \
+  --dflash-ddtree-budget 4 \
   --max-tokens 4096 \
-  --timeout 300
+  --timeout 300 \
+  --tui
 ```
 
 Why this is fast:
 
 - Prefix cache is enabled by default.
 - Repeated tool-turn prompts reuse cached KV state.
+- Target-prefix-cache accelerates target-only phases without using a drafter for tool/repair/validation quality decisions.
 - Tool-result compaction reduces the amount of history that must be prefetched again.
 - `--default-temperature 0` makes tool and code generation more deterministic.
 - `--tool-call-parser qwen3_coder_xml` matches the Qwen3 Coder XML tool format.
-- `--agentic-speculative-policy auto` adds phase classification and policy telemetry.
-- Without `--drafter`, the server does not enter DFlash mode, so it avoids drafter overhead.
+- `--agentic-speculative-policy auto` treats `--drafter` as available capability, not a forced path.
+- `--dflash-ddtree-budget 4` enables DDTree decode where the policy allows it.
 
-Important: this command does not use a draft model. It is fast because cache and compaction dominate this workload.
+Important: `--drafter` does not mean every turn uses DFlash/DDTree. `auto` keeps tool, repair, validation, and finalization turns target-only for quality, while target-prefix-cache handles the repeated prefill cost.
 
 ## What `--agentic-speculative-policy auto` Does
 
@@ -120,8 +129,6 @@ Important: this command does not use a draft model. It is fast because cache and
 It currently works in two modes, depending on whether DFlash is configured.
 
 ### Without `--drafter`
-
-This is the best measured path for the 35B opencode benchmark.
 
 When no `--drafter` is provided:
 
@@ -134,7 +141,7 @@ When no `--drafter` is provided:
 
 So `auto` does not magically load a drafter. It uses only what the server was configured with.
 
-This is why the command below can be extremely fast:
+This remains a good conservative profile when no drafter is available:
 
 ```bash
 uv run rapid-mlx serve /Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-4bit \
@@ -181,9 +188,9 @@ Initial rule shape:
 
 ```text
 if phase in {repair, validation, finalization, tool_json}:
-    use target fallback
-elif prompt_tokens > DFLASH_AGENTIC_POLICY_MAX_PREFILL:
-    use target fallback
+    use target fallback, optionally with target-prefix-cache
+elif prompt has cached prefix:
+    prefill only uncached suffix
 elif recent_acceptance < DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE:
     use target fallback for cooldown window
 elif max_tokens > 512 and greedy and ddtree_budget > 0:
@@ -200,9 +207,9 @@ Environment knobs:
 | `DFLASH_AGENTIC_POLICY_MIN_ACCEPTANCE` | `0.35` | Below this recent acceptance ratio, auto disables speculation temporarily. |
 | `DFLASH_AGENTIC_POLICY_COOLDOWN` | `3` | Number of following requests to keep fallback after poor acceptance. |
 
-## Why DFlash/DDTree/n-gram Did Not Win This Agentic Benchmark
+## Why Auto Beats Forced DFlash/DDTree
 
-DFlash, DDTree, and n-gram lookup optimize decode when draft tokens are accepted cheaply. That can help when the model is producing long continuous text or code.
+DFlash, DDTree, and n-gram lookup optimize decode when draft tokens are accepted cheaply. That can help when the model is producing long continuous text or code. They can hurt tool-heavy loops if forced on every turn.
 
 The opencode benchmark was different:
 
@@ -210,18 +217,19 @@ The opencode benchmark was different:
 - Most time was spent in prefill, not pure decode.
 - Tool turns often needed structured tool-call output, where speculative decode can be fragile.
 - Repair and validation turns benefit more from correctness and cache reuse than from draft-token aggression.
-- DFlash mode disables continuous batching and adds drafter/model coordination overhead.
 
-So the best profile was:
+So the best validated profile is:
 
-- no `--drafter`
 - prefix cache on
+- target-prefix-cache on
 - tool compaction on
 - deterministic decoding
 - correct tool parser
 - `--agentic-speculative-policy auto`
+- `--drafter` present as capability
+- `--dflash-ddtree-budget 4`
 
-DFlash is still useful for other shapes. It just was not the winning profile for this specific long tool-history coding task.
+The benchmark win came from making repeated target-only phases cache-friendly while keeping DDTree/n-gram decode available only when the policy allows it.
 
 ## DFlash/DDTree Example
 

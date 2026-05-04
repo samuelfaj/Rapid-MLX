@@ -719,6 +719,18 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
+        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
+        prefix_boundaries = self._compute_prefix_boundaries(
+            prompt,
+            messages,
+            tools,
+            enable_thinking,
+        )
+        if prefix_boundaries:
+            kwargs["prefix_boundaries"] = prefix_boundaries
+
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,

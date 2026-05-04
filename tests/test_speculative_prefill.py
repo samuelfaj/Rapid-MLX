@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for speculative prefill prompt compression."""
 
+import pytest
+
 from vllm_mlx.engine.batched import BatchedEngine
+from vllm_mlx.engine.base import GenerationOutput
 from vllm_mlx.request import Request, SamplingParams
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 from vllm_mlx.speculative.prefill import (
@@ -286,3 +289,46 @@ def test_batched_engine_does_not_compress_after_tool_result():
     )
 
     assert compressed == messages
+
+
+@pytest.mark.asyncio
+async def test_chat_passes_prefix_boundaries_to_non_stream_generate(monkeypatch):
+    from vllm_mlx.config.server_config import reset_config
+
+    cfg = reset_config()
+    cfg.agentic_speculative_policy = "auto"
+
+    engine = BatchedEngine("dummy")
+    engine._loaded = True
+    engine._tokenizer = StableWordTokenizer()
+    captured = {}
+
+    def fake_template(messages, tools=None, num_images=0, enable_thinking=None):
+        return " ".join(str(message.get("content", "")) for message in messages)
+
+    async def fake_generate(**kwargs):
+        captured.update(kwargs)
+        return GenerationOutput(text="ok")
+
+    monkeypatch.setattr(engine, "_apply_chat_template", fake_template)
+    monkeypatch.setattr(engine, "generate", fake_generate)
+
+    messages = [
+        {"role": "system", "content": "stable system"},
+        {"role": "user", "content": "alpha beta gamma"},
+    ]
+    tools = [{"type": "function", "function": {"name": "noop", "parameters": {}}}]
+
+    output = await engine.chat(
+        messages,
+        tools=tools,
+        max_tokens=16,
+        temperature=0,
+        top_p=1,
+    )
+
+    assert output.text == "ok"
+    assert captured["tools_requested"] is True
+    assert captured["prefix_boundary"] > 0
+    assert captured["prefix_boundaries"]
+    assert captured["agentic_phase"] == "initial_scaffold"

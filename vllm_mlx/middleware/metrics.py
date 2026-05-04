@@ -130,12 +130,6 @@ class MetricsMiddleware:
                 stats = cfg.engine.get_stats()
                 dflash_stats = stats.get("dflash") or {}
                 if dflash_stats:
-                    tps = dflash_stats.get("ddtree_last_generation_tps")
-                    if tps is not None:
-                        try:
-                            engine_gen_tps = max(engine_gen_tps, float(tps))
-                        except Exception:
-                            pass
                     mode = dflash_stats.get("mode")
                     if mode:
                         engine_spec_mode = str(mode)

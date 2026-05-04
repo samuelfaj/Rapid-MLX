@@ -593,6 +593,19 @@ class DFlashEngine(BatchedEngine):
             return None
         return sum(ratios[-3:]) / len(ratios[-3:])
 
+    def _recent_agentic_target_tps(self) -> tuple[float | None, int]:
+        values = [
+            float(item["generation_tps"])
+            for item in self._agentic_policy_history
+            if item.get("mode") in {"target-fallback", "target-prefix-cache"}
+            and float(item.get("generation_tps") or 0.0) > 0
+            and int(item.get("generated_tokens") or 0) >= 32
+        ]
+        if not values:
+            return None, 0
+        recent = values[-4:]
+        return sum(recent) / len(recent), len(values)
+
     def _agentic_policy_decision(
         self,
         prompt: str,
@@ -613,6 +626,7 @@ class DFlashEngine(BatchedEngine):
         cached_tokens = max(0, min(int(cached_tokens or 0), prompt_tokens))
         remaining_prefill_tokens = prompt_tokens - cached_tokens
         recent_acceptance = self._recent_agentic_acceptance()
+        recent_target_tps, target_tps_samples = self._recent_agentic_target_tps()
         phase = phase or "tool_json"
         metadata: dict[str, Any] = {
             "policy": policy,
@@ -624,6 +638,8 @@ class DFlashEngine(BatchedEngine):
             ),
             "remaining_prefill_tokens": remaining_prefill_tokens,
             "recent_acceptance": recent_acceptance,
+            "recent_target_tps": recent_target_tps,
+            "target_tps_samples": target_tps_samples,
             "cooldown": self._agentic_policy_cooldown,
         }
 
@@ -660,6 +676,43 @@ class DFlashEngine(BatchedEngine):
         ):
             metadata["ddtree_max_tokens_limit"] = ddtree_max_tokens_limit
             return "target-fallback", "max_tokens_outside_ddtree_sweet_spot", metadata
+        adaptive_ddtree = _env_bool("DFLASH_AGENTIC_ADAPTIVE_DDTREE", True)
+        min_target_samples = int(
+            os.environ.get("DFLASH_AGENTIC_ADAPTIVE_MIN_TARGET_SAMPLES", "2")
+        )
+        target_tps_trigger = float(
+            os.environ.get("DFLASH_AGENTIC_ADAPTIVE_TARGET_TPS_TRIGGER", "18")
+        )
+        adaptive_min_prompt = int(
+            os.environ.get("DFLASH_AGENTIC_ADAPTIVE_MIN_PROMPT_TOKENS", "4096")
+        )
+        explore_every = max(
+            0,
+            int(os.environ.get("DFLASH_AGENTIC_ADAPTIVE_EXPLORE_EVERY", "8")),
+        )
+        adaptive_ready = (
+            not adaptive_ddtree
+            or (
+                prompt_tokens >= adaptive_min_prompt
+                and target_tps_samples >= min_target_samples
+                and recent_target_tps is not None
+                and recent_target_tps <= target_tps_trigger
+            )
+            or (
+                explore_every > 0
+                and self._lifetime_responses > 0
+                and self._lifetime_responses % explore_every == 0
+            )
+        )
+        metadata["adaptive_ddtree_ready"] = adaptive_ready
+        metadata["adaptive_min_prompt_tokens"] = adaptive_min_prompt
+        metadata["adaptive_target_tps_trigger"] = target_tps_trigger
+        if (
+            adaptive_ddtree
+            and phase in {"initial_scaffold", "long_text_or_code"}
+            and not adaptive_ready
+        ):
+            return "target-fallback", "adaptive_target_warmup", metadata
         if (
             max_tokens > 512
             and greedy_request
@@ -1959,6 +2012,7 @@ class DFlashEngine(BatchedEngine):
                         "accepted_tokens": self._active.accepted_tokens,
                         "generated_tokens": self._active.generated_tokens,
                         "prompt_tokens": self._active.prompt_tokens,
+                        "generation_tps": self._active.generation_tps,
                     }
                 )
         self._active = None

@@ -197,6 +197,8 @@ elif prompt_tokens > DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS:
     use target fallback, optionally with target-prefix-cache
 elif max_tokens > DFLASH_AGENTIC_DDTREE_MAX_TOKENS and DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS=1:
     use target fallback, optionally with target-prefix-cache
+elif DFLASH_AGENTIC_ADAPTIVE_DDTREE=1 and target/cache has not slowed down:
+    use target fallback, optionally with target-prefix-cache
 elif phase is long_text_or_code and ddtree_budget > 0:
     use ddtree-ngram unless DFLASH_AGENTIC_NGRAM_LONG_TEXT=0
 elif max_tokens > 512 and greedy and ddtree_budget > 0:
@@ -215,6 +217,11 @@ Environment knobs:
 | `DFLASH_AGENTIC_DDTREE_MAX_PROMPT_TOKENS` | `16384` | Above this full prompt size, auto prefers target-prefix-cache because DFlash/DDTree prefill overhead dominates. |
 | `DFLASH_AGENTIC_DDTREE_MAX_TOKENS` | `1024` | Sweet-spot generation budget recorded in policy metadata. High agent budgets do not block DDTree unless strict mode is enabled. |
 | `DFLASH_AGENTIC_DDTREE_STRICT_MAX_TOKENS` | `0` | When set, treat `DFLASH_AGENTIC_DDTREE_MAX_TOKENS` as a hard DDTree cutoff. |
+| `DFLASH_AGENTIC_ADAPTIVE_DDTREE` | `1` | Start target/cache for agentic long-code phases, then try DDTree only after target/cache slows or periodic exploration fires. |
+| `DFLASH_AGENTIC_ADAPTIVE_MIN_TARGET_SAMPLES` | `2` | Minimum recent target/cache samples before slowdown can trigger DDTree. |
+| `DFLASH_AGENTIC_ADAPTIVE_TARGET_TPS_TRIGGER` | `18` | Recent target/cache generation TPS threshold below which auto may try DDTree. |
+| `DFLASH_AGENTIC_ADAPTIVE_MIN_PROMPT_TOKENS` | `4096` | Minimum prompt size before slowdown-triggered DDTree is considered. |
+| `DFLASH_AGENTIC_ADAPTIVE_EXPLORE_EVERY` | `8` | Periodically try DDTree every N completed requests to re-check whether it now wins. Set `0` to disable exploration. |
 | `DFLASH_AGENTIC_NGRAM_LONG_TEXT` | `1` | In agentic auto mode, allow n-gram lookup only for `long_text_or_code` phases. Set `0` to disable. |
 
 ## Why Auto Beats Forced DFlash/DDTree

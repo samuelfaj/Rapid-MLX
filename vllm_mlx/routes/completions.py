@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from ..api.models import (
@@ -16,6 +16,7 @@ from ..api.models import (
     CompletionResponse,
     Usage,
 )
+from ..api.structured_cot import normalize_structured_cot_mode
 from ..config import get_config
 from ..middleware.auth import check_rate_limit, verify_api_key
 from ..service.helpers import (
@@ -43,6 +44,15 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     _validate_model_name(request.model)
     engine = get_engine(request.model)
+    structured_cot_value = (
+        request.structured_cot
+        if request.structured_cot is not None
+        else get_config().structured_cot
+    )
+    try:
+        normalize_structured_cot_mode(structured_cot_value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
@@ -59,7 +69,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_completion(engine, prompts[0], request),
+                stream_completion(engine, prompts[0], request, structured_cot_value),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -80,6 +90,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
                 temperature=_resolve_temperature(request.temperature),
                 top_p=_resolve_top_p(request.top_p),
                 stop=request.stop,
+                structured_cot=structured_cot_value,
             ),
             raw_request,
             timeout=timeout,
@@ -124,6 +135,7 @@ async def stream_completion(
     engine,
     prompt: str,
     request: CompletionRequest,
+    structured_cot_value: bool | str | None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     async for output in engine.stream_generate(
@@ -132,6 +144,7 @@ async def stream_completion(
         temperature=_resolve_temperature(request.temperature),
         top_p=_resolve_top_p(request.top_p),
         stop=request.stop,
+        structured_cot=structured_cot_value,
     ):
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",

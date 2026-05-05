@@ -381,6 +381,7 @@ class EngineCore:
         images: list[Any] | None = None,
         videos: list[Any] | None = None,
         prefix_boundary: int = 0,
+        logits_processor_factories: list[Any] | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -409,6 +410,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            logits_processor_factories=logits_processor_factories,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

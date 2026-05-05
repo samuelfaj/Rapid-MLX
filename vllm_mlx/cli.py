@@ -98,6 +98,7 @@ def serve_command(args):
 
     # Import unified server
     from . import server
+    from .api.structured_cot import normalize_structured_cot_mode
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
@@ -162,6 +163,14 @@ def serve_command(args):
 
     # Configure --no-thinking: suppress chain-of-thought in chat template
     server._no_thinking = args.no_thinking
+
+    # Configure Structured-CoT server default.
+    try:
+        structured_cot_mode = normalize_structured_cot_mode(args.structured_cot)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    server._structured_cot = structured_cot_mode
 
     # Configure system prompt pinning
     server._pin_system_prompt = args.pin_system_prompt
@@ -230,6 +239,8 @@ def serve_command(args):
         features.append("gc-control")
     if args.pin_system_prompt:
         features.append("pin-system-prompt")
+    if structured_cot_mode:
+        features.append(f"structured-cot: {structured_cot_mode}")
     if args.cors_origins:
         features.append(f"cors: {', '.join(args.cors_origins)}")
     if features:
@@ -1357,6 +1368,18 @@ Examples:
             "Disable reasoning/thinking parser even if auto-detected. "
             "Thinking tokens will appear as regular content. "
             "Useful for faster responses when chain-of-thought is not needed."
+        ),
+    )
+    serve_parser.add_argument(
+        "--structured-cot",
+        nargs="?",
+        const="plan",
+        default=None,
+        choices=["basic", "plan", "lcb_plan"],
+        help=(
+            "Constrain the opening <think> block by default. "
+            "No value uses 'plan'. Options: basic, plan, lcb_plan. "
+            "Clients can override per request with structured_cot."
         ),
     )
     # GC control (Tier 0 optimization)

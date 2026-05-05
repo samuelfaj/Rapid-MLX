@@ -617,6 +617,10 @@ class BatchedEngine(BaseEngine):
             )
 
         # Use LLM engine for text-only (non-MLLM models)
+        from ..api.structured_cot import (
+            StructuredCoTLogitsProcessor,
+            normalize_structured_cot_mode,
+        )
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -625,10 +629,23 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             stop=stop or [],
         )
+        structured_cot_mode = normalize_structured_cot_mode(
+            kwargs.pop("structured_cot", None)
+        )
+        logits_processor_factories = None
+        if structured_cot_mode:
+            def _structured_cot_factory(request=None, mode=structured_cot_mode):
+                prompt_len = len(request.prompt_token_ids) if request else 0
+                return StructuredCoTLogitsProcessor(self.tokenizer, mode, prompt_len)
+
+            logits_processor_factories = [
+                _structured_cot_factory
+            ]
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            logits_processor_factories=logits_processor_factories,
         )
 
         text = clean_output_text(output.output_text)
@@ -696,6 +713,10 @@ class BatchedEngine(BaseEngine):
             return
 
         # Use LLM engine for text-only
+        from ..api.structured_cot import (
+            StructuredCoTLogitsProcessor,
+            normalize_structured_cot_mode,
+        )
         from ..request import SamplingParams
 
         sampling_params = SamplingParams(
@@ -706,10 +727,23 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        structured_cot_mode = normalize_structured_cot_mode(
+            kwargs.pop("structured_cot", None)
+        )
+        logits_processor_factories = None
+        if structured_cot_mode:
+            def _structured_cot_factory(request=None, mode=structured_cot_mode):
+                prompt_len = len(request.prompt_token_ids) if request else 0
+                return StructuredCoTLogitsProcessor(self.tokenizer, mode, prompt_len)
+
+            logits_processor_factories = [
+                _structured_cot_factory
+            ]
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            logits_processor_factories=logits_processor_factories,
         )
 
         async for output in self._engine.stream_outputs(request_id):

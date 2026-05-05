@@ -207,6 +207,9 @@ class ChatCompletionRequest(BaseModel):
     timeout: float | None = None
     # Thinking/reasoning control (Qwen3 style).  None = server default.
     enable_thinking: bool | None = None
+    # Constrain the opening <think> block to compact structured CoT.
+    # true defaults to "plan"; also accepts "basic", "plan", or "lcb_plan".
+    structured_cot: bool | str | None = None
     # Number of completions (only n=1 supported)
     n: int | None = None
 
@@ -289,6 +292,8 @@ class CompletionRequest(BaseModel):
     top_logprobs: int | None = None  # 0-20, per OpenAI spec
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # Constrain the opening <think> block to compact structured CoT.
+    structured_cot: bool | str | None = None
 
 
 class CompletionChoice(BaseModel):

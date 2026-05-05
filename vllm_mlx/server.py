@@ -189,6 +189,7 @@ _gc_control: bool = True  # Disable GC during generation to avoid latency spikes
 _no_thinking: bool = (
     False  # --no-thinking: force enable_thinking=False in chat template
 )
+_structured_cot: bool | str | None = None  # --structured-cot server default
 
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
@@ -588,6 +589,7 @@ def _sync_config() -> None:
     cfg.cloud_router = _cloud_router
     cfg.gc_control = _gc_control
     cfg.no_thinking = _no_thinking
+    cfg.structured_cot = _structured_cot
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash

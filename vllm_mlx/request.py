@@ -106,6 +106,7 @@ class Request:
 
     # For BatchGenerator integration
     batch_uid: int | None = None  # UID assigned by BatchGenerator
+    logits_processor_factories: list[Any] | None = None
 
     # Prefix cache fields
     prompt_cache: list[Any] | None = None  # Cached KV state from prefix cache

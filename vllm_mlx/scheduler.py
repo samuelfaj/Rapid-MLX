@@ -2066,10 +2066,21 @@ class Scheduler:
             # fall back to no-cache insert instead of crashing.
             # Create per-request logits processors
             request_logits_processors = None
+            processors = []
             if self._tool_logits_processor_factory:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
-                    request_logits_processors = [[processor]]
+                    processors.append(processor)
+            if request.logits_processor_factories:
+                for factory in request.logits_processor_factories:
+                    try:
+                        processor = factory(request)
+                    except TypeError:
+                        processor = factory()
+                    if processor is not None:
+                        processors.append(processor)
+            if processors:
+                request_logits_processors = [processors]
 
             # Per-request sampler (temperature/top_p may differ per request).
             # Without this, all requests use the BatchGenerator's default

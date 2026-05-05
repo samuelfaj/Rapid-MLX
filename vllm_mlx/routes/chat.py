@@ -24,6 +24,7 @@ from ..api.models import (
     TokenLogProb,
     Usage,
 )
+from ..api.structured_cot import normalize_structured_cot_mode
 from ..api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
@@ -129,6 +130,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     """
     _validate_model_name(request.model)
     engine = get_engine(request.model)
+    cfg = get_config()
 
     # Validate messages is non-empty
     if not request.messages:
@@ -177,6 +179,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             status_code=400,
             detail="top_logprobs must be between 0 and 20",
         )
+    structured_cot_value = (
+        request.structured_cot
+        if request.structured_cot is not None
+        else cfg.structured_cot
+    )
+    try:
+        normalize_structured_cot_mode(structured_cot_value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # --- Detailed request logging ---
     n_msgs = len(request.messages)
@@ -335,6 +346,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         chat_kwargs["enable_thinking"] = request.enable_thinking
     elif cfg.no_thinking:
         chat_kwargs["enable_thinking"] = False
+    if structured_cot_value is not None:
+        chat_kwargs["structured_cot"] = structured_cot_value
 
     # Cloud routing: offload large-context requests to cloud LLM
     if cfg.cloud_router and not engine.is_mllm and hasattr(engine, "build_prompt"):

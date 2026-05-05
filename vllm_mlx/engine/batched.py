@@ -196,6 +196,7 @@ class BatchedEngine(BaseEngine):
         self._gpu_memory_utilization = gpu_memory_utilization
         self._is_mllm = force_mllm or is_mllm_model(model_name)
         self._tool_logits_processor_factory = None
+        self._tool_logits_parser_name = None
 
         self._model = None
         self._processor = None  # For MLLM
@@ -386,6 +387,28 @@ class BatchedEngine(BaseEngine):
                 bool(self._scheduler_config and self._scheduler_config.enable_mtp)
             ),
         ).result()
+
+        if self._tool_logits_parser_name and self._tool_logits_processor_factory is None:
+            try:
+                from ..api.tool_logits import create_tool_logits_processor
+
+                parser_name = self._tool_logits_parser_name
+                tokenizer = self._tokenizer
+
+                def factory(tools=None, _parser_name=parser_name, _tok=tokenizer):
+                    return create_tool_logits_processor(
+                        _parser_name,
+                        _tok,
+                        tools=tools,
+                    )
+
+                self._tool_logits_processor_factory = factory
+                logger.info(
+                    "Tool logits bias enabled for parser after tokenizer load: %s",
+                    parser_name,
+                )
+            except Exception as e:
+                logger.warning("Failed to set up deferred tool logits bias: %s", e)
 
         # Validate MTP support if enabled
         if self._scheduler_config and self._scheduler_config.enable_mtp:
@@ -632,6 +655,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            disable_mtp=bool(kwargs.pop("disable_mtp", False)),
         )
 
         text = clean_output_text(output.output_text)
@@ -709,10 +733,12 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        disable_mtp = bool(kwargs.pop("disable_mtp", False))
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            disable_mtp=disable_mtp,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -790,6 +816,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            disable_mtp=bool(tools),
             **kwargs,
         )
 
@@ -910,6 +937,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            disable_mtp=bool(tools),
             **kwargs,
         ):
             yield output

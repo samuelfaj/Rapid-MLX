@@ -358,6 +358,40 @@ class TestSchedulerBasic:
 
         assert scheduler.get_num_waiting() == 1
         assert scheduler.has_requests()
+
+    def test_disable_mtp_request_gets_noop_logits_processor(
+        self, mock_model, mock_tokenizer
+    ):
+        """Tool requests can bypass MTP while the server keeps MTP enabled."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+        )
+        captured = {}
+
+        class FakeBatchGenerator:
+            def insert(self, *args, **kwargs):
+                captured["logits_processors"] = kwargs.get("logits_processors")
+                return [7]
+
+        scheduler.batch_generator = FakeBatchGenerator()
+        scheduler._ensure_batch_generator = lambda _sampling_params: None
+
+        request = Request(
+            request_id="test-1",
+            prompt="Hello world",
+            sampling_params=SamplingParams(max_tokens=10),
+            disable_mtp=True,
+        )
+        scheduler.add_request(request)
+        scheduled = scheduler._schedule_waiting()
+
+        assert scheduled == [request]
+        processors = captured["logits_processors"]
+        assert processors is not None
+        assert len(processors[0]) == 1
+        assert processors[0][0]([1, 2], "logits") == "logits"
         assert scheduler.get_request("test-1") is not None
 
     def test_add_duplicate_request(self, mock_model, mock_tokenizer):

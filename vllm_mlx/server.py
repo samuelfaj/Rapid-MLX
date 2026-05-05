@@ -531,9 +531,23 @@ def load_model(
                 # Set on BatchedEngine for use during scheduler init
                 if hasattr(_engine, "_tool_logits_processor_factory"):
                     _engine._tool_logits_processor_factory = factory
+                if (
+                    hasattr(_engine, "_engine")
+                    and _engine._engine is not None
+                    and hasattr(_engine._engine, "engine")
+                    and hasattr(_engine._engine.engine, "scheduler")
+                ):
+                    _engine._engine.engine.scheduler._tool_logits_processor_factory = factory
                 logger.info(f"Tool logits bias enabled for parser: {_tool_call_parser}")
             else:
-                logger.warning("Tool logits bias requested but tokenizer not available")
+                if hasattr(_engine, "_tool_logits_parser_name"):
+                    _engine._tool_logits_parser_name = _tool_call_parser
+                    logger.info(
+                        "Tool logits bias will be enabled after tokenizer load "
+                        f"for parser: {_tool_call_parser}"
+                    )
+                else:
+                    logger.warning("Tool logits bias requested but tokenizer not available")
         except Exception as e:
             logger.warning(f"Failed to set up tool logits bias: {e}")
 

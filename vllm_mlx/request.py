@@ -120,6 +120,7 @@ class Request:
     # Multimodal content (images, video) - raw inputs
     images: list[Any] | None = None
     videos: list[Any] | None = None
+    disable_mtp: bool = False
 
     # Processed multimodal inputs for VLM batching
     pixel_values: Any | None = None  # Processed image tensors (mx.array)

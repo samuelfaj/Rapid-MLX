@@ -222,6 +222,34 @@ class TestStreamingPostProcessorToolCalls:
         events = pp.process_chunk(_make_output("extra text"))
         assert len(events) == 0
 
+    def test_duplicate_streaming_tool_calls_are_suppressed(self):
+        """After one tool call event, repeated parser hits are not re-emitted."""
+        tool_parser = self._make_tool_parser()
+        tool_parser.extract_tool_calls_streaming.return_value = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": "{}"},
+                }
+            ]
+        }
+
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_parser_instance=tool_parser,
+        )
+        pp = StreamingPostProcessor(cfg)
+        pp.reset()
+
+        first = pp.process_chunk(_make_output("<tool_call>"))
+        second = pp.process_chunk(_make_output("<tool_call>"))
+
+        assert len(first) == 1
+        assert first[0].type == "tool_call"
+        assert second == []
+
     def test_fallback_tool_detection_on_finalize(self):
         """Finalize detects tool calls when streaming detection missed them."""
         tool_parser = self._make_tool_parser()
@@ -292,6 +320,99 @@ class TestStreamingPostProcessorToolCalls:
         args = json.loads(events[0].tool_calls[0]["function"]["arguments"])
         assert isinstance(args["todos"], list)
         assert args["todos"][0]["content"] == "Initialize"
+
+    def test_tool_call_string_param_object_is_serialized(self):
+        """String-typed tool params must stay valid for strict clients like pi."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        chunks = pp._normalize_tool_call_chunks(
+            [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": {
+                            "path": "/tmp/package.json",
+                            "content": {"name": "demo"},
+                        },
+                    },
+                }
+            ]
+        )
+
+        args = json.loads(chunks[0]["function"]["arguments"])
+        assert args["path"] == "/tmp/package.json"
+        assert args["content"] == '{\n  "name": "demo"\n}'
+
+    def test_truncated_xml_tool_call_emits_tool_call_not_content(self):
+        """Malformed Qwen XML opening is still translated to a tool call."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(
+            _make_output(
+                "=write>\n"
+                "<parameter=content>\n"
+                "hello\n"
+                "</parameter>\n"
+                "<parameter=path>\n"
+                "/tmp/a.txt\n"
+                "</parameter>\n"
+                "</function>",
+                finished=True,
+            )
+        )
+
+        tool_events = [event for event in events if event.type == "tool_call"]
+        assert len(tool_events) == 1
+        args = json.loads(tool_events[0].tool_calls[0]["function"]["arguments"])
+        assert args["content"] == "hello"
+        assert args["path"] == "/tmp/a.txt"
 
     def test_partial_calling_tool_marker_is_buffered(self):
         """Do not leak partial generic tool markers as assistant text."""

@@ -881,6 +881,46 @@ class TestQwen3CoderParser:
         args = json.loads(result.tool_calls[0]["arguments"])
         assert args["city"] == "Berlin"
 
+    def test_truncated_function_opening_xml_format(self):
+        """Test XML tool calls with the opening '<function' bytes omitted."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                }
+            ]
+        }
+        _, calls = parse_tool_calls(
+            (
+                "=write>\n"
+                "<parameter=content>\n"
+                "hello\n"
+                "</parameter>\n"
+                "<parameter=path>\n"
+                "/tmp/a.txt\n"
+                "</parameter>\n"
+                "</function>"
+            ),
+            request=request,
+        )
+
+        assert calls is not None
+        assert len(calls) == 1
+        assert calls[0].function.name == "write"
+        args = json.loads(calls[0].function.arguments)
+        assert args["content"] == "hello"
+        assert args["path"] == "/tmp/a.txt"
+
     def test_bare_multi_function_without_wrapper(self):
         """Test multiple bare <function=...> blocks without <tool_call> wrapper."""
         parser = HermesToolParser()

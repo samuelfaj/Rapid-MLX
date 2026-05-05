@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from ..api.tool_calling import parse_tool_calls
@@ -67,6 +68,16 @@ def _has_partial_calling_tool_marker(text: str) -> bool:
             if _starts_current_line(tail, start):
                 return True
     return False
+
+
+def _has_xml_tool_marker(text: str) -> bool:
+    if "<parameter=" not in text:
+        return False
+    return bool(
+        "<function=" in text
+        or "<tool_call>" in text
+        or re.search(r"(?m)^\s*=[A-Za-z_][\w-]*>", text)
+    )
 
 
 def _starts_current_line(text: str, start: int) -> bool:
@@ -213,6 +224,58 @@ class StreamingPostProcessor:
             return False
         return all(key in arguments for key in required)
 
+    def _tool_param_schemas(self, name: str | None) -> dict[str, dict]:
+        if not name or not isinstance(self.request, dict):
+            return {}
+        tools = self.request.get("tools")
+        if not isinstance(tools, list):
+            return {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict) or function.get("name") != name:
+                continue
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                return {}
+            properties = parameters.get("properties")
+            return properties if isinstance(properties, dict) else {}
+        return {}
+
+    def _normalize_tool_call_arguments(self, name: str | None, arguments):
+        schemas = self._tool_param_schemas(name)
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except (TypeError, ValueError):
+                return arguments
+        else:
+            parsed = arguments
+
+        if not isinstance(parsed, dict):
+            return json.dumps(parsed)
+
+        for param_name, param_value in list(parsed.items()):
+            schema = schemas.get(param_name)
+            if not isinstance(schema, dict):
+                continue
+            if schema.get("type") == "string" and not isinstance(param_value, str):
+                parsed[param_name] = json.dumps(param_value, indent=2)
+
+        return json.dumps(parsed)
+
+    def _normalize_tool_call_chunks(self, chunks: list[dict]) -> list[dict]:
+        for chunk in chunks:
+            function = chunk.get("function") if isinstance(chunk, dict) else None
+            if not isinstance(function, dict):
+                continue
+            function["arguments"] = self._normalize_tool_call_arguments(
+                function.get("name"),
+                function.get("arguments", "{}"),
+            )
+        return chunks
+
     def _tool_calls_to_stream_chunks(self, tool_calls) -> list[dict]:
         chunks = []
         for i, tc in enumerate(tool_calls):
@@ -243,7 +306,9 @@ class StreamingPostProcessor:
                     "type": "function",
                     "function": {
                         "name": name,
-                        "arguments": arguments,
+                        "arguments": self._normalize_tool_call_arguments(
+                            name, arguments
+                        ),
                     },
                 }
             )
@@ -349,6 +414,17 @@ class StreamingPostProcessor:
         else:
             content, reasoning = delta_text, None
 
+        if self.tool_calls_detected:
+            if output.finished:
+                return [
+                    StreamEvent(
+                        type="finish",
+                        finish_reason="tool_calls",
+                        tool_calls_detected=True,
+                    )
+                ]
+            return []
+
         # Tool call detection on content
         if self.tool_parser and content:
             result = self._detect_tool_calls(content)
@@ -428,6 +504,17 @@ class StreamingPostProcessor:
 
         content = delta_msg.content
         reasoning = delta_msg.reasoning
+
+        if self.tool_calls_detected:
+            if output.finished:
+                return [
+                    StreamEvent(
+                        type="finish",
+                        finish_reason="tool_calls",
+                        tool_calls_detected=True,
+                    )
+                ]
+            return []
 
         # MiniMax redirect: tool calls wrapped in <think> blocks
         if self.tool_parser and reasoning:
@@ -530,6 +617,16 @@ class StreamingPostProcessor:
 
         # Tool call detection
         if self.tool_parser and delta_text:
+            if self.tool_calls_detected:
+                if output.finished:
+                    return [
+                        StreamEvent(
+                            type="finish",
+                            finish_reason="tool_calls",
+                            tool_calls_detected=True,
+                        )
+                    ]
+                return []
             result = self._detect_tool_calls(delta_text)
             if result is None:
                 return []
@@ -643,6 +740,22 @@ class StreamingPostProcessor:
                 )
                 self.tool_calls_detected = True
 
+        if _has_xml_tool_marker(_fallback_text) and not self.tool_calls_detected:
+            _, tool_calls = parse_tool_calls(_fallback_text, self.request)
+            if tool_calls:
+                chunks = self._tool_calls_to_stream_chunks(tool_calls)
+                if not chunks:
+                    return events
+                events.append(
+                    StreamEvent(
+                        type="tool_call",
+                        tool_calls=chunks,
+                        finish_reason="tool_calls",
+                        tool_calls_detected=True,
+                    )
+                )
+                self.tool_calls_detected = True
+
         return events
 
     def _detect_tool_calls(self, content: str) -> dict | None:
@@ -687,8 +800,22 @@ class StreamingPostProcessor:
             return None  # inside tool markup
 
         if "tool_calls" in tool_result:
+            tool_result["tool_calls"] = self._normalize_tool_call_chunks(
+                tool_result["tool_calls"]
+            )
             self.tool_calls_detected = True
             return tool_result
+
+        if _has_xml_tool_marker(self.tool_accumulated_text):
+            _, tool_calls = parse_tool_calls(self.tool_accumulated_text, self.request)
+            if tool_calls:
+                chunks = self._tool_calls_to_stream_chunks(tool_calls)
+                if not chunks:
+                    return None
+                self.tool_calls_detected = True
+                return {"tool_calls": chunks}
+            if "</function>" not in self.tool_accumulated_text:
+                return None
 
         if "Calling tool:" in self.tool_accumulated_text:
             _, tool_calls = parse_tool_calls(self.tool_accumulated_text, self.request)

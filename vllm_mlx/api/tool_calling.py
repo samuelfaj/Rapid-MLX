@@ -409,8 +409,27 @@ def parse_tool_calls(
     if not nemotron_matches:
         nemotron_pattern = r"<toolcall>\s*(\w+)\s*\n(.*?)</toolcall>"
         nemotron_matches = re.findall(nemotron_pattern, text, re.DOTALL)
+    if not nemotron_matches:
+        # Some Qwen-style streams drop the opening "<function" bytes and emit
+        # "=write> ... </function>". Treat this as the same XML tool call only
+        # when the body contains explicit parameter tags.
+        nemotron_pattern = (
+            r"(?m)^\s*=([A-Za-z_][\w-]*)>\s*"
+            r"((?:(?!^\s*=[A-Za-z_][\w-]*>).)*?<parameter=[^>]+>.*?</function>)"
+        )
+        nemotron_matches = re.findall(nemotron_pattern, text, re.DOTALL)
+
+    request_tool_names = set()
+    if isinstance(request, dict):
+        for tool in request.get("tools") or []:
+            if isinstance(tool, dict):
+                function = tool.get("function")
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    request_tool_names.add(function["name"])
 
     for name, params_block in nemotron_matches:
+        if request_tool_names and name.strip() not in request_tool_names:
+            continue
         # Parse parameters from <parameter=name>value</parameter> format
         param_pattern = r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>"
         params = re.findall(param_pattern, params_block, re.DOTALL)

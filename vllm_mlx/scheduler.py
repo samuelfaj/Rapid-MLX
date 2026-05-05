@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
 
+
+class _MTPBypassLogitsProcessor:
+    """No-op processor used to route selected requests through mlx-lm's native step."""
+
+    def __call__(self, _tokens: Any, logits: Any) -> Any:
+        return logits
+
 # Error patterns that indicate cache corruption.
 # Each pattern must be specific enough to avoid false positives.
 # The bare word "cache" was removed because it matched unrelated TypeErrors
@@ -995,6 +1002,14 @@ def _install_mtp(
         def _mtp_generation_step(gen_self):
             if not gen_self.uids:
                 return [], []
+
+            if any(gen_self.logits_processors):
+                _skip_state[0] = None
+                for uid in gen_self.uids:
+                    _deferred_drafts.pop(uid, None)
+                    _pending_primary_tokens.pop(uid, None)
+                    _persistent_mtp_caches.pop(uid, None)
+                return _orig_generation_step(gen_self)
 
             gen_self._current_tokens = gen_self._next_tokens
             gen_self._current_logprobs = gen_self._next_logprobs
@@ -2616,6 +2631,10 @@ class Scheduler:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
                     request_logits_processors = [[processor]]
+            if request.disable_mtp:
+                if request_logits_processors is None:
+                    request_logits_processors = [[]]
+                request_logits_processors[0].append(_MTPBypassLogitsProcessor())
 
             # Per-request sampler (temperature/top_p may differ per request).
             # Without this, all requests use the BatchGenerator's default

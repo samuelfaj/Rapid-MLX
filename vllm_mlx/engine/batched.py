@@ -382,6 +382,9 @@ class BatchedEngine(BaseEngine):
             load_model_with_fallback,
             self._model_name,
             tokenizer_config=tokenizer_config,
+            enable_mtp=(
+                bool(self._scheduler_config and self._scheduler_config.enable_mtp)
+            ),
         ).result()
 
         # Validate MTP support if enabled

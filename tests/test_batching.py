@@ -9,6 +9,7 @@ for the vLLM-style continuous batching implementation.
 import asyncio
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -197,6 +198,45 @@ class TestSchedulerConfig:
         assert config.max_num_seqs == 64
         assert config.policy == SchedulingPolicy.PRIORITY
 
+    def test_mtp_defaults_top_k_for_batch_generator(self, monkeypatch):
+        """MTP path should use MTPLX-compatible top_k when request omits it."""
+        import vllm_mlx.scheduler as scheduler_module
+
+        seen = {}
+
+        def fake_make_sampler(**kwargs):
+            seen["sampler"] = kwargs
+            return object()
+
+        class FakeBatchGenerator:
+            def __init__(self, **kwargs):
+                seen["batch"] = kwargs
+                self._step = lambda *args, **kwargs: None
+                self._next = lambda *args, **kwargs: []
+
+        def fake_install_mtp(*args, **kwargs):
+            seen["mtp"] = kwargs
+
+        monkeypatch.setattr(scheduler_module, "make_sampler", fake_make_sampler)
+        monkeypatch.setattr(scheduler_module, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(scheduler_module, "_install_mtp", fake_install_mtp)
+
+        model = MagicMock()
+        model.mtp = object()
+        tokenizer = MagicMock()
+        tokenizer.eos_token_id = None
+        tokenizer.eos_token_ids = set()
+        scheduler = Scheduler(
+            model,
+            tokenizer,
+            SchedulerConfig(enable_prefix_cache=False, enable_mtp=True),
+        )
+
+        scheduler._create_batch_generator(SamplingParams(top_k=0))
+
+        assert seen["sampler"]["top_k"] == 20
+        assert seen["mtp"]["target_top_k"] == 20
+
 
 class TestSchedulerBasic:
     """Basic tests for Scheduler (without real model)."""
@@ -227,6 +267,79 @@ class TestSchedulerBasic:
         assert scheduler.get_num_waiting() == 0
         assert scheduler.get_num_running() == 0
         assert not scheduler.has_requests()
+
+    def test_running_request_tps_uses_last_token_time(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        request = Request(
+            request_id="test-1",
+            prompt="Hello world",
+            sampling_params=SamplingParams(max_tokens=200),
+            arrival_time=time.time() - 10.0,
+        )
+        request.num_prompt_tokens = 10
+        request.status = RequestStatus.RUNNING
+        request.first_token_time = request.arrival_time + 2.0
+        request.last_token_time = request.first_token_time + 1.0
+        request.output_token_ids = list(range(100))
+        scheduler.running[request.request_id] = request
+
+        info = scheduler.get_running_requests_info()[0]
+
+        assert info["completion_tokens"] == 100
+        assert info["tokens_per_second"] == 100.0
+
+    def test_running_request_tps_waits_for_stable_window(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        request = Request(
+            request_id="test-1",
+            prompt="Hello world",
+            sampling_params=SamplingParams(max_tokens=200),
+            arrival_time=time.time() - 1.0,
+        )
+        request.num_prompt_tokens = 10
+        request.status = RequestStatus.RUNNING
+        request.first_token_time = request.arrival_time + 0.5
+        request.last_token_time = request.first_token_time + 0.01
+        request.output_token_ids = [1, 2]
+        scheduler.running[request.request_id] = request
+
+        info = scheduler.get_running_requests_info()[0]
+
+        assert info["completion_tokens"] == 2
+        assert info["tokens_per_second"] is None
+
+    def test_completed_request_info_preserves_final_tps(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+        )
+        request = Request(
+            request_id="test-1",
+            prompt="Hello world",
+            sampling_params=SamplingParams(max_tokens=200),
+            arrival_time=time.time() - 10.0,
+        )
+        request.num_prompt_tokens = 10
+        request.status = RequestStatus.RUNNING
+        request.first_token_time = request.arrival_time + 2.0
+        request.last_token_time = request.first_token_time + 2.0
+        request.output_token_ids = list(range(100))
+        scheduler.completed_request_infos.append(
+            scheduler._request_info(request, status="finished")
+        )
+
+        stats = scheduler.get_stats()
+
+        assert stats["completed_requests"][0]["completion_tokens"] == 100
+        assert stats["completed_requests"][0]["tokens_per_second"] == 50.0
 
     def test_add_request(self, mock_model, mock_tokenizer):
         """Test adding requests to scheduler."""

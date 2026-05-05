@@ -153,23 +153,24 @@ def main():
     total_bytes = sum(v.nbytes for v in quantized.values())
     logger.info(f"MTP weights size: {total_bytes / 1e6:.1f} MB")
 
-    # Ensure config has mtp_num_hidden_layers (for our patch to detect)
+    # Ensure config declares one native MTP layer for runtime injection.
     text_config = config.get("text_config", config)
+    if text_config.get("num_nextn_predict_layers") is None:
+        text_config["num_nextn_predict_layers"] = 1
     if text_config.get("mtp_num_hidden_layers") is None:
         # Read from HF config
         hf_cfg_path = hf_hub_download(args.hf_model, "config.json")
         with open(hf_cfg_path) as f:
             hf_cfg = json.load(f)
         hf_tc = hf_cfg.get("text_config", hf_cfg)
-        mtp_layers = hf_tc.get("mtp_num_hidden_layers", 0)
-        if mtp_layers:
-            if "text_config" in config:
-                config["text_config"]["mtp_num_hidden_layers"] = mtp_layers
-            else:
-                config["mtp_num_hidden_layers"] = mtp_layers
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=2)
-            logger.info(f"Updated config: mtp_num_hidden_layers={mtp_layers}")
+        text_config["mtp_num_hidden_layers"] = hf_tc.get("mtp_num_hidden_layers", 1)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    logger.info(
+        "Updated config: num_nextn_predict_layers=%s, mtp_num_hidden_layers=%s",
+        text_config.get("num_nextn_predict_layers"),
+        text_config.get("mtp_num_hidden_layers"),
+    )
 
     logger.info("\nDone! MTP weights extracted and quantized.")
     logger.info(f"Start server with: --enable-mtp")

@@ -78,7 +78,11 @@ def _is_vendored_arch_model(model_name: str) -> bool:
         return False
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(
+    model_name: str,
+    tokenizer_config: dict = None,
+    enable_mtp: bool = False,
+):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
@@ -139,7 +143,8 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
         # stripped mtp.* weights.  Check if the config declares MTP
         # layers and the model came back without a .mtp attribute;
         # if so, re-inject from the safetensors on disk.
-        _try_inject_mtp_post_load(model, model_name)
+        if enable_mtp:
+            _try_inject_mtp_post_load(model, model_name)
         return model, tokenizer
     except ValueError as e:
         # Fallback for models with non-standard tokenizers, OR newer model_types
@@ -162,12 +167,20 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
                 f"Model has extra/missing parameters (likely VLM / MTP weights), "
                 f"retrying with strict=False: {e}"
             )
-            return _load_strict_false(model_name, tokenizer_config)
+            return _load_strict_false(
+                model_name,
+                tokenizer_config,
+                enable_mtp=enable_mtp,
+            )
         else:
             raise
 
 
-def _load_strict_false(model_name: str, tokenizer_config: dict = None):
+def _load_strict_false(
+    model_name: str,
+    tokenizer_config: dict = None,
+    enable_mtp: bool = False,
+):
     """Load model with strict=False to discard extra weights (e.g., vision tower, MTP)."""
     from mlx_lm.utils import load_model, load_tokenizer
 
@@ -185,20 +198,27 @@ def _load_strict_false(model_name: str, tokenizer_config: dict = None):
         tokenizer_config or {},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    # Inject MTP support if model has MTP config + weights
-    _try_inject_mtp(model, model_path, config)
+    # Inject MTP support only for native MTP serving. The monkey-patch replaces
+    # model.__call__, so AR-only loads must keep the upstream model untouched.
+    if enable_mtp:
+        _try_inject_mtp(model, model_path, config)
     return model, tokenizer
 
 
 def _read_num_mtp_layers(config: dict) -> int:
-    """Read num_nextn_predict_layers from config, checking text_config too.
+    """Read MTP layer count from config, checking text_config too.
 
     Multimodal checkpoints (VLM + MTP) store this under text_config,
     while text-only checkpoints put it at the top level.  Fixes #121.
     """
-    n = config.get("num_nextn_predict_layers", 0)
+    n = config.get("num_nextn_predict_layers", 0) or config.get(
+        "mtp_num_hidden_layers", 0
+    )
     if n == 0:
-        n = config.get("text_config", {}).get("num_nextn_predict_layers", 0)
+        text_config = config.get("text_config", {})
+        n = text_config.get("num_nextn_predict_layers", 0) or text_config.get(
+            "mtp_num_hidden_layers", 0
+        )
     return n
 
 
@@ -232,7 +252,8 @@ def _try_inject_mtp_post_load(model, model_name):
     num_mtp = _read_num_mtp_layers(config)
     if num_mtp > 0 and getattr(model, "mtp", None) is None:
         mtp_file = Path(model_path) / "model-mtp.safetensors"
-        if mtp_file.exists():
+        mtp_alt_file = Path(model_path) / "mtp.safetensors"
+        if mtp_file.exists() or mtp_alt_file.exists():
             logger.info(
                 f"[MTP] Found MTP config (layers={num_mtp}) and weights, injecting..."
             )

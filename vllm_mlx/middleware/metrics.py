@@ -94,11 +94,13 @@ class MetricsMiddleware:
                 if cfg.engine is None:
                     return
                 stats = cfg.engine.get_stats()
-                for request in stats.get("requests") or []:
+                requests = list(stats.get("requests") or [])
+                requests.extend(stats.get("completed_requests") or [])
+                for request in requests:
                     tps = request.get("tokens_per_second")
                     if tps is not None:
                         value = float(tps)
-                        if value > engine_gen_tps:
+                        if value > 0:
                             engine_gen_tps = value
                     ttft = request.get("ttft_s")
                     if ttft is not None and engine_ttft is None:

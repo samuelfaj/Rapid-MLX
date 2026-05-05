@@ -16,6 +16,114 @@ import argparse
 import sys
 
 
+def _children_of(pid: int) -> list[int]:
+    import subprocess
+
+    try:
+        output = subprocess.check_output(
+            ["pgrep", "-P", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    return [int(item) for item in output.split() if item.strip().isdigit()]
+
+
+def _process_tree(root_pids: set[int]) -> set[int]:
+    seen: set[int] = set()
+    pending = list(root_pids)
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pending.extend(_children_of(pid))
+    return seen
+
+
+def _pids_for_port(port: int) -> set[int]:
+    import subprocess
+
+    try:
+        output = subprocess.check_output(
+            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return set()
+    return {int(item) for item in output.split() if item.strip().isdigit()}
+
+
+def kill_command(args) -> None:
+    """Kill the process tree listening on a TCP port."""
+    import os
+    import signal
+    import time
+
+    port = int(args.port)
+    if port <= 0 or port > 65535:
+        print(f"Invalid port: {port}")
+        sys.exit(2)
+
+    root_pids = _pids_for_port(port)
+    if not root_pids:
+        print(f"No process listening on port {port}")
+        return
+
+    pids = _process_tree(root_pids)
+    current_pid = os.getpid()
+    pids.discard(current_pid)
+    if not pids:
+        print(f"No killable process found on port {port}")
+        return
+
+    print(f"Killing port {port}: " + " ".join(str(pid) for pid in sorted(pids)))
+    for pid in sorted(pids, reverse=True):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            print(f"Permission denied sending TERM to pid {pid}: {exc}")
+
+    deadline = time.monotonic() + float(args.timeout)
+    while time.monotonic() < deadline:
+        alive = [pid for pid in pids if _pid_exists(pid)]
+        if not alive:
+            print(f"Port {port} killed")
+            return
+        time.sleep(0.1)
+
+    alive = [pid for pid in pids if _pid_exists(pid)]
+    for pid in sorted(alive, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            print(f"Permission denied sending KILL to pid {pid}: {exc}")
+
+    remaining = [pid for pid in pids if _pid_exists(pid)]
+    if remaining:
+        print("Still alive: " + " ".join(str(pid) for pid in sorted(remaining)))
+        sys.exit(1)
+    print(f"Port {port} killed")
+
+
+def _pid_exists(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _check_disk_space(model_name: str) -> None:
     """Check if there's enough disk space to download the model.
 
@@ -133,6 +241,7 @@ def serve_command(args):
                 if (
                     not args.reasoning_parser
                     and not args.no_thinking
+                    and not args.enable_mtp
                     and auto_config.reasoning_parser
                 ):
                     args.reasoning_parser = auto_config.reasoning_parser
@@ -1574,6 +1683,18 @@ Examples:
     # Models command
     subparsers.add_parser("models", help="List available model aliases")
 
+    # Kill command
+    kill_parser = subparsers.add_parser(
+        "kill", help="Kill the process tree listening on a TCP port"
+    )
+    kill_parser.add_argument("port", type=int, help="TCP port to kill")
+    kill_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=3.0,
+        help="Seconds to wait after SIGTERM before SIGKILL (default: 3)",
+    )
+
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -1679,6 +1800,8 @@ Examples:
         bench_kv_cache_command(args)
     elif args.command == "models":
         models_command(args)
+    elif args.command == "kill":
+        kill_command(args)
     elif args.command == "agents":
         agents_command(args)
     elif args.command == "doctor":

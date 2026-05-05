@@ -44,7 +44,9 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     import mlx.core as mx
     import mlx.nn as nn
 
-    num_mtp_layers = config.get("num_nextn_predict_layers", 0)
+    num_mtp_layers = config.get("num_nextn_predict_layers", 0) or config.get(
+        "mtp_num_hidden_layers", 0
+    )
     if num_mtp_layers == 0:
         logger.info("[MTP inject] num_nextn_predict_layers=0, skipping")
         return False
@@ -52,15 +54,21 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     model_path = Path(model_path)
     mtp_file = model_path / "model-mtp.safetensors"
     if not mtp_file.exists():
-        logger.warning(f"[MTP inject] model-mtp.safetensors not found in {model_path}")
+        mtp_file = model_path / "mtp.safetensors"
+    if not mtp_file.exists():
+        logger.warning(f"[MTP inject] MTP sidecar not found in {model_path}")
         return False
 
-    args = model.args
+    text_model = getattr(model, "language_model", model)
+    args = text_model.args
 
     # Import model components
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
     from mlx_lm.models.cache import KVCache
-    from mlx_lm.models.qwen3_next import Qwen3NextDecoderLayer
+    if type(text_model).__module__.endswith("qwen3_5"):
+        from mlx_lm.models.qwen3_5 import DecoderLayer as MTPDecoderLayer
+    else:
+        from mlx_lm.models.qwen3_next import Qwen3NextDecoderLayer as MTPDecoderLayer
 
     # --- Step 1: Create MTP module ---
     logger.info(f"[MTP inject] Creating MTP module ({num_mtp_layers} layers)")
@@ -78,11 +86,15 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             # MTP decoder uses full attention (not linear/delta-net)
             fa_idx = args.full_attention_interval - 1
             self.layers = [
-                Qwen3NextDecoderLayer(args, layer_idx=fa_idx) for _ in range(n_layers)
+                MTPDecoderLayer(args, layer_idx=fa_idx) for _ in range(n_layers)
             ]
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     mtp = _MTPModule(args, num_mtp_layers)
+    raw = mx.load(str(mtp_file))
+    has_quantized_fc = any(
+        key in raw for key in ("mtp.fc.scales", "mtp.fc.biases")
+    )
 
     # --- Step 2: Quantize MTP module to match base model ---
     # nn.quantize handles Linear → QuantizedLinear but NOT SwitchLinear →
@@ -93,6 +105,11 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
         bits = quant_config.get("bits", 6)
         group_size = quant_config.get("group_size", 64)
         mode = quant_config.get("mode", "affine")
+        if mtp_file.name == "mtp.safetensors":
+            # MTPLX Optimized-Speed ships a pre-quantized MTP sidecar using
+            # 4-bit/group-32 tensors even when the base config defaults differ.
+            bits = 4
+            group_size = 32
 
         # 2a: Replace SwitchLinear → QuantizedSwitchLinear in MoE blocks
         try:
@@ -130,9 +147,10 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
         def _mtp_quant_pred(path, module):
             if not isinstance(module, nn.Linear):
                 return False
-            # fc kept as FP (concat projection)
+            # MTPLX Optimized-Speed keeps fc dense; extracted UD sidecars may
+            # already contain quantized fc.{weight,scales,biases}.
             if path == "fc":
-                return False
+                return has_quantized_fc
             # shared_expert_gate kept as FP (small, stored unquantized)
             if path.endswith("shared_expert_gate"):
                 return False
@@ -145,7 +163,6 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
 
     # --- Step 3: Load MTP weights ---
     logger.info(f"[MTP inject] Loading weights from {mtp_file.name}")
-    raw = mx.load(str(mtp_file))
     mtp_weights = {
         k.removeprefix("mtp."): v for k, v in raw.items() if k.startswith("mtp.")
     }
@@ -154,6 +171,7 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
     logger.info(f"[MTP inject] Loaded {len(mtp_weights)} MTP weight tensors")
 
     # --- Step 4: Attach MTP and monkey-patch model class ---
+    text_model.mtp = mtp
     model.mtp = mtp
 
     original_class = model.__class__
@@ -167,7 +185,8 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             cache=None,
             return_hidden: bool = False,
         ):
-            inner = self.model
+            lm = getattr(self, "language_model", self)
+            inner = lm.model
             hidden_states = inner.embed_tokens(inputs)
             if cache is None:
                 cache = [None] * len(inner.layers)
@@ -177,12 +196,12 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=c)
             normed = inner.norm(hidden_states)
-            if self.args.tie_word_embeddings:
+            if lm.args.tie_word_embeddings:
                 out = inner.embed_tokens.as_linear(normed)
             else:
-                out = self.lm_head(normed)
+                out = lm.lm_head(normed)
             if return_hidden:
-                return out, hidden_states  # pre-norm hidden states
+                return out, normed
             return out
 
         def mtp_forward(
@@ -191,26 +210,35 @@ def inject_mtp_support(model: Any, model_path, config: dict) -> bool:
             next_token_ids,
             cache=None,
             mtp_cache=None,
+            return_hidden: bool = False,
         ):
             """Run MTP head: predict token n+2 from hidden states + token n+1."""
-            input_embeds = self.model.embed_tokens(next_token_ids)
-            h = self.mtp.pre_fc_norm_hidden(hidden_states)
-            e = self.mtp.pre_fc_norm_embedding(input_embeds)
-            x = self.mtp.fc(mx.concatenate([h, e], axis=-1))
-            layer = self.mtp.layers[0]
+            lm = getattr(self, "language_model", self)
+            inner = lm.model
+            mtp_root = lm.mtp
+            input_embeds = inner.embed_tokens(next_token_ids)
+            e = mtp_root.pre_fc_norm_embedding(input_embeds)
+            h = mtp_root.pre_fc_norm_hidden(hidden_states)
+            x = mtp_root.fc(mx.concatenate([e, h], axis=-1))
+            layer = mtp_root.layers[0]
             c = mtp_cache[0] if mtp_cache else None
             mask = create_attention_mask(x, c)
             x = layer(x, mask=mask, cache=c)
-            x = self.mtp.norm(x)
-            if self.args.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(x)
-            return self.lm_head(x)
+            x = mtp_root.norm(x)
+            if lm.args.tie_word_embeddings:
+                logits = inner.embed_tokens.as_linear(x)
+            else:
+                logits = lm.lm_head(x)
+            if return_hidden:
+                return logits, x
+            return logits
 
         def make_mtp_cache(self):
             """Create KV cache for MTP layers."""
-            if self.mtp is None:
+            lm = getattr(self, "language_model", self)
+            if lm.mtp is None:
                 return None
-            return [KVCache() for _ in self.mtp.layers]
+            return [KVCache() for _ in lm.mtp.layers]
 
     model.__class__ = _Qwen3NextMTP
     logger.info("[MTP inject] Model class patched with MTP support")
@@ -244,7 +272,9 @@ def validate_mtp_support(model: Any) -> bool:
             if lm is not None:
                 args = getattr(lm, "args", None)
         if args is not None:
-            num_mtp = getattr(args, "num_nextn_predict_layers", 0)
+            num_mtp = getattr(args, "num_nextn_predict_layers", 0) or getattr(
+                args, "mtp_num_hidden_layers", 0
+            )
         if num_mtp > 0:
             logger.warning(
                 "[MTP] Model config has num_nextn_predict_layers=%d but "

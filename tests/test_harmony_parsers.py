@@ -1319,6 +1319,27 @@ class TestServeLogLevelFlags:
         assert 'choices=["DEBUG", "INFO", "WARNING", "ERROR"]' in source
 
 
+class TestKillCommand:
+    def test_cli_has_kill_command(self):
+        import importlib
+        import inspect
+
+        source = inspect.getsource(importlib.import_module("vllm_mlx.cli").main)
+        assert '"kill"' in source
+        assert "kill_command(args)" in source
+
+    def test_kill_command_helpers_use_port_process_tree(self):
+        import importlib
+        import inspect
+
+        mod = importlib.import_module("vllm_mlx.cli")
+        source = inspect.getsource(mod.kill_command)
+        assert "_pids_for_port(port)" in source
+        assert "_process_tree(root_pids)" in source
+        assert "signal.SIGTERM" in source
+        assert "signal.SIGKILL" in source
+
+
 # ============================================================================
 # SUPPORTS_NATIVE_TOOL_FORMAT Tests
 # ============================================================================

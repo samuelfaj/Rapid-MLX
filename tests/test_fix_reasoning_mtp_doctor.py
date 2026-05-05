@@ -136,6 +136,67 @@ class TestMTPQuantizedSwitchLinear:
         assert qsl.weight.shape[0] == ne  # num_experts preserved
 
 
+class TestMTPLoaderGate:
+    """MTP injection must only happen when native MTP serving is enabled."""
+
+    def test_load_model_does_not_inject_mtp_when_disabled(self, monkeypatch):
+        import vllm_mlx.utils.tokenizer as tokenizer_module
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        injected = []
+
+        monkeypatch.setattr(tokenizer_module, "_register_vendored_archs", lambda: None)
+        monkeypatch.setattr(tokenizer_module, "_needs_tokenizer_fallback", lambda _: False)
+        monkeypatch.setattr(tokenizer_module, "_is_vendored_arch_model", lambda _: False)
+        monkeypatch.setattr(
+            "vllm_mlx.models.gemma4_text.is_gemma4_model",
+            lambda _: False,
+        )
+        monkeypatch.setattr(
+            "mlx_lm.load",
+            lambda *args, **kwargs: (model, tokenizer),
+        )
+        monkeypatch.setattr(
+            tokenizer_module,
+            "_try_inject_mtp_post_load",
+            lambda *args, **kwargs: injected.append(args),
+        )
+
+        assert tokenizer_module.load_model_with_fallback("model")[0] is model
+        assert injected == []
+
+    def test_load_model_injects_mtp_when_enabled(self, monkeypatch):
+        import vllm_mlx.utils.tokenizer as tokenizer_module
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        injected = []
+
+        monkeypatch.setattr(tokenizer_module, "_register_vendored_archs", lambda: None)
+        monkeypatch.setattr(tokenizer_module, "_needs_tokenizer_fallback", lambda _: False)
+        monkeypatch.setattr(tokenizer_module, "_is_vendored_arch_model", lambda _: False)
+        monkeypatch.setattr(
+            "vllm_mlx.models.gemma4_text.is_gemma4_model",
+            lambda _: False,
+        )
+        monkeypatch.setattr(
+            "mlx_lm.load",
+            lambda *args, **kwargs: (model, tokenizer),
+        )
+        monkeypatch.setattr(
+            tokenizer_module,
+            "_try_inject_mtp_post_load",
+            lambda *args, **kwargs: injected.append(args),
+        )
+
+        assert (
+            tokenizer_module.load_model_with_fallback("model", enable_mtp=True)[0]
+            is model
+        )
+        assert injected == [(model, "model")]
+
+
 # ======================================================================
 # Fix 3: Doctor runner TimeoutExpired bytes handling
 # ======================================================================
@@ -344,3 +405,13 @@ class TestMTPGenerateStep:
         mx.eval(mask)
 
         assert bool(mask.item()) is True
+
+    def test_mtp_layer_detection_accepts_mtp_num_hidden_layers(self):
+        """Qwen3.6 source configs may expose MTP only as mtp_num_hidden_layers."""
+        from vllm_mlx.utils.tokenizer import _read_num_mtp_layers
+
+        assert _read_num_mtp_layers({"mtp_num_hidden_layers": 1}) == 1
+        assert (
+            _read_num_mtp_layers({"text_config": {"mtp_num_hidden_layers": 1}})
+            == 1
+        )

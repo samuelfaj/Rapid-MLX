@@ -101,8 +101,10 @@ class RequestRecorder:
 
             started_at = float(entry.get("started_at") or now)
             first_at = entry.get("first_token_at")
+            last_at = entry.get("last_token_at") or now
             text_chunks = int(entry.get("text_chunks", 0))
             elapsed = max(0.0, now - started_at)
+            token_elapsed = max(0.0, float(last_at) - started_at)
             ttft = (first_at - started_at) if first_at else None
             ptoks = (
                 int(prompt_tokens)
@@ -119,32 +121,38 @@ class RequestRecorder:
                 not non_streaming
                 and ttft is not None
                 and text_chunks > 1
-                and elapsed > ttft + 0.01
+                and token_elapsed > ttft + 0.01
             ):
-                generation_window = elapsed - ttft
+                generation_window = token_elapsed - ttft
                 prompt_tps = (ptoks / ttft) if ttft > 0.01 else 0.0
             else:
                 generation_window = elapsed
                 ttft = None
                 prompt_tps = 0.0
 
-            has_engine_tps = engine_gen_tps is not None and engine_gen_tps > 0
             generation_tps = (
-                float(engine_gen_tps)
-                if has_engine_tps
-                else (gtoks / generation_window if generation_window > 0.01 else 0.0)
+                gtoks / generation_window if generation_window > 0.01 else 0.0
             )
+            has_engine_tps = (
+                engine_gen_tps is not None and engine_gen_tps > 0
+            )
+            if has_engine_tps:
+                generation_tps = float(engine_gen_tps)
             if engine_ttft is not None and engine_ttft > 0:
                 ttft = float(engine_ttft)
                 if ptoks > 0 and ttft > 0.01:
                     prompt_tps = ptoks / ttft
                 if not has_engine_tps:
-                    decode_window = elapsed - ttft
+                    decode_elapsed = token_elapsed if text_chunks > 1 else elapsed
+                    decode_window = decode_elapsed - ttft
                     if decode_window > 0.01 and gtoks > 0:
                         generation_tps = gtoks / decode_window
 
+            decode_elapsed = token_elapsed if text_chunks > 1 else elapsed
             decode_window = (
-                elapsed - ttft if ttft is not None and elapsed > ttft + 0.01 else 0.0
+                decode_elapsed - ttft
+                if ttft is not None and decode_elapsed > ttft + 0.01
+                else 0.0
             )
             decode_tps = (gtoks / decode_window) if decode_window > 0.01 else 0.0
             if has_engine_tps:

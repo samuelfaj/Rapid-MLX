@@ -899,7 +899,11 @@ Examples:
                 logger.info(
                     f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
                 )
-            if not args.reasoning_parser and auto_config.reasoning_parser:
+            if (
+                not args.reasoning_parser
+                and not getattr(args, "enable_mtp", False)
+                and auto_config.reasoning_parser
+            ):
                 args.reasoning_parser = auto_config.reasoning_parser
                 logger.info(
                     f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"

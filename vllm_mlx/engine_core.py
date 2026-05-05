@@ -424,7 +424,14 @@ class EngineCore:
             async with self._hybrid_lock:
                 now = loop.time()
                 elapsed = now - self._last_request_time
-                gap = 0.5 if self._last_request_time == 0.0 else 0.2
+                max_num_seqs = getattr(
+                    self.config.scheduler_config,
+                    "max_num_seqs",
+                    0,
+                )
+                gap = 0.0 if max_num_seqs == 1 else (
+                    0.5 if self._last_request_time == 0.0 else 0.2
+                )
                 if elapsed < gap:
                     await asyncio.sleep(gap - elapsed)
                 self._last_request_time = loop.time()

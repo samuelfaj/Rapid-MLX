@@ -131,6 +131,7 @@ class Request:
     # Metadata
     finish_reason: str | None = None
     first_token_time: float | None = None  # Time when first output token was generated
+    last_token_time: float | None = None  # Time when latest output token was generated
     cache_hit_type: str | None = (
         None  # Type of cache hit: exact/prefix/supersequence/lcp/miss
     )

@@ -368,6 +368,388 @@ class TestStreamingPostProcessorToolCalls:
         assert args["path"] == "/tmp/package.json"
         assert args["content"] == '{\n  "name": "demo"\n}'
 
+    def test_direct_tool_call_chunks_drop_missing_required_args(self):
+        """Direct parser chunks must not send invalid empty tool calls to clients."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        chunks = pp._normalize_tool_call_chunks(
+            [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": {}},
+                }
+            ]
+        )
+
+        assert chunks == []
+
+    def test_direct_tool_call_chunks_drop_empty_or_unknown_tool_names(self):
+        """Direct parser chunks must not emit tool calls clients cannot execute."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        chunks = pp._normalize_tool_call_chunks(
+            [
+                {
+                    "index": 0,
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": {}},
+                },
+                {
+                    "index": 1,
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "missing",
+                        "arguments": {"command": "echo bad"},
+                    },
+                },
+            ]
+        )
+
+        assert chunks == []
+
+    def test_direct_empty_tool_call_result_does_not_mark_detected(self):
+        """Dropped direct parser calls must not create empty tool-use turns."""
+        tool_parser = self._make_tool_parser()
+        tool_parser.extract_tool_calls_streaming.return_value = {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": {}},
+                }
+            ]
+        }
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_parser_instance=tool_parser,
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        assert pp.process_chunk(_make_output("<tool_call>")) == []
+        assert not pp.tool_calls_detected
+
+    def test_reasoning_only_action_stop_does_not_emit_prompt_specific_keepalive(self):
+        """Planning-only stops must not trigger prompt-specific tool calls."""
+        reasoning_parser = MagicMock()
+        delta_msg = MagicMock()
+        delta_msg.content = None
+        delta_msg.reasoning = "Let me create all the remaining files now."
+        reasoning_parser.extract_reasoning_streaming.return_value = delta_msg
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            reasoning_parser=reasoning_parser,
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(_make_output("x", finished=True))
+
+        assert len(events) == 1
+        assert events[0].type == "finish"
+        assert events[0].finish_reason == "stop"
+
+    def test_reasoning_only_incomplete_calling_tool_stop_emits_keepalive_tool_call(self):
+        """Stops after `[Calling tool: write]` should not end the agent loop."""
+        reasoning_parser = MagicMock()
+        delta_msg = MagicMock()
+        delta_msg.content = None
+        delta_msg.reasoning = "[Calling tool: write]"
+        reasoning_parser.extract_reasoning_streaming.return_value = delta_msg
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            reasoning_parser=reasoning_parser,
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(_make_output("x", finished=True))
+
+        assert len(events) == 1
+        assert events[0].type == "tool_call"
+        assert events[0].finish_reason == "tool_calls"
+        assert events[0].tool_calls[0]["function"]["name"] == "bash"
+
+    def test_malformed_assignment_tool_syntax_is_detected(self):
+        """Streaming `=write]{...}` fragments should become tool calls."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(
+            _make_output('=write]{"path":"/tmp/a.txt","content":"ok"}')
+        )
+
+        assert len(events) == 1
+        assert events[0].type == "tool_call"
+        assert events[0].tool_calls[0]["function"]["name"] == "write"
+
+    def test_malformed_assignment_xml_parameters_is_detected(self):
+        """Streaming `=write]<parameter=...` fragments should become tool calls."""
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(
+            _make_output(
+                "=write]<parameter=path>/tmp/tsconfig.json</parameter>"
+                '<parameter=content>{"compilerOptions":{"strict":true}}</parameter>'
+                "</function>"
+            )
+        )
+
+        assert len(events) == 1
+        assert events[0].type == "tool_call"
+        assert events[0].tool_calls[0]["function"]["name"] == "write"
+
+    def test_incomplete_assignment_tool_marker_finish_emits_keepalive(self):
+        """A dangling `tool=write]` finish should keep the agent loop alive."""
+        tool_parser = MagicMock()
+        tool_parser.extract_tool_calls_streaming.return_value = None
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                },
+            ]
+        }
+        cfg = _make_cfg(
+            enable_auto_tool_choice=True,
+            tool_parser_instance=tool_parser,
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        assert pp.process_chunk(_make_output(" tool=write]")) == []
+        events = pp.process_chunk(_make_output("", finished=True))
+
+        assert len(events) == 1
+        assert events[0].type == "tool_call"
+        assert events[0].finish_reason == "tool_calls"
+        assert events[0].tool_calls[0]["function"]["name"] == "bash"
+
+    def test_directory_creation_intent_stop_does_not_emit_prompt_specific_keepalive(self):
+        """Directory repair plans alone must not synthesize tool calls."""
+        reasoning_parser = MagicMock()
+        delta_msg = MagicMock()
+        delta_msg.content = None
+        delta_msg.reasoning = "The models directory doesn't exist yet. Let me create it first."
+        reasoning_parser.extract_reasoning_streaming.return_value = delta_msg
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            reasoning_parser=reasoning_parser,
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        events = pp.process_chunk(_make_output("x", finished=True))
+
+        assert len(events) == 1
+        assert events[0].type == "finish"
+        assert events[0].finish_reason == "stop"
+
+    def test_split_reasoning_action_stop_does_not_synthesize_keepalive(self):
+        """Accumulated planning text alone must not synthesize tool calls."""
+        reasoning_parser = MagicMock()
+        first = MagicMock()
+        first.content = None
+        first.reasoning = "Let me create all the files"
+        second = MagicMock()
+        second.content = None
+        second.reasoning = "."
+        reasoning_parser.extract_reasoning_streaming.side_effect = [first, second]
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ]
+        }
+        cfg = _make_cfg(
+            reasoning_parser=reasoning_parser,
+            enable_auto_tool_choice=True,
+            tool_call_parser="qwen3_coder_xml",
+        )
+        pp = StreamingPostProcessor(cfg, tools_requested=True, request=request)
+
+        assert pp.process_chunk(_make_output("first"))[0].type == "reasoning"
+        events = pp.process_chunk(_make_output(".", finished=True))
+
+        assert len(events) == 1
+        assert events[0].type == "finish"
+        assert events[0].finish_reason == "stop"
+
     def test_truncated_xml_tool_call_emits_tool_call_not_content(self):
         """Malformed Qwen XML opening is still translated to a tool call."""
         request = {

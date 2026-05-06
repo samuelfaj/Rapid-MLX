@@ -77,6 +77,23 @@ def _has_xml_tool_marker(text: str) -> bool:
         "<function=" in text
         or "<tool_call>" in text
         or re.search(r"(?m)^\s*=[A-Za-z_][\w-]*>", text)
+        or re.search(r"(?m)^\s*(?:tool\s*)?=\s*[A-Za-z_][\w.-]*\]", text)
+    )
+
+
+def _has_incomplete_assignment_tool_marker(text: str) -> bool:
+    """Return True for malformed tails like `tool=write]` without JSON args."""
+    return bool(re.search(r"(?:tool\s*)?=\s*[A-Za-z_][\w.-]*\]\s*$", text.rstrip()))
+
+
+def _has_incomplete_calling_tool_invocation(text: str) -> bool:
+    """Return True for tails like `[Calling tool: write]` without arguments."""
+    return bool(
+        re.search(
+            r"(?:^|[\r\n])\s*\[?Calling tool:\s*[A-Za-z_][\w.-]*\]?\s*$",
+            text.rstrip(),
+            re.IGNORECASE,
+        )
     )
 
 
@@ -180,9 +197,12 @@ class StreamingPostProcessor:
 
         # State
         self.accumulated_text = ""
+        self.accumulated_content = ""
+        self.accumulated_reasoning = ""
         self.tool_accumulated_text = ""
         self.tool_calls_detected = False
         self.tool_markup_possible = False
+        self._keepalive_tool_call_emitted = False
 
         # Nemotron thinking prefix
         self._is_thinking_model = False
@@ -195,23 +215,35 @@ class StreamingPostProcessor:
         self._json_preamble_buffer = ""
 
     def _tool_call_has_required_args(self, name: str | None, arguments) -> bool:
-        if not name or not isinstance(self.request, dict):
+        if not isinstance(self.request, dict):
             return True
         tools = self.request.get("tools")
         if not isinstance(tools, list):
             return True
+        if not name:
+            return False
 
         required = []
+        known_tool = False
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
             function = tool.get("function")
             if not isinstance(function, dict) or function.get("name") != name:
                 continue
+            known_tool = True
             parameters = function.get("parameters")
             if isinstance(parameters, dict):
                 required = parameters.get("required") or []
             break
+        if not known_tool:
+            return False
+        if not required:
+            required = {
+                "bash": ["command"],
+                "write": ["path", "content"],
+                "read": ["path"],
+            }.get(name, [])
         if not required:
             return True
 
@@ -266,15 +298,101 @@ class StreamingPostProcessor:
         return json.dumps(parsed)
 
     def _normalize_tool_call_chunks(self, chunks: list[dict]) -> list[dict]:
+        normalized = []
         for chunk in chunks:
             function = chunk.get("function") if isinstance(chunk, dict) else None
             if not isinstance(function, dict):
+                continue
+            if not self._tool_call_has_required_args(
+                function.get("name"),
+                function.get("arguments", "{}"),
+            ):
+                logger.debug(
+                    "Dropping malformed tool call missing required arguments: %s",
+                    function.get("name"),
+                )
                 continue
             function["arguments"] = self._normalize_tool_call_arguments(
                 function.get("name"),
                 function.get("arguments", "{}"),
             )
-        return chunks
+            normalized.append(chunk)
+        return normalized
+
+    def _request_has_tool(self, name: str) -> bool:
+        if not isinstance(self.request, dict):
+            return False
+        tools = self.request.get("tools")
+        if not isinstance(tools, list):
+            return False
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if isinstance(function, dict) and function.get("name") == name:
+                return True
+        return False
+
+    def _maybe_make_keepalive_tool_call(
+        self,
+        finish_reason: str | None,
+        content: str | None,
+        reasoning: str | None = None,
+    ) -> StreamEvent | None:
+        if (
+            finish_reason != "stop"
+            or not self.tools_requested
+            or self.tool_calls_detected
+            or self._keepalive_tool_call_emitted
+            or not self._request_has_tool("bash")
+        ):
+            return None
+
+        marker_text = "\n".join(
+            part
+            for part in (
+                content,
+                reasoning,
+                self.accumulated_content,
+                self.accumulated_reasoning,
+                self.tool_accumulated_text,
+            )
+            if part
+        )
+        incomplete_tool_marker = (
+            _has_incomplete_assignment_tool_marker(marker_text)
+            or _has_incomplete_calling_tool_invocation(marker_text)
+        )
+        if not incomplete_tool_marker:
+            return None
+
+        self._keepalive_tool_call_emitted = True
+        self.tool_calls_detected = True
+        return StreamEvent(
+            type="tool_call",
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_keepalive",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps(
+                            {
+                                "command": (
+                                    "printf '%s\\n' "
+                                    "'Previous assistant response ended while "
+                                    "forming a tool call. Continue by emitting "
+                                    "the intended tool call only.'"
+                                )
+                            }
+                        ),
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+            tool_calls_detected=True,
+        )
 
     def _tool_calls_to_stream_chunks(self, tool_calls) -> list[dict]:
         chunks = []
@@ -371,9 +489,12 @@ class StreamingPostProcessor:
         instance holds its own parser instances (created in __init__).
         """
         self.accumulated_text = ""
+        self.accumulated_content = ""
+        self.accumulated_reasoning = ""
         self.tool_accumulated_text = ""
         self.tool_calls_detected = False
         self.tool_markup_possible = False
+        self._keepalive_tool_call_emitted = False
         self._think_prefix_sent = False
         self._json_preamble_stripped = False
         self._json_preamble_buffer = ""
@@ -392,6 +513,13 @@ class StreamingPostProcessor:
         if not delta_text:
             # Handle finish-only chunks
             if output.finished:
+                keepalive = self._maybe_make_keepalive_tool_call(
+                    self._compute_finish_reason(output),
+                    None,
+                    self.accumulated_text,
+                )
+                if keepalive is not None:
+                    return [keepalive]
                 return [self._make_finish_event(output)]
             return []
 
@@ -568,6 +696,19 @@ class StreamingPostProcessor:
             content = sanitize_output(content)
             if not content:
                 content = None
+        if content:
+            self.accumulated_content += content
+        if reasoning:
+            self.accumulated_reasoning += reasoning
+
+        if finish_reason:
+            keepalive = self._maybe_make_keepalive_tool_call(
+                finish_reason,
+                content,
+                reasoning,
+            )
+            if keepalive is not None:
+                return [keepalive]
 
         if finish_reason:
             return [
@@ -665,6 +806,16 @@ class StreamingPostProcessor:
             content = sanitize_output(content)
             if not content:
                 content = None
+        if content:
+            self.accumulated_content += content
+
+        if finish_reason:
+            keepalive = self._maybe_make_keepalive_tool_call(
+                finish_reason,
+                content,
+            )
+            if keepalive is not None:
+                return [keepalive]
 
         # When finish_reason is set, emit ONE finish event with content merged in.
         # Never emit separate content + finish events — that would cause
@@ -769,6 +920,7 @@ class StreamingPostProcessor:
             not self.tool_markup_possible
             and "<" not in content
             and "[" not in content
+            and "=" not in content
             and "Calling tool:" not in content
         ):
             self.tool_accumulated_text += content
@@ -803,6 +955,8 @@ class StreamingPostProcessor:
             tool_result["tool_calls"] = self._normalize_tool_call_chunks(
                 tool_result["tool_calls"]
             )
+            if not tool_result["tool_calls"]:
+                return None
             self.tool_calls_detected = True
             return tool_result
 
@@ -816,6 +970,16 @@ class StreamingPostProcessor:
                 return {"tool_calls": chunks}
             if "</function>" not in self.tool_accumulated_text:
                 return None
+
+        if re.search(r"(?:tool\s*)?=\s*[A-Za-z_][\w.-]*\]\s*\{", self.tool_accumulated_text):
+            _, tool_calls = parse_tool_calls(self.tool_accumulated_text, self.request)
+            if tool_calls:
+                chunks = self._tool_calls_to_stream_chunks(tool_calls)
+                if not chunks:
+                    return None
+                self.tool_calls_detected = True
+                return {"tool_calls": chunks}
+            return None
 
         if "Calling tool:" in self.tool_accumulated_text:
             _, tool_calls = parse_tool_calls(self.tool_accumulated_text, self.request)

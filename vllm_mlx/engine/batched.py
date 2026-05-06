@@ -655,7 +655,6 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
-            disable_mtp=bool(kwargs.pop("disable_mtp", False)),
         )
 
         text = clean_output_text(output.output_text)
@@ -733,12 +732,10 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
-        disable_mtp = bool(kwargs.pop("disable_mtp", False))
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
-            disable_mtp=disable_mtp,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -816,7 +813,6 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
-            disable_mtp=bool(tools),
             **kwargs,
         )
 
@@ -937,7 +933,6 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
-            disable_mtp=bool(tools),
             **kwargs,
         ):
             yield output

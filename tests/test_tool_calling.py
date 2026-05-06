@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for tool_calling.py"""
 
+import json
 from unittest.mock import MagicMock
 
 from vllm_mlx.api.tool_calling import (
@@ -302,6 +303,74 @@ class TestParseToolCalls:
         assert tool_calls is not None
         arguments = tool_calls[0].function.arguments
         assert '"content": "{\\"compilerOptions\\": {\\"strict\\": true}}"' in arguments
+
+    def test_malformed_tool_assignment_call(self):
+        """Recover Qwen fragments like `tool=write]{...}` as tool calls."""
+        text = (
+            '=write]{"path":"/tmp/hello.txt","content":"hello"}'
+        )
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+
+        cleaned, tool_calls = parse_tool_calls(text, request=request)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "write"
+        assert json.loads(tool_calls[0].function.arguments)["content"] == "hello"
+        assert cleaned == ""
+
+    def test_malformed_assignment_xml_parameters_call(self):
+        """Recover Qwen fragments like `=write]<parameter=...` as tool calls."""
+        text = (
+            "=write]<parameter=path>/tmp/tsconfig.json</parameter>"
+            '<parameter=content>{"compilerOptions":{"strict":true}}</parameter>'
+            "</function>"
+        )
+        request = {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                        },
+                    },
+                }
+            ]
+        }
+
+        cleaned, tool_calls = parse_tool_calls(text, request=request)
+
+        assert tool_calls is not None
+        assert tool_calls[0].function.name == "write"
+        arguments = json.loads(tool_calls[0].function.arguments)
+        assert arguments["path"] == "/tmp/tsconfig.json"
+        assert json.loads(arguments["content"]) == {
+            "compilerOptions": {"strict": True}
+        }
+        assert cleaned == ""
 
 
 class TestConvertToolsForTemplate:

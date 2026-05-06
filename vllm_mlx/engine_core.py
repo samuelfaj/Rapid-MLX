@@ -381,7 +381,6 @@ class EngineCore:
         images: list[Any] | None = None,
         videos: list[Any] | None = None,
         prefix_boundary: int = 0,
-        disable_mtp: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -410,7 +409,6 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
-            disable_mtp=disable_mtp,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

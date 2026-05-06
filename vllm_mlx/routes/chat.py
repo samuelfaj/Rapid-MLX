@@ -714,6 +714,7 @@ async def stream_chat_completion(
         completion_tokens = 0
 
         # Stream content — PostProcessor handles reasoning/tool/sanitize
+        stop_after_tool_call = False
         async for output in engine.stream_chat(messages=messages, **kwargs):
             if hasattr(output, "prompt_tokens") and output.prompt_tokens:
                 prompt_tokens = output.prompt_tokens
@@ -753,14 +754,16 @@ async def stream_chat_completion(
                                 delta=ChatCompletionChunkDelta(
                                     tool_calls=event.tool_calls,
                                 ),
-                                finish_reason=event.finish_reason,
+                                finish_reason="tool_calls",
                             )
                         ],
-                        usage=get_usage(output) if output.finished else None,
+                        usage=get_usage(output),
                     )
                     _tc_sse = f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                     logger.info(f"[SSE-TC] {_tc_sse.strip()[:300]}")
                     yield _tc_sse
+                    stop_after_tool_call = True
+                    break
 
                 elif event.type == "finish":
                     chunk = ChatCompletionChunk(
@@ -779,25 +782,28 @@ async def stream_chat_completion(
                         usage=get_usage(output) if output.finished else None,
                     )
                     yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+            if stop_after_tool_call:
+                break
 
         # Fallback tool call detection
-        for event in processor.finalize():
-            if event.type == "tool_call":
-                tool_chunk = ChatCompletionChunk(
-                    id=response_id,
-                    model=_resolve_model_name(request.model),
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            delta=ChatCompletionChunkDelta(
-                                tool_calls=event.tool_calls,
-                            ),
-                            finish_reason="tool_calls",
-                        )
-                    ],
-                )
-                _fb_sse = f"data: {tool_chunk.model_dump_json(exclude_none=True)}\n\n"
-                logger.info(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
-                yield _fb_sse
+        if not stop_after_tool_call:
+            for event in processor.finalize():
+                if event.type == "tool_call":
+                    tool_chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=_resolve_model_name(request.model),
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=event.tool_calls,
+                                ),
+                                finish_reason="tool_calls",
+                            )
+                        ],
+                    )
+                    _fb_sse = f"data: {tool_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    logger.info(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
+                    yield _fb_sse
 
         # Log throughput
         elapsed = time.perf_counter() - start_time

@@ -34,13 +34,6 @@ logger = logging.getLogger(__name__)
 # Enable MambaCache batching support for models like Nemotron
 ensure_mamba_support()
 
-
-class _MTPBypassLogitsProcessor:
-    """No-op processor used to route selected requests through mlx-lm's native step."""
-
-    def __call__(self, _tokens: Any, logits: Any) -> Any:
-        return logits
-
 # Error patterns that indicate cache corruption.
 # Each pattern must be specific enough to avoid false positives.
 # The bare word "cache" was removed because it matched unrelated TypeErrors
@@ -1003,14 +996,6 @@ def _install_mtp(
             if not gen_self.uids:
                 return [], []
 
-            if any(gen_self.logits_processors):
-                _skip_state[0] = None
-                for uid in gen_self.uids:
-                    _deferred_drafts.pop(uid, None)
-                    _pending_primary_tokens.pop(uid, None)
-                    _persistent_mtp_caches.pop(uid, None)
-                return _orig_generation_step(gen_self)
-
             gen_self._current_tokens = gen_self._next_tokens
             gen_self._current_logprobs = gen_self._next_logprobs
             input_tokens = gen_self._current_tokens
@@ -1205,7 +1190,7 @@ def _install_mtp(
                         for e, uid in enumerate(current_uids):
                             _deferred_drafts[uid] = [
                                 {
-                                    "token": tokens[e].item(),
+                                    "token_array": tokens[e : e + 1],
                                     "logprobs": deferred_logprobs[depth_index][e],
                                 }
                                 for depth_index, tokens in enumerate(
@@ -1275,35 +1260,6 @@ def _install_mtp(
                                 verify_hidden[:, : len(draft_token_arrays), :],
                                 draft_token_arrays,
                             )
-                        bonus_distribution = None
-                        bonus_tokens = None
-                        bonus_logprobs = None
-                        bonus_logits = verify_logits[:, accepted_count, :]
-                        if any(gen_self.logits_processors):
-                            processed_bonus_logits = []
-                            for e in range(batch_size):
-                                sample_logits = bonus_logits[e : e + 1]
-                                history_parts = [
-                                    token_context[e],
-                                    primary_tokens[e : e + 1],
-                                ]
-                                for prev_tokens in draft_token_arrays:
-                                    history_parts.append(prev_tokens[e : e + 1])
-                                history = mx.concatenate(tuple(history_parts))
-                                for processor in gen_self.logits_processors[e]:
-                                    sample_logits = processor(history, sample_logits)
-                                processed_bonus_logits.append(sample_logits)
-                            bonus_logits = mx.concatenate(
-                                processed_bonus_logits,
-                                axis=0,
-                            )
-                        bonus_distribution = distribution_logprobs(
-                            bonus_logits,
-                            _target_params,
-                        )
-                        bonus_tokens = sample_from_logprobs(bonus_distribution)
-                        mx.eval(bonus_tokens)
-                        bonus_logprobs = list(bonus_distribution)
                         _skip_state[0] = {
                             "logits": verify_logits[:, accepted_count, :],
                             "hidden": verify_hidden[:, -1:, :],
@@ -1312,24 +1268,14 @@ def _install_mtp(
                         for e, uid in enumerate(current_uids):
                             deferred = [
                                 {
-                                    "token": tokens[e].item(),
+                                    "token_array": tokens[e : e + 1],
                                     "logprobs": target_distributions[depth_index][e],
                                 }
                                 for depth_index, tokens in enumerate(
                                     draft_token_arrays
                                 )
                             ]
-                            deferred.append(
-                                {
-                                    "token": bonus_tokens[e].item(),
-                                    "logprobs": bonus_logprobs[e],
-                                }
-                            )
                             _deferred_drafts[uid] = deferred
-                            _pending_primary_tokens[uid] = {
-                                "token_array": bonus_tokens[e : e + 1],
-                                "logprobs": bonus_logprobs[e],
-                            }
                         _mtp_stats["accepted"] += 1
                     else:
                         assert correction_distribution is not None
@@ -1389,7 +1335,7 @@ def _install_mtp(
                         for e, uid in enumerate(current_uids):
                             deferred = [
                                 {
-                                    "token": tokens[e].item(),
+                                    "token_array": tokens[e : e + 1],
                                     "logprobs": target_distributions[depth_index][e],
                                 }
                                 for depth_index, tokens in enumerate(
@@ -1398,7 +1344,7 @@ def _install_mtp(
                             ]
                             deferred.append(
                                 {
-                                    "token": correction_tokens[e].item(),
+                                    "token_array": correction_tokens[e : e + 1],
                                     "logprobs": correction_distribution[e],
                                 }
                             )
@@ -1472,7 +1418,10 @@ def _install_mtp(
                 else:
                     draft_items = list(draft_info)
                 for draft_item in draft_items:
-                    draft_t = int(draft_item["token"])
+                    if "token_array" in draft_item:
+                        draft_t = int(draft_item["token_array"].item())
+                    else:
+                        draft_t = int(draft_item["token"])
                     draft_lp = draft_item["logprobs"]
                     finish_reason = None
                     current_state = None
@@ -2631,10 +2580,6 @@ class Scheduler:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
                     request_logits_processors = [[processor]]
-            if request.disable_mtp:
-                if request_logits_processors is None:
-                    request_logits_processors = [[]]
-                request_logits_processors[0].append(_MTPBypassLogitsProcessor())
 
             # Per-request sampler (temperature/top_p may differ per request).
             # Without this, all requests use the BatchGenerator's default

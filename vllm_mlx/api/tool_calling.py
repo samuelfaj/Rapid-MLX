@@ -234,6 +234,50 @@ def _iter_calling_tool_calls(text: str):
             return
 
 
+def _iter_bracket_tool_assignment_calls(text: str):
+    """Yield malformed `tool=name]{...}` or `=name]{...}` spans."""
+    pattern = re.compile(
+        r"(?:tool\s*)?=\s*([A-Za-z_][\w.-]*)\]\s*(\{)",
+        re.DOTALL,
+    )
+    search_from = 0
+    while True:
+        match = pattern.search(text, search_from)
+        if match is None:
+            return
+
+        name = match.group(1).strip()
+        i = match.start(2)
+        args_start = i
+        depth = 0
+        in_string = False
+        escaped = False
+        while i < len(text):
+            char = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        args_end = i + 1
+                        yield match.start(), args_end, name, text[args_start:args_end]
+                        search_from = args_end
+                        break
+            i += 1
+        else:
+            return
+
+
 def _is_tool_call_json(obj: dict) -> bool:
     """
     Check if a JSON object looks like a tool call.
@@ -418,6 +462,15 @@ def parse_tool_calls(
             r"((?:(?!^\s*=[A-Za-z_][\w-]*>).)*?<parameter=[^>]+>.*?</function>)"
         )
         nemotron_matches = re.findall(nemotron_pattern, text, re.DOTALL)
+    if not nemotron_matches:
+        # Some MTP-corrupted Qwen streams emit "=write]<parameter=...".
+        # Recover the explicit parameter block even without "<function=write>".
+        nemotron_pattern = (
+            r"(?m)^\s*(?:tool\s*)?=\s*([A-Za-z_][\w.-]*)\]\s*"
+            r"((?:(?!^\s*(?:tool\s*)?=\s*[A-Za-z_][\w.-]*\]).)*?"
+            r"<parameter=[^>]+>.*?</function>)"
+        )
+        nemotron_matches = re.findall(nemotron_pattern, text, re.DOTALL)
 
     request_tool_names = set()
     if isinstance(request, dict):
@@ -426,6 +479,34 @@ def parse_tool_calls(
                 function = tool.get("function")
                 if isinstance(function, dict) and isinstance(function.get("name"), str):
                     request_tool_names.add(function["name"])
+
+    assignment_tool_matches = list(_iter_bracket_tool_assignment_calls(text))
+    for start, end, name, args_str in assignment_tool_matches:
+        if request_tool_names and name.strip() not in request_tool_names:
+            continue
+        try:
+            arguments = json.loads(args_str)
+            tool_calls.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name.strip(),
+                        arguments=_serialize_tool_arguments(
+                            arguments, name.strip(), request
+                        ),
+                    ),
+                )
+            )
+        except json.JSONDecodeError:
+            continue
+
+    if assignment_tool_matches:
+        for start, end, name, _ in reversed(assignment_tool_matches):
+            if request_tool_names and name.strip() not in request_tool_names:
+                continue
+            cleaned_text = cleaned_text[:start] + cleaned_text[end:]
+        cleaned_text = cleaned_text.strip()
 
     for name, params_block in nemotron_matches:
         if request_tool_names and name.strip() not in request_tool_names:
@@ -464,6 +545,18 @@ def parse_tool_calls(
         )
         cleaned_text = re.sub(
             r"<toolcall>\s*\w+\s*\n.*?</toolcall>",
+            "",
+            cleaned_text,
+            flags=re.DOTALL,
+        )
+        cleaned_text = re.sub(
+            r"(?m)^\s*=[A-Za-z_][\w-]*>\s*.*?</function>",
+            "",
+            cleaned_text,
+            flags=re.DOTALL,
+        )
+        cleaned_text = re.sub(
+            r"(?m)^\s*(?:tool\s*)?=\s*[A-Za-z_][\w.-]*\]\s*.*?</function>",
             "",
             cleaned_text,
             flags=re.DOTALL,

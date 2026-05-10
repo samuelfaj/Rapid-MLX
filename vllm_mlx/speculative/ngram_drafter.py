@@ -315,6 +315,18 @@ class NgramRequestState:
         if len(drafts) < decoder.min_matches:
             return []
 
+        # Cycle guard: if a prefix of length p>=3 of [pending, *drafts]
+        # equals the same-length suffix of recent history, the model is
+        # about to repeat a token cycle of period <= p. Suppress the
+        # draft so spec-decode does not amplify the loop. Cheap: O(L^2)
+        # worst case where L = len(drafts)+1 (small, ~5–7), only runs
+        # after a draft is otherwise accepted.
+        predicted = [int(pending_token)] + drafts
+        max_p = min(len(predicted), len(history))
+        for p in range(max_p, 2, -1):
+            if list(history[-p:]) == predicted[:p]:
+                return []
+
         decoder.total_drafts += 1
         decoder.total_draft_tokens += len(drafts)
         return drafts

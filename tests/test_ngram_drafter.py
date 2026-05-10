@@ -201,6 +201,29 @@ class TestNgramRequestState:
         # Query (1,99,X) doesn't appear → empty
         assert s.lookup_drafts_with_pending(50) == []
 
+    def test_lookup_with_pending_cycle_guard_breaks_loop(self):
+        # Build a degenerate looping history: pattern [7,8,9] repeated
+        # many times. Without the cycle guard, querying with pending=7
+        # would propose drafts [8,9,7] — the exact next cycle. The guard
+        # detects [pending=7, *drafts=[8,9,7]] == last 4 history tokens
+        # and returns [] so the loop is not amplified.
+        prompt = [7, 8, 9] * 8
+        s = _make_state(prompt, only_in_think=False, min_occurrences=2)
+        # History tail: ..., 8, 9, 7, 8, 9. Pending=7 → predicted=
+        # [7,8,9,7]; recent suffix is also [7,8,9,7]. Guard fires.
+        assert s.lookup_drafts_with_pending(7) == []
+
+    def test_lookup_with_pending_cycle_guard_allows_non_cycle(self):
+        # Same n-gram index but the predicted continuation does not
+        # match the recent suffix → guard does not fire.
+        prompt = [1, 2, 3, 4, 5, 6] * 4
+        s = _make_state(prompt, only_in_think=False, min_occurrences=2)
+        s.feed_token(1)
+        s.feed_token(2)
+        # History tail ends with [...,5,6,1,2]; pending=3 → predicted=
+        # [3,4,5,6]. Tail [6,1,2]+pending=[6,1,2,3] != predicted. Allow.
+        assert s.lookup_drafts_with_pending(3) == [4, 5, 6, 1]
+
     def test_lookup_with_pending_does_not_mutate_state(self):
         prompt = [1, 2, 3, 4, 5, 6]
         s = _make_state(prompt, only_in_think=False)

@@ -21,6 +21,8 @@ _QWEN36_MTPLX_MODEL = "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed"
 _QWEN36_MTPLX_MARKER = "Qwen3.6-27B-MTPLX-Optimized-Speed"
 _QWEN36_35B_MTPLX_MODEL = "samuelfaj/Qwen3.6-35B-A3B-4bit-MTPLX-Optimized-Speed"
 _QWEN36_35B_MTPLX_MARKER = "Qwen3.6-35B-A3B-4bit-MTPLX-Optimized-Speed"
+_QWEN36_35B_8BIT_MTPLX_MODEL = "samuelfaj/Qwen3.6-35B-A3B-8bit-MTPLX-Optimized-Speed"
+_QWEN36_35B_8BIT_MTPLX_MARKER = "Qwen3.6-35B-A3B-8bit-MTPLX-Optimized-Speed"
 _QWEN36_35B_A3B_MARKER = "Qwen3.6-35B-A3B"
 
 
@@ -38,9 +40,16 @@ def _is_qwen36_mtplx_request(args: argparse.Namespace) -> bool:
     return (
         original_alias == "qwen3.6-27b"
         or original_alias == "qwen3.6-35b"
-        or model in (_QWEN36_MTPLX_MODEL, _QWEN36_35B_MTPLX_MODEL)
+        or original_alias == "qwen3.6-35b-8bit"
+        or model
+        in (
+            _QWEN36_MTPLX_MODEL,
+            _QWEN36_35B_MTPLX_MODEL,
+            _QWEN36_35B_8BIT_MTPLX_MODEL,
+        )
         or _QWEN36_MTPLX_MARKER in model
         or _QWEN36_35B_MTPLX_MARKER in model
+        or _QWEN36_35B_8BIT_MTPLX_MARKER in model
         or _is_local_mtplx_qwen_model(model)
     )
 
@@ -152,6 +161,69 @@ def _apply_qwen36_mtplx_preset(
     # (poem, snake game React/TS, vite landing page) — all 3 only
     # succeed with thinking enabled. MTP acceptance stays at 83-95%
     # regardless of thinking mode (perf is unaffected).
+
+    # ---- N-gram preset (35B-A3B only).
+    # On the 35B-A3B model with strong native MTP (~95% baseline accept),
+    # n-gram-layered speculation reaches +18% throughput in mixed
+    # reasoning + tool-use workloads vs. MTP-only (measured on the
+    # agentic regression suite). The configuration below mirrors that
+    # winning combination:
+    #
+    #   - K=6 wide drafts, capped per-cycle by adaptive K based on the
+    #     n-gram match's prior occurrence count (avoids wasted verify
+    #     slots on weak matches).
+    #   - min_occurrences=2: filter one-off matches.
+    #   - greedy acceptance: ngram-source depths accept on argmax match,
+    #     which raises hit rate at low temperatures without disturbing
+    #     MTP-source acceptance (those still use Leviathan/Chen).
+    #   - hybrid verify: append one MTP-head draft after the ngram tail
+    #     to capture extra ground when ngram drafts all accept.
+    #   - everywhere + skip-tool-calls: draft inside <think> AND content
+    #     but skip Qwen3 tool-call XML (where structure repeats but
+    #     content varies, so ngram matches are stale).
+    #   - auto-disable + self-tune: when MTP is strong globally and
+    #     ngram is weak, suppress n-gram drafting; per-request, disable
+    #     drafting once running acceptance proves bad. Together these
+    #     guarantee no regression vs. the MTP-only baseline.
+    if _is_qwen36_35b_a3b_request(args):
+        if hasattr(args, "enable_ngram") and _has_cli_option(
+            raw_args, "--disable-ngram"
+        ):
+            args.enable_ngram = False
+        elif hasattr(args, "enable_ngram") and not _has_cli_option(
+            raw_args, "--enable-ngram"
+        ):
+            args.enable_ngram = True
+        if not _has_cli_option(raw_args, "--ngram-num-draft-tokens"):
+            args.ngram_num_draft_tokens = 6
+        if not _has_cli_option(raw_args, "--ngram-min-occurrences"):
+            args.ngram_min_occurrences = 2
+        if not _has_cli_option(raw_args, "--ngram-acceptance-mode"):
+            args.ngram_acceptance_mode = "greedy"
+        if not _has_cli_option(
+            raw_args, "--ngram-hybrid-verify", "--no-ngram-hybrid-verify"
+        ):
+            args.ngram_hybrid_verify = True
+        if not _has_cli_option(
+            raw_args, "--ngram-only-in-think", "--ngram-everywhere"
+        ):
+            args.ngram_only_in_think = False  # everywhere
+        if not _has_cli_option(
+            raw_args, "--ngram-skip-tool-calls", "--no-ngram-skip-tool-calls"
+        ):
+            args.ngram_skip_tool_calls = True
+        if not _has_cli_option(
+            raw_args, "--ngram-self-tune", "--no-ngram-self-tune"
+        ):
+            args.ngram_self_tune = True
+        if not _has_cli_option(
+            raw_args, "--ngram-self-tune-disable-threshold"
+        ):
+            args.ngram_self_tune_disable_threshold = 0.30
+        if not _has_cli_option(raw_args, "--ngram-auto-disable-mtp-threshold"):
+            args.ngram_auto_disable_mtp_threshold = 0.85
+        if not _has_cli_option(raw_args, "--ngram-auto-disable-min-ngram"):
+            args.ngram_auto_disable_min_ngram = 0.50
 
 def _apply_qwen36_35b_defaults(args: argparse.Namespace, raw_args: list[str]) -> None:
     if getattr(args, "command", None) != "serve" or not _is_qwen36_35b_a3b_request(
@@ -1081,6 +1153,7 @@ def models_command(_args):
         "qwen3.5-35b": ("37 GB", "83 tok/s", "48GB+ Mac"),
         "qwen3.5-122b": ("65 GB", "57 tok/s", "96GB+ Mac"),
         "qwen3.6-35b": ("20 GB", "94 tok/s", "32GB+ Mac"),
+        "qwen3.6-35b-8bit": ("38 GB", "—", "64GB+ Mac"),
         "qwen3-coder": ("45 GB", "74 tok/s", "64GB+ Mac"),
         "gemma-4-26b": ("14.4 GB", "85 tok/s", "24GB+ Mac"),
         "gemma-4-31b": ("17 GB", "31 tok/s", "32GB+ Mac"),
@@ -1557,6 +1630,13 @@ Examples:
         "Gated to <think> blocks by default.",
     )
     serve_parser.add_argument(
+        "--disable-ngram",
+        action="store_true",
+        default=False,
+        help="Disable auto-enabled n-gram preset (overrides model presets "
+        "that turn ngram on by default).",
+    )
+    serve_parser.add_argument(
         "--ngram-num-draft-tokens",
         type=int,
         default=4,
@@ -1640,11 +1720,19 @@ Examples:
     )
     serve_parser.add_argument(
         "--ngram-hybrid-verify",
+        dest="ngram_hybrid_verify",
         action="store_true",
         default=False,
         help="When ngram supplies the first K_ngram drafts, also append "
         "ONE additional MTP-head draft at position K_ngram (verify width "
-        "= K_ngram+1). Default off.",
+        "= K_ngram+1). Auto-enabled by the qwen3.6-35b preset.",
+    )
+    serve_parser.add_argument(
+        "--no-ngram-hybrid-verify",
+        dest="ngram_hybrid_verify",
+        action="store_false",
+        help="Disable the auto-enabled hybrid verify (e.g. to compare "
+        "pure-ngram drafting against ngram + trailing MTP head).",
     )
     serve_parser.add_argument(
         "--ngram-skip-tool-calls",
@@ -2040,8 +2128,14 @@ Examples:
     )
     bench_parser.add_argument(
         "--ngram-hybrid-verify",
+        dest="ngram_hybrid_verify",
         action="store_true",
         default=False,
+    )
+    bench_parser.add_argument(
+        "--no-ngram-hybrid-verify",
+        dest="ngram_hybrid_verify",
+        action="store_false",
     )
     bench_parser.add_argument(
         "--ngram-skip-tool-calls",

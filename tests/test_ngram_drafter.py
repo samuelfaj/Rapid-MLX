@@ -10,6 +10,7 @@ import pytest
 from vllm_mlx.scheduler import Scheduler, SchedulerConfig
 from vllm_mlx.speculative.ngram_drafter import (
     NgramRequestState,
+    TextToolCallTracker,
     ThinkStateTracker,
     lookup_think_token_ids,
 )
@@ -143,16 +144,55 @@ class TestNgramRequestState:
 
     def test_lookup_with_pending_finds_match(self):
         # History: prompt=[1,2,3,4,5,6], then feed 1,2.
-        # Trigram (1,2,3) is at position 0; continuation = history[3:3+K] (K=4).
-        # history after feeds = [1,2,3,4,5,6,1,2] → continuation = [4,5,6,1]
+        # Trigram (1,2,3) is at position 0 (1 occurrence with continuation
+        # [4,5,6,1] in history). With adaptive_k=True, freq=1 caps K_max
+        # at min(K, freq+1) = 2 → drafts = [4, 5].
         prompt = [1, 2, 3, 4, 5, 6]
         s = _make_state(prompt, only_in_think=False)
         s.feed_token(1)
         s.feed_token(2)
         drafts = s.lookup_drafts_with_pending(3)
-        assert drafts == [4, 5, 6, 1]
+        assert drafts == [4, 5]
         # State is unchanged (no commit) — last appended was 2, not 3
         assert s.decoder._token_history[-1] == 2
+
+    def test_lookup_with_pending_full_K_when_high_confidence(self):
+        # 4 occurrences of (1,2,3) with same continuation [4,5,6,1] →
+        # adaptive K_max = min(4, freq+1=5) = 4 → drafts = [4,5,6,1].
+        prompt = [1, 2, 3, 4, 5, 6] * 4
+        s = _make_state(prompt, only_in_think=False)
+        s.feed_token(1)
+        s.feed_token(2)
+        drafts = s.lookup_drafts_with_pending(3)
+        assert drafts == [4, 5, 6, 1]
+
+    def test_lookup_with_pending_disabled_adaptive_k(self):
+        # With adaptive_k=False, even a single occurrence drafts up to K.
+        prompt = [1, 2, 3, 4, 5, 6]
+        s = _make_state(prompt, only_in_think=False, adaptive_k=False)
+        s.feed_token(1)
+        s.feed_token(2)
+        drafts = s.lookup_drafts_with_pending(3)
+        assert drafts == [4, 5, 6, 1]
+
+    def test_lookup_with_pending_min_occurrences_filter(self):
+        # Single occurrence + min_occurrences=2 → no drafts.
+        prompt = [1, 2, 3, 4, 5, 6]
+        s = _make_state(
+            prompt, only_in_think=False, min_occurrences=2
+        )
+        s.feed_token(1)
+        s.feed_token(2)
+        assert s.lookup_drafts_with_pending(3) == []
+        # 2 occurrences + min_occurrences=2 → drafts allowed.
+        prompt2 = [1, 2, 3, 4, 5, 6] * 2
+        s2 = _make_state(
+            prompt2, only_in_think=False, min_occurrences=2
+        )
+        s2.feed_token(1)
+        s2.feed_token(2)
+        # freq=2 → adaptive K = min(4, 3) = 3 → first 3 of [4,5,6,1]
+        assert s2.lookup_drafts_with_pending(3) == [4, 5, 6]
 
     def test_lookup_with_pending_returns_empty_when_no_match(self):
         prompt = [1, 2, 3, 4, 5, 6]
@@ -301,6 +341,135 @@ class TestSchedulerNgramWiring:
         stats = sch.get_stats()
         assert stats["mtp"]["ngram_acceptance_ratio"] is None
         assert stats["mtp"]["ngram_enabled"] is False
+
+
+class TestTextToolCallTracker:
+    def _make_tokenizer(self):
+        from unittest.mock import MagicMock
+
+        tok = MagicMock()
+        decode_map = {
+            100: "<tool_call>",
+            101: "</tool_call>",
+            1: "a",
+            2: "b",
+            3: " hello",
+        }
+        tok.decode = lambda ids: "".join(decode_map.get(i, "") for i in ids)
+        return tok
+
+    def test_starts_outside(self):
+        t = TextToolCallTracker(self._make_tokenizer())
+        assert t.in_tool_call is False
+
+    def test_enters_on_start_marker(self):
+        t = TextToolCallTracker(self._make_tokenizer())
+        t.feed(100)
+        assert t.in_tool_call is True
+
+    def test_exits_on_end_marker(self):
+        t = TextToolCallTracker(self._make_tokenizer())
+        t.feed(100)
+        t.feed(1)
+        t.feed(2)
+        assert t.in_tool_call is True
+        t.feed(101)
+        assert t.in_tool_call is False
+
+    def test_no_tokenizer_disabled(self):
+        t = TextToolCallTracker(None)
+        assert t.enabled is False
+        t.feed(100)
+        # Never flips state without a working tokenizer.
+        assert t.in_tool_call is False
+
+    def test_handles_marker_split_across_decodes(self):
+        # Even if decode returns chunks, substring search after each
+        # accumulation should find the marker.
+        t = TextToolCallTracker(self._make_tokenizer())
+        t.feed(1)  # 'a'
+        t.feed(100)  # '<tool_call>'
+        t.feed(3)  # ' hello'
+        assert t.in_tool_call is True
+        t.feed(101)  # '</tool_call>'
+        assert t.in_tool_call is False
+
+    def test_tool_call_gates_should_draft(self):
+        # NgramRequestState should suppress drafting inside tool_call.
+        tok = self._make_tokenizer()
+        prompt = [1, 2, 3]
+        s = NgramRequestState(
+            prompt_tokens=prompt,
+            think_start_id=None,
+            think_end_id=None,
+            num_draft_tokens=4,
+            ngram_size=3,
+            min_matches=2,
+            only_in_think=False,
+            skip_tool_calls=True,
+            tokenizer=tok,
+        )
+        assert s.should_draft() is True  # outside tool call
+        s.feed_token(100)  # enter tool_call
+        assert s.in_tool_call is True
+        assert s.should_draft() is False
+        s.feed_token(101)  # exit tool_call
+        assert s.in_tool_call is False
+        assert s.should_draft() is True
+
+
+class TestSelfTuneDisable:
+    def test_disables_after_warmup_with_low_acceptance(self):
+        # Use a small warmup-equivalent burst of bad acceptance.
+        s = NgramRequestState(
+            prompt_tokens=[1, 2, 3],
+            think_start_id=None,
+            think_end_id=None,
+            num_draft_tokens=4,
+            ngram_size=3,
+            min_matches=2,
+            only_in_think=False,
+            self_tune=True,
+            self_tune_disable_threshold=0.50,
+        )
+        # Drop 32 tokens, accept just 5 (acceptance = 5/32 = 0.16).
+        s.record_outcome(drafted=32, accepted=5)
+        assert s.self_tune_disabled is True
+        assert s.should_draft() is False
+
+    def test_does_not_disable_when_acceptance_is_strong(self):
+        s = NgramRequestState(
+            prompt_tokens=[1, 2, 3],
+            think_start_id=None,
+            think_end_id=None,
+            num_draft_tokens=4,
+            ngram_size=3,
+            min_matches=2,
+            only_in_think=False,
+            self_tune=True,
+            self_tune_disable_threshold=0.30,
+        )
+        s.record_outcome(drafted=40, accepted=30)  # rate=0.75
+        assert s.self_tune_disabled is False
+        assert s.should_draft() is True
+
+    def test_does_not_disable_before_warmup(self):
+        s = NgramRequestState(
+            prompt_tokens=[1, 2, 3],
+            think_start_id=None,
+            think_end_id=None,
+            num_draft_tokens=4,
+            ngram_size=3,
+            min_matches=2,
+            only_in_think=False,
+            self_tune=True,
+            self_tune_disable_threshold=0.50,
+        )
+        # Below 32-token warmup: never disables, even with 0 accept.
+        s.record_outcome(drafted=4, accepted=0)
+        s.record_outcome(drafted=4, accepted=0)
+        assert s.self_tune_disabled is False
+        assert s.should_draft() is True
 
 
 class TestRecorderNgramFields:

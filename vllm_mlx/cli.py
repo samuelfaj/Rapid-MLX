@@ -470,6 +470,15 @@ def serve_command(args):
         ngram_size=args.ngram_size,
         ngram_min_matches=args.ngram_min_matches,
         ngram_only_in_think=args.ngram_only_in_think,
+        ngram_acceptance_mode=args.ngram_acceptance_mode,
+        ngram_min_occurrences=args.ngram_min_occurrences,
+        ngram_adaptive_k=args.ngram_adaptive_k,
+        ngram_auto_disable_mtp_threshold=args.ngram_auto_disable_mtp_threshold,
+        ngram_auto_disable_min_ngram=args.ngram_auto_disable_min_ngram,
+        ngram_hybrid_verify=args.ngram_hybrid_verify,
+        ngram_skip_tool_calls=args.ngram_skip_tool_calls,
+        ngram_self_tune=args.ngram_self_tune,
+        ngram_self_tune_disable_threshold=args.ngram_self_tune_disable_threshold,
         # KV cache quantization
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -496,12 +505,26 @@ def serve_command(args):
             if args.ngram_only_in_think
             else "everywhere"
         )
+        tool_gate = (
+            "skip-tool-calls" if args.ngram_skip_tool_calls else "incl-tool-calls"
+        )
+        adaptive = "adaptive-K" if args.ngram_adaptive_k else "fixed-K"
+        autodis = (
+            f"auto-disable@MTP>={args.ngram_auto_disable_mtp_threshold}"
+            if args.ngram_auto_disable_mtp_threshold > 0
+            else "no-auto-disable"
+        )
+        hybrid = " hybrid" if args.ngram_hybrid_verify else ""
         print(
             "N-gram: enabled, "
             f"K={args.ngram_num_draft_tokens}, "
             f"n={args.ngram_size}, "
             f"min_matches={args.ngram_min_matches}, "
-            f"gate={gate}"
+            f"min_occ={args.ngram_min_occurrences}, "
+            f"accept={args.ngram_acceptance_mode}, "
+            f"{adaptive}, {gate}, {tool_gate}, "
+            f"self-tune={'on' if args.ngram_self_tune else 'off'}, "
+            f"{autodis}{hybrid}"
         )
     print(f"Stream interval: {args.stream_interval} tokens")
     if args.use_paged_cache:
@@ -687,6 +710,15 @@ def bench_command(args):
             ngram_size=args.ngram_size,
             ngram_min_matches=args.ngram_min_matches,
             ngram_only_in_think=args.ngram_only_in_think,
+            ngram_acceptance_mode=args.ngram_acceptance_mode,
+            ngram_min_occurrences=args.ngram_min_occurrences,
+            ngram_adaptive_k=args.ngram_adaptive_k,
+            ngram_auto_disable_mtp_threshold=args.ngram_auto_disable_mtp_threshold,
+            ngram_auto_disable_min_ngram=args.ngram_auto_disable_min_ngram,
+            ngram_hybrid_verify=args.ngram_hybrid_verify,
+            ngram_skip_tool_calls=args.ngram_skip_tool_calls,
+            ngram_self_tune=args.ngram_self_tune,
+            ngram_self_tune_disable_threshold=args.ngram_self_tune_disable_threshold,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -1558,6 +1590,96 @@ Examples:
         help="Disable the <think>-block gate; draft n-gram across all "
         "outputs.",
     )
+    # --- Advanced n-gram tuning (greedy / confidence / hybrid / auto-disable
+    # / tool-call skip / self-tune).
+    serve_parser.add_argument(
+        "--ngram-acceptance-mode",
+        choices=["greedy", "probabilistic"],
+        default="greedy",
+        help="Acceptance rule for ngram-sourced drafts. 'greedy' accepts "
+        "iff target argmax matches the draft (higher accept rate, slight "
+        "loss of sample diversity). 'probabilistic' uses the lossless "
+        "Leviathan/Chen prob-ratio test (default: greedy).",
+    )
+    serve_parser.add_argument(
+        "--ngram-min-occurrences",
+        type=int,
+        default=1,
+        help="Require the n-gram + continuation to have appeared at least N "
+        "times in history before drafting (default: 1 = no filter).",
+    )
+    serve_parser.add_argument(
+        "--ngram-adaptive-k",
+        dest="ngram_adaptive_k",
+        action="store_true",
+        default=True,
+        help="Scale draft length by occurrence count: K_cap = min(K, "
+        "freq+1). Default on.",
+    )
+    serve_parser.add_argument(
+        "--no-ngram-adaptive-k",
+        dest="ngram_adaptive_k",
+        action="store_false",
+        help="Disable adaptive K; always draft up to --ngram-num-draft-tokens.",
+    )
+    serve_parser.add_argument(
+        "--ngram-auto-disable-mtp-threshold",
+        type=float,
+        default=0.0,
+        help="When MTP global running acceptance is at or above this "
+        "threshold AND ngram running acceptance is below "
+        "--ngram-auto-disable-min-ngram, suppress n-gram drafts. "
+        "0.0 disables (default).",
+    )
+    serve_parser.add_argument(
+        "--ngram-auto-disable-min-ngram",
+        type=float,
+        default=0.50,
+        help="Lower bound on ngram running acceptance below which the "
+        "auto-disable kicks in (default: 0.50).",
+    )
+    serve_parser.add_argument(
+        "--ngram-hybrid-verify",
+        action="store_true",
+        default=False,
+        help="When ngram supplies the first K_ngram drafts, also append "
+        "ONE additional MTP-head draft at position K_ngram (verify width "
+        "= K_ngram+1). Default off.",
+    )
+    serve_parser.add_argument(
+        "--ngram-skip-tool-calls",
+        dest="ngram_skip_tool_calls",
+        action="store_true",
+        default=True,
+        help="Skip n-gram drafting inside <tool_call>...</tool_call> "
+        "regions (Qwen3-style XML tool calls). Default on.",
+    )
+    serve_parser.add_argument(
+        "--no-ngram-skip-tool-calls",
+        dest="ngram_skip_tool_calls",
+        action="store_false",
+        help="Allow n-gram drafting inside tool-call regions.",
+    )
+    serve_parser.add_argument(
+        "--ngram-self-tune",
+        dest="ngram_self_tune",
+        action="store_true",
+        default=True,
+        help="Per-request self-tune: after warmup, suppress drafting on "
+        "requests whose running acceptance is below threshold.",
+    )
+    serve_parser.add_argument(
+        "--no-ngram-self-tune",
+        dest="ngram_self_tune",
+        action="store_false",
+        help="Disable per-request self-tune.",
+    )
+    serve_parser.add_argument(
+        "--ngram-self-tune-disable-threshold",
+        type=float,
+        default=0.30,
+        help="Per-request self-tune disable threshold (default: 0.30).",
+    )
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
@@ -1884,6 +2006,69 @@ Examples:
         action="store_false",
         help="Disable the <think>-block gate; draft n-gram across all "
         "outputs.",
+    )
+    bench_parser.add_argument(
+        "--ngram-acceptance-mode",
+        choices=["greedy", "probabilistic"],
+        default="greedy",
+    )
+    bench_parser.add_argument(
+        "--ngram-min-occurrences",
+        type=int,
+        default=1,
+    )
+    bench_parser.add_argument(
+        "--ngram-adaptive-k",
+        dest="ngram_adaptive_k",
+        action="store_true",
+        default=True,
+    )
+    bench_parser.add_argument(
+        "--no-ngram-adaptive-k",
+        dest="ngram_adaptive_k",
+        action="store_false",
+    )
+    bench_parser.add_argument(
+        "--ngram-auto-disable-mtp-threshold",
+        type=float,
+        default=0.0,
+    )
+    bench_parser.add_argument(
+        "--ngram-auto-disable-min-ngram",
+        type=float,
+        default=0.50,
+    )
+    bench_parser.add_argument(
+        "--ngram-hybrid-verify",
+        action="store_true",
+        default=False,
+    )
+    bench_parser.add_argument(
+        "--ngram-skip-tool-calls",
+        dest="ngram_skip_tool_calls",
+        action="store_true",
+        default=True,
+    )
+    bench_parser.add_argument(
+        "--no-ngram-skip-tool-calls",
+        dest="ngram_skip_tool_calls",
+        action="store_false",
+    )
+    bench_parser.add_argument(
+        "--ngram-self-tune",
+        dest="ngram_self_tune",
+        action="store_true",
+        default=True,
+    )
+    bench_parser.add_argument(
+        "--no-ngram-self-tune",
+        dest="ngram_self_tune",
+        action="store_false",
+    )
+    bench_parser.add_argument(
+        "--ngram-self-tune-disable-threshold",
+        type=float,
+        default=0.30,
     )
     bench_parser.add_argument(
         "--enable-prefix-cache",

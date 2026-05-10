@@ -127,6 +127,46 @@ class SchedulerConfig:
     ngram_min_matches: int = 2
     ngram_only_in_think: bool = True
 
+    # --- Advanced n-gram tuning ---
+    # Acceptance mode: "greedy" matches argmax of target distribution
+    # (high acceptance under low-entropy reasoning, slight loss of sample
+    # diversity); "probabilistic" uses the Leviathan/Chen prob-ratio test
+    # (lossless w.r.t. target sampling distribution).
+    ngram_acceptance_mode: str = "greedy"
+
+    # Confidence gate: require the n-gram + continuation to have appeared
+    # at least N times in history before drafting. 1 = no gate (use any
+    # match), 2-3 = filter out one-off matches.
+    ngram_min_occurrences: int = 1
+
+    # Adaptive K: scale draft length by occurrence count so weak matches
+    # only commit short drafts. K_cap = min(num_draft_tokens, freq + 1).
+    ngram_adaptive_k: bool = True
+
+    # Auto-disable: when MTP global running acceptance is above this
+    # threshold AND ngram running acceptance is below
+    # `ngram_auto_disable_min_ngram` after warmup, suppress ngram drafts.
+    # Set to 0.0 to disable. 0.85 is a reasonable default for strong MTP
+    # heads (Qwen3.6-35B-A3B has MTP ~95% on reasoning workloads).
+    ngram_auto_disable_mtp_threshold: float = 0.0
+    ngram_auto_disable_min_ngram: float = 0.50
+
+    # Hybrid verify: when ngram drafts the first K_ngram positions, also
+    # run the MTP head sequentially through them to produce ONE additional
+    # MTP-sourced draft at position K_ngram. Total verify width grows by 1.
+    ngram_hybrid_verify: bool = False
+
+    # Skip tool-call XML regions (text-level marker tracking). Required
+    # for Qwen3-style models where tool calls are multi-token BPE
+    # sequences and ngram tends to find structural-but-stale matches.
+    ngram_skip_tool_calls: bool = True
+
+    # Per-request self-tune: after the first 32 drafted tokens, disable
+    # drafting for the rest of THIS request when running acceptance is
+    # below threshold.
+    ngram_self_tune: bool = True
+    ngram_self_tune_disable_threshold: float = 0.30
+
 
 @dataclass
 class SchedulerOutput:
@@ -623,6 +663,10 @@ def _install_mtp(
     stats: dict[str, int] | None = None,
     ngram_drafters: dict[int, Any] | None = None,
     ngram_num_drafts: int = 0,
+    ngram_acceptance_mode: str = "greedy",
+    ngram_hybrid_verify: bool = False,
+    ngram_auto_disable_mtp_threshold: float = 0.0,
+    ngram_auto_disable_min_ngram: float = 0.50,
 ) -> None:
     """
     Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
@@ -685,6 +729,27 @@ def _install_mtp(
     # _step can feed them to the n-gram state in correct emission order
     # before performing its lookup.
     _ngram_pending: dict[int, list[int]] = {}
+
+    # ---- Auto-disable: when MTP is strong globally and ngram acceptance
+    # ---- is poor, suppress n-gram drafting to avoid wasted verify cycles.
+    _AUTO_DISABLE_MTP_WARMUP = 64
+    _AUTO_DISABLE_NGRAM_WARMUP = 32
+
+    def _ngram_auto_disable_active() -> bool:
+        if ngram_auto_disable_mtp_threshold <= 0:
+            return False
+        total_mtp = _mtp_stats.get("accepted", 0) + _mtp_stats.get("rejected", 0)
+        if total_mtp < _AUTO_DISABLE_MTP_WARMUP:
+            return False
+        mtp_rate = _mtp_stats["accepted"] / total_mtp
+        if mtp_rate < ngram_auto_disable_mtp_threshold:
+            return False
+        drafted = _mtp_stats.get("ngram_tokens_drafted", 0)
+        if drafted < _AUTO_DISABLE_NGRAM_WARMUP:
+            return False
+        accepted = _mtp_stats.get("ngram_tokens_accepted", 0)
+        ngram_rate = accepted / drafted
+        return ngram_rate < ngram_auto_disable_min_ngram
 
     # MTP stats — share scheduler-owned dict so counters survive batch
     # generator recreation between requests.
@@ -1149,14 +1214,17 @@ def _install_mtp(
                     pending = _ngram_pending.pop(_uid, [])
                     if pending:
                         ngram_state.feed_many(pending)
-                    if ngram_state.should_draft():
+                    if (
+                        ngram_state.should_draft()
+                        and not _ngram_auto_disable_active()
+                    ):
                         try:
                             _primary_id = int(primary_tokens[0].item())
                         except Exception:
                             _primary_id = None
                         if _primary_id is not None:
                             cands = ngram_state.lookup_drafts_with_pending(
-                                _primary_id
+                                _primary_id, max_k=ngram_num_drafts
                             )
                             if cands:
                                 ngram_draft_ids = list(cands[:ngram_num_drafts])
@@ -1164,6 +1232,7 @@ def _install_mtp(
             try:
                 draft_token_arrays = []
                 draft_distributions = []
+                draft_sources: list[str] = []  # "ngram" or "mtp" per depth
                 persistent_mtp_uid = (
                     current_uids[0]
                     if batch_size == 1 and hasattr(model, "make_mtp_cache")
@@ -1182,20 +1251,54 @@ def _install_mtp(
                     )
                 mtp_cache_start_offset = _cache_offset(mtp_cache)
 
-                if ngram_draft_ids is not None:
-                    # N-gram path: synthesize draft arrays + delta logprobs so
-                    # the existing acceptance/rejection machinery works
-                    # unchanged. q = δ on draft_token gives accept_prob =
-                    # min(p_target[draft], 1) and a clean residual that
-                    # zeros out the draft token.
-                    vocab_size = int(logits.shape[-1])
-                    for tok in ngram_draft_ids:
-                        tok_arr = mx.array([tok], dtype=primary_tokens.dtype)
-                        draft_token_arrays.append(tok_arr)
-                        # Use a finite large negative instead of -inf to keep
-                        # downstream arithmetic numerically clean (residual
-                        # uses exp; -inf is fine but -1e30 also produces
-                        # effective zero and avoids NaN paths).
+                # Unified draft loop: at each depth we ALWAYS run the MTP
+                # head forward to keep its hidden state + cache consistent
+                # with the actually-emitted token sequence. At ngram depths
+                # we replace the MTP-sampled token with the n-gram-supplied
+                # one (and synthesize a delta distribution so the existing
+                # acceptance machinery keeps working). At MTP depths we use
+                # MTP's own sampled token. Hybrid verify simply means the
+                # loop runs one extra MTP depth after the ngram tail.
+                K_ngram = len(ngram_draft_ids) if ngram_draft_ids else 0
+                if K_ngram > 0:
+                    total_depth = K_ngram + (1 if ngram_hybrid_verify else 0)
+                else:
+                    total_depth = max(1, int(num_draft_tokens))
+
+                draft_hidden = hidden_states[:, -1:, :]
+                next_token = primary_tokens
+                vocab_size = int(logits.shape[-1])
+                for depth in range(total_depth):
+                    mtp_pred_logits = None
+                    next_hidden = None
+                    if hasattr(model, "mtp_forward"):
+                        try:
+                            draft_output = model.mtp_forward(
+                                draft_hidden,
+                                next_token[:, None],
+                                mtp_cache=mtp_cache,
+                                return_hidden=True,
+                            )
+                        except Exception:
+                            draft_output = None
+                        if isinstance(draft_output, tuple):
+                            mtp_logits_full, mtp_hidden_full = draft_output
+                            mtp_pred_logits = mtp_logits_full[:, -1, :]
+                            next_hidden = (
+                                mtp_hidden_full[:, -1:, :]
+                                if mtp_hidden_full is not None
+                                else None
+                            )
+                        elif draft_output is not None:
+                            mtp_pred_logits = draft_output[:, -1, :]
+
+                    if depth < K_ngram:
+                        # Ngram-supplied token at this depth. Synthesize a
+                        # delta distribution so acceptance_mask + residual
+                        # paths produce the prompt-lookup acceptance rule
+                        # (q = δ on the draft token).
+                        tok_id = ngram_draft_ids[depth]
+                        tok_arr = mx.array([tok_id], dtype=primary_tokens.dtype)
                         delta = mx.full((1, vocab_size), -1e30)
                         delta = mx.put_along_axis(
                             delta,
@@ -1203,55 +1306,31 @@ def _install_mtp(
                             mx.zeros((1, 1)),
                             axis=-1,
                         )
+                        draft_token_arrays.append(tok_arr)
                         draft_distributions.append(delta)
-                    # Advance the persistent MTP cache by 1 to fold in the
-                    # primary, mirroring the +1 that the MTP head's first
-                    # draft call would have produced. Without this step,
-                    # the persistent MTP cache lags the main verify cache by
-                    # 1 token and any subsequent MTP-head fallback (when
-                    # n-gram returns no match) would predict from a stale
-                    # context.
-                    if mtp_cache is not None:
-                        try:
-                            model.mtp_forward(
-                                hidden_states[:, -1:, :],
-                                primary_tokens[:, None],
-                                mtp_cache=mtp_cache,
-                                return_hidden=False,
-                            )
-                        except Exception:
-                            # On failure, leave mtp_cache untouched. Worst
-                            # case we lose 1 token of MTP context for the
-                            # next fallback.
-                            pass
-                else:
-                    cycle_depth = max(1, int(num_draft_tokens))
-                    draft_hidden = hidden_states[:, -1:, :]
-                    next_token = primary_tokens
-                    for _depth_index in range(cycle_depth):
-                        draft_output = model.mtp_forward(
-                            draft_hidden,
-                            next_token[:, None],
-                            mtp_cache=mtp_cache,
-                            return_hidden=True,
-                        )
-                        if isinstance(draft_output, tuple):
-                            draft_logits_full, draft_hidden_full = draft_output
-                        else:
-                            draft_logits_full = draft_output
-                            draft_hidden_full = None
-                        draft_logits = draft_logits_full[:, -1, :]
+                        draft_sources.append("ngram")
+                        next_token = tok_arr
+                    elif mtp_pred_logits is not None:
+                        # MTP-sampled token at this depth.
                         draft_distribution = distribution_logprobs(
-                            draft_logits,
-                            _draft_params,
+                            mtp_pred_logits, _draft_params
                         )
                         draft_tokens = sample_from_logprobs(draft_distribution)
                         draft_token_arrays.append(draft_tokens)
                         draft_distributions.append(draft_distribution)
+                        draft_sources.append("mtp")
                         next_token = draft_tokens
-                        if draft_hidden_full is None:
+                    else:
+                        # No MTP head available beyond ngram drafts — stop.
+                        break
+
+                    if next_hidden is None:
+                        # Cannot advance past this depth without a fresh
+                        # hidden; commit what we have and break.
+                        if depth < total_depth - 1:
                             break
-                        draft_hidden = draft_hidden_full[:, -1:, :]
+                    else:
+                        draft_hidden = next_hidden
 
                 rnn_snapshots = {}
                 for ci, c in enumerate(gen_self.prompt_cache):
@@ -1348,11 +1427,31 @@ def _install_mtp(
                             verify_target_logits,
                             _target_params,
                         )
-                        accepted_mask = acceptance_mask(
-                            target_distribution,
-                            draft_distributions[depth_index],
-                            draft_tokens,
+                        # Greedy acceptance for ngram-sourced depths: accept
+                        # iff target_argmax matches the n-gram draft token.
+                        # This raises acceptance under low-entropy reasoning
+                        # at the cost of strictly preserving target sample
+                        # distribution (well-known prompt-lookup tradeoff).
+                        # MTP-sourced depths always use the lossless
+                        # probability-ratio rule.
+                        is_ngram_depth = (
+                            depth_index < len(draft_sources)
+                            and draft_sources[depth_index] == "ngram"
                         )
+                        if (
+                            ngram_acceptance_mode == "greedy"
+                            and is_ngram_depth
+                        ):
+                            target_argmax = mx.argmax(
+                                target_distribution, axis=-1
+                            )
+                            accepted_mask = target_argmax == draft_tokens
+                        else:
+                            accepted_mask = acceptance_mask(
+                                target_distribution,
+                                draft_distributions[depth_index],
+                                draft_tokens,
+                            )
                         mx.eval(accepted_mask, draft_tokens)
                         target_distributions.append(target_distribution)
                         accepted_masks.append(accepted_mask)
@@ -2139,6 +2238,14 @@ class Scheduler:
                         if self.config.enable_ngram
                         else 0
                     ),
+                    ngram_acceptance_mode=self.config.ngram_acceptance_mode,
+                    ngram_hybrid_verify=self.config.ngram_hybrid_verify,
+                    ngram_auto_disable_mtp_threshold=(
+                        self.config.ngram_auto_disable_mtp_threshold
+                    ),
+                    ngram_auto_disable_min_ngram=(
+                        self.config.ngram_auto_disable_min_ngram
+                    ),
                 )
             else:
                 logger.warning(
@@ -2896,6 +3003,14 @@ class Scheduler:
                             ngram_size=self.config.ngram_size,
                             min_matches=self.config.ngram_min_matches,
                             only_in_think=self.config.ngram_only_in_think,
+                            min_occurrences=self.config.ngram_min_occurrences,
+                            adaptive_k=self.config.ngram_adaptive_k,
+                            skip_tool_calls=self.config.ngram_skip_tool_calls,
+                            self_tune=self.config.ngram_self_tune,
+                            self_tune_disable_threshold=(
+                                self.config.ngram_self_tune_disable_threshold
+                            ),
+                            tokenizer=self._actual_tokenizer,
                         )
                     except Exception as exc:  # pragma: no cover — defensive
                         logger.warning(

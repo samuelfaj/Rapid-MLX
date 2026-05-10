@@ -328,6 +328,17 @@ def serve_command(args):
         server._tool_call_parser = None
         server._enable_tool_logits_bias = False
 
+    # Configure structured CoT
+    structured_cot_arg = getattr(args, "structured_cot", None)
+    if structured_cot_arg is None:
+        server._structured_cot_path = None
+    elif structured_cot_arg == "__default__":
+        from .api.structured_cot import DEFAULT_GRAMMAR_PATH
+
+        server._structured_cot_path = str(DEFAULT_GRAMMAR_PATH)
+    else:
+        server._structured_cot_path = str(structured_cot_arg)
+
     # Configure generation defaults
     if args.default_temperature is not None:
         server._default_temperature = args.default_temperature
@@ -1580,6 +1591,21 @@ Examples:
         default=False,
         help="Bias logits toward structural tool call tokens for faster generation. "
         "Only active when --tool-call-parser is also set. Currently supports minimax.",
+    )
+    # Structured chain-of-thought (https://andthattoo.dev/blog/structured_cot).
+    # Optional path to a custom GBNF grammar; default = bundled fsm_grammar.gbnf.
+    serve_parser.add_argument(
+        "--structured-cot",
+        nargs="?",
+        const="__default__",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Constrain the model's <think> block to a structured plan. "
+            "Pass without a value to use the bundled default grammar "
+            "(fsm_grammar.gbnf from andthattoo/structured-cot), or pass a "
+            "path to a custom GBNF file."
+        ),
     )
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers

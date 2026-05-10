@@ -1632,6 +1632,7 @@ class Scheduler:
         tokenizer: Any,
         config: SchedulerConfig | None = None,
         tool_logits_processor_factory: Any | None = None,
+        structured_cot_processor_factory: Any | None = None,
     ):
         """
         Initialize the scheduler.
@@ -1643,11 +1644,14 @@ class Scheduler:
             tool_logits_processor_factory: Optional callable that creates a
                 logits processor for tool call structural token biasing.
                 Called with no args, returns a processor or None.
+            structured_cot_processor_factory: Optional callable that creates a
+                logits processor enforcing structured CoT inside <think> blocks.
         """
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or SchedulerConfig()
         self._tool_logits_processor_factory = tool_logits_processor_factory
+        self._structured_cot_processor_factory = structured_cot_processor_factory
 
         # Detect if tokenizer is a processor (MLLM) and get the actual tokenizer
         self._actual_tokenizer = self._get_actual_tokenizer(tokenizer)
@@ -2591,10 +2595,17 @@ class Scheduler:
             # fall back to no-cache insert instead of crashing.
             # Create per-request logits processors
             request_logits_processors = None
+            processors: list[Any] = []
             if self._tool_logits_processor_factory:
                 processor = self._tool_logits_processor_factory()
                 if processor is not None:
-                    request_logits_processors = [[processor]]
+                    processors.append(processor)
+            if self._structured_cot_processor_factory:
+                cot_processor = self._structured_cot_processor_factory()
+                if cot_processor is not None:
+                    processors.append(cot_processor)
+            if processors:
+                request_logits_processors = [processors]
 
             # Per-request sampler (temperature/top_p may differ per request).
             # Without this, all requests use the BatchGenerator's default

@@ -464,6 +464,12 @@ def serve_command(args):
         mtp_num_draft_tokens=args.mtp_num_draft_tokens,
         mtp_draft_temperature=args.mtp_draft_temperature,
         mtp_optimistic=args.mtp_optimistic,
+        # N-gram (prompt-lookup) speculative decoding
+        enable_ngram=args.enable_ngram,
+        ngram_num_draft_tokens=args.ngram_num_draft_tokens,
+        ngram_size=args.ngram_size,
+        ngram_min_matches=args.ngram_min_matches,
+        ngram_only_in_think=args.ngram_only_in_think,
         # KV cache quantization
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -483,6 +489,19 @@ def serve_command(args):
             "MTP: enabled, "
             f"draft_tokens={args.mtp_num_draft_tokens}, "
             f"draft_temp={args.mtp_draft_temperature}"
+        )
+    if args.enable_ngram:
+        gate = (
+            "in <think> only"
+            if args.ngram_only_in_think
+            else "everywhere"
+        )
+        print(
+            "N-gram: enabled, "
+            f"K={args.ngram_num_draft_tokens}, "
+            f"n={args.ngram_size}, "
+            f"min_matches={args.ngram_min_matches}, "
+            f"gate={gate}"
         )
     print(f"Stream interval: {args.stream_interval} tokens")
     if args.use_paged_cache:
@@ -662,6 +681,12 @@ def bench_command(args):
             mtp_num_draft_tokens=args.mtp_num_draft_tokens,
             mtp_draft_temperature=args.mtp_draft_temperature,
             mtp_optimistic=args.mtp_optimistic,
+            # N-gram (prompt-lookup) speculative decoding
+            enable_ngram=args.enable_ngram,
+            ngram_num_draft_tokens=args.ngram_num_draft_tokens,
+            ngram_size=args.ngram_size,
+            ngram_min_matches=args.ngram_min_matches,
+            ngram_only_in_think=args.ngram_only_in_think,
             # KV cache quantization
             kv_cache_quantization=args.kv_cache_quantization,
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -1489,6 +1514,50 @@ Examples:
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
     )
+    # N-gram (prompt-lookup) speculative decoding — layered with MTP.
+    serve_parser.add_argument(
+        "--enable-ngram",
+        action="store_true",
+        default=False,
+        help="Enable n-gram (prompt-lookup) speculative decoding layered "
+        "before MTP. Drafts up to K tokens per verify cycle from repeating "
+        "patterns in prompt+history; falls back to MTP head when no match. "
+        "Gated to <think> blocks by default.",
+    )
+    serve_parser.add_argument(
+        "--ngram-num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of n-gram draft tokens per verify cycle (default: 4).",
+    )
+    serve_parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=3,
+        help="N-gram size used for prompt-lookup matching (default: 3).",
+    )
+    serve_parser.add_argument(
+        "--ngram-min-matches",
+        type=int,
+        default=2,
+        help="Minimum continuation tokens required for an n-gram match to "
+        "fire (default: 2).",
+    )
+    serve_parser.add_argument(
+        "--ngram-only-in-think",
+        dest="ngram_only_in_think",
+        action="store_true",
+        default=True,
+        help="Restrict n-gram drafting to <think>...</think> blocks "
+        "(default: True).",
+    )
+    serve_parser.add_argument(
+        "--ngram-everywhere",
+        dest="ngram_only_in_think",
+        action="store_false",
+        help="Disable the <think>-block gate; draft n-gram across all "
+        "outputs.",
+    )
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
@@ -1773,6 +1842,48 @@ Examples:
         action="store_true",
         default=False,
         help="Skip MTP acceptance check for maximum speed.",
+    )
+    # N-gram (prompt-lookup) — same flags as serve.
+    bench_parser.add_argument(
+        "--enable-ngram",
+        action="store_true",
+        default=False,
+        help="Enable n-gram (prompt-lookup) speculative decoding layered "
+        "before MTP.",
+    )
+    bench_parser.add_argument(
+        "--ngram-num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of n-gram draft tokens per verify cycle (default: 4).",
+    )
+    bench_parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=3,
+        help="N-gram size used for prompt-lookup matching (default: 3).",
+    )
+    bench_parser.add_argument(
+        "--ngram-min-matches",
+        type=int,
+        default=2,
+        help="Minimum continuation tokens required for an n-gram match to "
+        "fire (default: 2).",
+    )
+    bench_parser.add_argument(
+        "--ngram-only-in-think",
+        dest="ngram_only_in_think",
+        action="store_true",
+        default=True,
+        help="Restrict n-gram drafting to <think>...</think> blocks "
+        "(default: True).",
+    )
+    bench_parser.add_argument(
+        "--ngram-everywhere",
+        dest="ngram_only_in_think",
+        action="store_false",
+        help="Disable the <think>-block gate; draft n-gram across all "
+        "outputs.",
     )
     bench_parser.add_argument(
         "--enable-prefix-cache",

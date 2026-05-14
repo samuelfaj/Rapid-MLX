@@ -35,8 +35,12 @@ _ORNSTEIN_35B_ALIASES = {
     "ornstein3.6-35b-saber-4bit",
     "ornstein3.6-35b-saber",
     "ornstein3.6-35b-saber-8bit",
+    "ornstein3.6-27b-nsc-ace-saber-4bit",
+    "ornstein3.6-27b-nsc-ace-saber",
+    "ornstein3.6-27b-nsc-ace-saber-8bit",
 }
 _ORNSTEIN_35B_MARKER = "Ornstein3.6-35B-A3B-SABER"
+_ORNSTEIN_27B_NSC_ACE_MARKER = "Ornstein3.6-27B-MTP-NSC-ACE-SABER"
 
 
 def _has_cli_option(raw_args: list[str], *option_names: str) -> bool:
@@ -254,6 +258,7 @@ def _is_ornstein_35b_request(args: argparse.Namespace) -> bool:
     return (
         original_alias in _ORNSTEIN_35B_ALIASES
         or _ORNSTEIN_35B_MARKER in model
+        or _ORNSTEIN_27B_NSC_ACE_MARKER in model
     )
 
 

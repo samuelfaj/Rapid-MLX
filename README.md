@@ -12,10 +12,11 @@ Check out:
 lightning-mlx serve qwopus3.6-35b
 lightning-mlx serve ornstein3.6-35b-saber
 lightning-mlx serve qwen3.6-35b-nsc-ace-saber
+lightning-mlx serve ornstein3.6-27b-nsc-ace-saber
 ```
 
 **❤️ I really recommend:**
-`lightning-mlx serve qwen3.6-35b-nsc-ace-saber`
+`lightning-mlx serve qwen3.6-35b-nsc-ace-saber` and `lightning-mlx serve ornstein3.6-27b-nsc-ace-saber`
 
 
 ## Raw Decode Benchmarks

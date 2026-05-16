@@ -426,8 +426,12 @@ def _looks_like_invalid_tool_continuation(text: str | None) -> bool:
         lowered.startswith("_") or lowered.endswith("_name")
     ):
         return True
-    if len(stripped) <= 16:
-        return True
+    # NOTE: this runs per streaming delta with tool_mode on (the default,
+    # since tool_call_parser defaults to a truthy value). A blanket
+    # "len <= 16 -> invalid" rule here silently drops nearly every streamed
+    # content chunk, because streaming emits content a few tokens at a time.
+    # Only the explicit junk fragments below are genuine invalid-continuation
+    # markers; length alone is not.
     return lowered in {
         "i",
         "i'm",
@@ -1150,7 +1154,13 @@ async def stream_chat_completion(
             if hasattr(request, "model_dump")
             else None
         )
-        tool_mode = bool(request.tools or cfg.tool_call_parser)
+        # tool_mode gates content-suppression heuristics (force_tool_work,
+        # invalid-continuation filtering). It must track whether THIS request
+        # actually carries tools -- not merely whether a tool-call parser is
+        # configured. tool_call_parser defaults to a truthy value, so the old
+        # `or cfg.tool_call_parser` made tool_mode True for every plain chat
+        # request and silently suppressed its streamed content.
+        tool_mode = bool(request.tools)
         force_tool_work = bool(tool_mode and _last_user_requests_artifact(request.messages))
         last_tool_needs_more_work = _last_tool_result_needs_more_work(request.messages)
         processor = StreamingPostProcessor(

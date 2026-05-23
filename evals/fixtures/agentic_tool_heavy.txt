@@ -1,0 +1,1 @@
+Read pyproject.toml, then list every dependency under [project.dependencies], then for each one tell me its purpose in one short line.

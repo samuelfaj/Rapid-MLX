@@ -982,6 +982,41 @@ def bench_command(args):
         print(f"Loading model: {args.model}")
         model, tokenizer = load_model_with_fallback(args.model)
 
+        # Generate prompts
+        if args.prompt_file:
+            import os
+            if not os.path.exists(args.prompt_file):
+                raise FileNotFoundError(f"Prompt file not found: {args.prompt_file}")
+            with open(args.prompt_file) as f:
+                prompts = [
+                    line.strip()
+                    for line in f
+                    if line.strip()
+                ]
+            if not prompts:
+                raise ValueError(f"No non-blank lines in prompt file: {args.prompt_file}")
+            # Repeat prompts to match --num-prompts
+            requested = args.num_prompts
+            if len(prompts) < requested:
+                prompts = (prompts * ((requested // len(prompts)) + 1))[:requested]
+            else:
+                prompts = prompts[:requested]
+        else:
+            prompts = [
+                f"Write a short poem about {topic}."
+                for topic in [
+                    "nature",
+                    "love",
+                    "technology",
+                    "space",
+                    "music",
+                    "art",
+                    "science",
+                    "history",
+                    "food",
+                    "travel",
+                ][: args.num_prompts]
+            ]
         scheduler_config = SchedulerConfig(
             max_num_seqs=args.max_num_seqs,
             prefill_batch_size=args.prefill_batch_size,
@@ -1032,23 +1067,6 @@ def bench_command(args):
             print(
                 f"Paged cache: block_size={args.paged_cache_block_size}, max_blocks={args.max_cache_blocks}"
             )
-
-        # Generate prompts
-        prompts = [
-            f"Write a short poem about {topic}."
-            for topic in [
-                "nature",
-                "love",
-                "technology",
-                "space",
-                "music",
-                "art",
-                "science",
-                "history",
-                "food",
-                "travel",
-            ][: args.num_prompts]
-        ]
 
         params = SamplingParams(
             max_tokens=args.max_tokens,
@@ -1102,6 +1120,31 @@ def bench_command(args):
         print(f"  Total tokens: {total_tokens}")
         print(f"  Tokens/second: {total_completion_tokens / total_time:.2f}")
         print(f"  Throughput: {total_tokens / total_time:.2f} tok/s")
+
+        if args.report_json:
+            import json
+            import subprocess as _sp
+            from pathlib import Path as _Path
+
+            _Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                "model": args.model,
+                "num_prompts": len(prompts),
+                "prompt_file": args.prompt_file,
+                "max_tokens": args.max_tokens,
+                "prefill_tok_s": total_prompt_tokens / total_time if total_time > 0 else 0,
+                "gen_tok_s": total_completion_tokens / total_time if total_time > 0 else 0,
+                "total_time_s": total_time,
+                "peak_gpu_mem_mb": mx.metal.get_peak_memory() / 1024 / 1024,
+                "device_name": mx.device_info().get("device_name", "unknown"),
+                "mlx_version": mx.__version__,
+                "git_sha": _sp.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+            }
+            with open(args.report_json, "w") as fh:
+                json.dump(report, fh, indent=2)
+            print(f"  Report written: {args.report_json}")
 
     asyncio.run(run_benchmark())
 
@@ -2480,6 +2523,19 @@ Examples:
         type=int,
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
+    )
+    bench_parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to a text file containing the prompt(s) — one per line. "
+        "Overrides synthetic prompts.",
+    )
+    bench_parser.add_argument(
+        "--report-json",
+        type=str,
+        default=None,
+        help="Write a JSON metrics report to this path.",
     )
 
     # Detokenizer benchmark

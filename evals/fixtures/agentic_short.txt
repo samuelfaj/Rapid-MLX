@@ -1,0 +1,1 @@
+List the files in the current directory and tell me which file is the largest. Use the available tools.

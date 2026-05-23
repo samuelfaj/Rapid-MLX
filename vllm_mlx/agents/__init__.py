@@ -105,6 +105,7 @@ def _load_profile_from_yaml(path: Path) -> AgentProfile:
         testing=_parse_testing(data),
         versions=_parse_versions(data),
         known_issues=data.get("known_issues", []),
+        engine=data.get("engine", {}),
         needs_function_calling=capabilities.get("function_calling", True),
         needs_streaming=capabilities.get("streaming", True),
         needs_vision=capabilities.get("vision", False),

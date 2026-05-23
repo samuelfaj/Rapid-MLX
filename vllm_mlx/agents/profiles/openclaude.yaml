@@ -24,6 +24,9 @@ streaming:
   suppress_patterns: []
   max_tools: 25  # Claude Code ~20 tools
 
+engine:
+  ngram_max_k: 6
+
 testing:
   binary: null
   query_cmd: null  # OpenClaude is interactive, no single-query mode

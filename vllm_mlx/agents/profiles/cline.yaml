@@ -23,6 +23,9 @@ streaming:
   suppress_patterns: []
   max_tools: 0  # Cline uses XML text parsing, not OpenAI FC
 
+engine:
+  ngram_max_k: 6
+
 testing:
   binary: null  # VS Code extension, no CLI
   query_cmd: null

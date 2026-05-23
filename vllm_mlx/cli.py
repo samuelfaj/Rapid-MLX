@@ -340,6 +340,21 @@ def _apply_ornstein_mtplx_preset(
     if not _has_cli_option(raw_args, "--ngram-auto-disable-min-ngram"):
         args.ngram_auto_disable_min_ngram = 0.50
 
+    # Per-agent profile overrides (engine.ngram_max_k, etc.)
+    _agent = getattr(args, "agent_name", None)
+    if _agent:
+        try:
+            from vllm_mlx.agents import get_profile
+            _profile = get_profile(_agent)
+            if _profile and "engine" in _profile:
+                _eng = _profile["engine"]
+                if "ngram_max_k" in _eng and not _has_cli_option(
+                    raw_args, "--ngram-num-draft-tokens"
+                ):
+                    args.ngram_num_draft_tokens = _eng["ngram_max_k"]
+        except Exception:
+            pass  # Profile loading is best-effort
+
 
 def _apply_qwen36_35b_defaults(args: argparse.Namespace, raw_args: list[str]) -> None:
     if getattr(args, "command", None) != "serve" or not _is_qwen36_35b_a3b_request(

@@ -95,6 +95,9 @@ class AgentProfile:
     # Known issues (human-readable, for docs and --info output)
     known_issues: list[str] = field(default_factory=list)
 
+    # Engine overrides (ngram_max_k, etc.) — best-effort, not validated
+    engine: dict = field(default_factory=dict)
+
     # Capabilities the agent expects from the server
     needs_function_calling: bool = True
     needs_streaming: bool = True

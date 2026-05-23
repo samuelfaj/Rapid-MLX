@@ -27,6 +27,9 @@ streaming:
   suppress_patterns: []
   max_tools: 10
 
+engine:
+  ngram_max_k: 6
+
 testing:
   binary: null  # Rust binary, cargo install
   query_cmd: "codex '{query}'"

@@ -1044,6 +1044,13 @@ Examples:
     args = parser.parse_args()
     uvicorn_log_level = configure_logging(args.log_level)
 
+    # Log Metal 4 / NAX capabilities (pure observability)
+    try:
+        from vllm_mlx.runtime.metal4 import log_capabilities
+        log_capabilities()
+    except Exception:
+        pass
+
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter, _idle_timeout
     global _default_temperature, _default_top_p

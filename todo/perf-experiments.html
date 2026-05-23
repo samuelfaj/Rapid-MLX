@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Perf Experiments — Agentic / Solo / M5</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1c2030;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #7cc4ff;
+    --accent-2: #ffb86b;
+    --ok: #61d095;
+    --warn: #ffcc66;
+    --bad: #ff6b6b;
+    --border: #262b3a;
+    --code-bg: #0b0d12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 40px 28px 80px; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 32px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h1 .sub { color: var(--accent); font-weight: 500; }
+  h2 { font-size: 22px; margin: 40px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 17px; margin: 26px 0 10px; color: var(--accent-2); }
+  h4 { font-size: 14px; margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta span { margin-right: 18px; }
+  .pill {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  }
+  .pill.plan { background: #2b3654; color: var(--accent); }
+  .pill.ok { background: #1f3a2c; color: var(--ok); }
+  .pill.warn { background: #3a3120; color: var(--warn); }
+  .pill.bad { background: #3a2222; color: var(--bad); }
+  .pill.phase { background: #2b3654; color: var(--accent); margin-right: 8px; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; color: #ffd479; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    color: #d8dee9;
+  }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td {
+    text-align: left; padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+  ul, ol { padding-left: 22px; }
+  ul li, ol li { margin: 4px 0; }
+  .audit-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .audit { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .check { color: var(--ok); }
+  .gap { color: var(--warn); }
+  .exp {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 14px 0;
+  }
+  .exp.med { border-left-color: var(--accent-2); }
+  .exp.large { border-left-color: var(--bad); }
+  .exp.skip { border-left-color: var(--muted); opacity: 0.65; }
+  .exp h3 { margin-top: 0; }
+  .exp .row { display: grid; grid-template-columns: 110px 1fr; gap: 12px; margin: 4px 0; font-size: 14px; }
+  .exp .row .k { color: var(--muted); }
+  .callout {
+    background: #1a1f2c; border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    padding: 12px 16px; border-radius: 6px; margin: 14px 0;
+  }
+  .callout.ok { border-left-color: var(--ok); }
+  .callout.bad { border-left-color: var(--bad); }
+  .gate-table th { width: 22%; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 36px 0; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Performance Experiments <span class="sub">— Agentic / Solo / M5-first</span></h1>
+  <p class="meta">
+    <span><span class="pill plan">PLANNING</span></span>
+    <span>Workload: agentic</span>
+    <span>HW: M5 primary, M1–M4 must not regress</span>
+    <span>Maintainer: solo</span>
+  </p>
+  <p>One change at a time. Snapshot before. Apply. Snapshot after. Keep if win. Revert if loss. Move on.</p>
+  <p>Companion: <code>nax-metal4-plan.html</code> — NAX/Metal4 track runs in parallel.</p>
+</header>
+
+<h2>0. Audit — already shipped (do not re-implement)</h2>
+
+<div class="audit-grid">
+  <div class="audit">
+    <h4>Speculative decoding</h4>
+    <ul>
+      <li><span class="check">✓</span> MTP via mlx-lm batched engine</li>
+      <li><span class="check">✓</span> MTP optimistic (auto-on)</li>
+      <li><span class="check">✓</span> N-gram drafter (prompt-lookup)</li>
+      <li><span class="check">✓</span> <code>&lt;think&gt;</code> + <code>&lt;tool_call&gt;</code> state machines</li>
+      <li><span class="check">✓</span> Adaptive K per match confidence</li>
+      <li><span class="check">✓</span> Hybrid verify (MTP after n-gram tail)</li>
+      <li><span class="check">✓</span> Self-tuning + auto-disable (no-regression vs MTP-only)</li>
+      <li><span class="check">✓</span> DFlash block-diffusion drafter</li>
+      <li><span class="check">✓</span> Native MTP path</li>
+    </ul>
+  </div>
+  <div class="audit">
+    <h4>KV / cache</h4>
+    <ul>
+      <li><span class="check">✓</span> Prompt cache (always on, 5–30× TTFT)</li>
+      <li><span class="check">✓</span> Prefix cache + disk persistence</li>
+      <li><span class="check">✓</span> KV cache quantization (configurable bits)</li>
+      <li><span class="check">✓</span> KV cache turboquant (auto-bits by head_dim)</li>
+      <li><span class="check">✓</span> Paged cache</li>
+      <li><span class="check">✓</span> Chunked prefill</li>
+    </ul>
+  </div>
+  <div class="audit">
+    <h4>Attention &amp; quantization</h4>
+    <ul>
+      <li><span class="check">✓</span> Flash attn via <code>mx.fast.scaled_dot_product_attention</code></li>
+      <li><span class="check">✓</span> Sliding window plumbed (coverage TBD)</li>
+      <li><span class="check">✓</span> 4 / 6 / 8 bit MTPLX-optimized weights</li>
+      <li><span class="check">✓</span> 2-bit DQ for DeepSeek-V4-Flash</li>
+    </ul>
+  </div>
+  <div class="audit">
+    <h4>System</h4>
+    <ul>
+      <li><span class="check">✓</span> Daemon + boot persistence</li>
+      <li><span class="check">✓</span> HW detect M1–M4 (M5 missing — see E1)</li>
+      <li><span class="check">✓</span> 17 tool-call parsers</li>
+      <li><span class="check">✓</span> Per-agent profiles (codex / claude / aider / ...)</li>
+    </ul>
+  </div>
+  <div class="audit">
+    <h4>Rejected (do not revisit)</h4>
+    <ul>
+      <li>Medusa — superseded by EAGLE-3</li>
+      <li>Prompt lookup standalone — kept only as layered n-gram</li>
+      <li><code>--no-thinking</code> as default — degrades agentic quality (per GOAL.md)</li>
+    </ul>
+  </div>
+  <div class="audit">
+    <h4>Gaps found in audit</h4>
+    <ul>
+      <li><span class="gap">⚠</span> <strong>M5 missing</strong> from <code>HARDWARE_PROFILES</code> dict</li>
+      <li><span class="gap">⚠</span> NAX / Metal4 detection not wired (see NAX plan)</li>
+      <li><span class="gap">⚠</span> KV-quant is opt-in; agentic defaults may benefit from auto-on</li>
+    </ul>
+  </div>
+</div>
+
+<h2>1. Workflow protocol — try / eval / keep / revert</h2>
+<div class="callout bad"><strong>One change per experiment.</strong> No bundling. No parallel branches.</div>
+
+<h3>Per-experiment steps</h3>
+<ol>
+  <li><code>pre</code> — confirm previous experiment landed clean.</li>
+  <li><code>branch</code> — <code>exp/&lt;id&gt;-&lt;slug&gt;</code> from main.</li>
+  <li><code>snapshot_before</code> — agentic sweep → <code>reports/exp/&lt;id&gt;/before/</code>.</li>
+  <li><code>change</code> — single edit. Commit <code>exp(&lt;id&gt;): &lt;desc&gt;</code>.</li>
+  <li><code>snapshot_after</code> — agentic sweep → <code>reports/exp/&lt;id&gt;/after/</code>.</li>
+  <li><code>compare</code> — summarize.</li>
+  <li><code>verdict</code> — apply gates. Record in <code>verdict.md</code>.</li>
+  <li><code>act</code> — merge if keep / delete branch if revert.</li>
+  <li><code>log</code> — append to <code>reports/exp/INDEX.md</code>.</li>
+</ol>
+
+<h3>Keep gates (ALL must pass)</h3>
+<table class="gate-table">
+  <thead><tr><th>ID</th><th>Criterion</th></tr></thead>
+  <tbody>
+    <tr><td>G1 agentic-short</td><td>Δ ≥ <strong>+5%</strong> tok/s on M5</td></tr>
+    <tr><td>G2 agentic-long</td><td>Δ ≥ <strong>0%</strong> on M5 (no regression)</td></tr>
+    <tr><td>G3 M1/M3 regression</td><td>within <strong>±2%</strong> on both</td></tr>
+    <tr><td>G4 drift</td><td>mean abs ≤ <strong>1e-3</strong> if numerics touched</td></tr>
+    <tr><td>G5 acceptance</td><td>MTP + n-gram Δpp within <strong>±1pp</strong></td></tr>
+    <tr><td>G6 maintenance</td><td>≤ <strong>1 flag</strong> OR ≤ <strong>50 LOC</strong></td></tr>
+  </tbody>
+</table>
+
+<h3>Revert triggers (ANY → revert)</h3>
+<ul>
+  <li>Any G1–G5 fails</li>
+  <li>G6 fails (too much maintenance)</li>
+  <li>Test suite regression</li>
+  <li>Crash on M1 / M3 / M5</li>
+</ul>
+
+<h3>Bench fixture — agentic sweep</h3>
+<pre><code># short turn (tool-only)
+lightning-mlx bench &lt;model&gt; --prompt-file evals/fixtures/agentic_short.txt \
+  --num-prompts 5 --max-tokens 256 --report-json reports/exp/&lt;id&gt;/&lt;dir&gt;/short.json
+
+# long turn (snake artifact)
+lightning-mlx bench &lt;model&gt; --prompt-file evals/fixtures/agentic_long.txt \
+  --num-prompts 3 --max-tokens 2048 --report-json reports/exp/&lt;id&gt;/&lt;dir&gt;/long.json
+
+# mixed (interleaved)
+scripts/agentic_mixed.sh &lt;model&gt; reports/exp/&lt;id&gt;/&lt;dir&gt;/mixed.json</code></pre>
+<p class="meta">Models: <code>qwen3.6-35b-nsc-ace-saber-8bit</code>, <code>qwen3.6-27b-8bit</code>. M5 mandatory; M1+M3 nightly or before merge if M5 win &gt;10%.</p>
+
+<h3>Prereq tooling (E0 — blocking)</h3>
+<ul>
+  <li><code>scripts/agentic_mixed.sh</code></li>
+  <li><code>evals/fixtures/agentic_{short,long}.txt</code></li>
+  <li><code>reports/exp/INDEX.md</code> skeleton</li>
+  <li>Reuse summarizer + drift gate from NAX plan §4.6</li>
+</ul>
+
+<h2>2. Experiment queue</h2>
+
+<h3>Phase 1 — config quick wins (hours each)</h3>
+
+<div class="exp">
+  <h3>E1 — m5_hw_profile_entry</h3>
+  <div class="row"><div class="k">Change</div><div>Add M5 / M5 Pro / M5 Max / M5 Ultra to <code>HARDWARE_PROFILES</code> in <code>vllm_mlx/optimizations.py</code>.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Unknown chip falls back to 200 GB/s default → suboptimal heuristics.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>0% direct; unlocks E7</div></div>
+</div>
+
+<div class="exp">
+  <h3>E2 — mtp_depth_sweep</h3>
+  <div class="row"><div class="k">Change</div><div>Sweep <code>--mtp-num-draft-tokens</code> ∈ {2, 3, 4, 5}. Bake winner into alias preset.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Default 3 may be sub-optimal for agentic-short (tool structure repeats).</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+5–15% agentic-short</div></div>
+</div>
+
+<div class="exp">
+  <h3>E3 — kv_turboquant_default_on</h3>
+  <div class="row"><div class="k">Change</div><div>Enable <code>--kv-cache-turboquant</code> by default in agentic profiles (<code>vllm_mlx/agents/profiles/*.yaml</code>).</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Decode is BW-bound; turboquant halves KV bytes; already shipped, just opt-in.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+10–25% agentic-long decode</div></div>
+</div>
+
+<div class="exp">
+  <h3>E4 — prefix_cache_size_tune</h3>
+  <div class="row"><div class="k">Change</div><div>Raise <code>--prefix-cache-size</code> default per agentic profile. Measure hit rate.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Agentic sessions repeat tool scaffolding → fewer prefills if cache fits.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+10–30% TTFT on repeat turns</div></div>
+</div>
+
+<div class="exp">
+  <h3>E5 — chunked_prefill_default_on</h3>
+  <div class="row"><div class="k">Change</div><div>Default <code>--chunked-prefill-tokens 8192</code> for agentic profiles when ctx &gt; 16k.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Prefill dominates long-turn TTFT; chunking lets next-turn gen start sooner.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+5–15% mixed throughput</div></div>
+</div>
+
+<div class="exp">
+  <h3>E6 — power_mode_doc</h3>
+  <div class="row"><div class="k">Change</div><div>Docs only: recommend <code>sudo pmset -a powermode 2</code> + Game Mode for sustained bench.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Thermal/power throttle widens bench noise band.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill ok">no risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>Bench stability +5%; user gain marginal</div></div>
+</div>
+
+<h3>Phase 2 — small code (days each)</h3>
+
+<div class="exp med">
+  <h3>E7 — auto_kv_bits_by_hw</h3>
+  <div class="row"><div class="k">Change</div><div>Auto-pick KV bits per HW: M1/M2 → fp16, M3+ → 8-bit, M5 → 6-bit. Single function in <code>scheduler.py</code>.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Low-BW chips waste cycles on dequant; high-BW chips absorb 6-bit.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1 day • <span class="pill warn">low–med</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+5–15% M5, 0% M1</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E8 — ngram_K_per_workload</h3>
+  <div class="row"><div class="k">Change</div><div>Per-profile override of <code>--ngram-max-k</code> (codex higher K, generic current).</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Agent traces have profile-specific repetition rates.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1 day • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+3–10% agentic</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E9 — nax_runtime_detect</h3>
+  <div class="row"><div class="k">Change</div><div>Thin <code>vllm_mlx/runtime/metal4.py</code>: detect M5 + macOS 26.2 + Metal4 family. TUI surfaces it. No kernels.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Precondition for later Metal4 kernel work; observability gain now.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1 day • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>0% direct; foundation for E16</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E10 — mlx_floor_bump</h3>
+  <div class="row"><div class="k">Change</div><div><code>pyproject.toml</code>: <code>mlx&gt;=0.30.0</code> (was 0.29). Re-lock.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>MLX 0.30 = upstream NAX kernels; 0.30.4 = faster fused vec GQA. Free wins.</div></div>
+  <div class="row"><div class="k">Effort</div><div>hours • <span class="pill warn">watch mlx-lm compat</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+5–20% M5; faster GQA broadly</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E11 — dflash_sweep</h3>
+  <div class="row"><div class="k">Change</div><div>Sweep DFlash block size + adaptive bounds on agentic fixture per profile.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>DFlash shipped, un-tuned for agentic; defaults may favor raw decode.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1 day • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+5–15% if model has DFlash sidecar</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E12 — sampler_gpu_path</h3>
+  <div class="row"><div class="k">Change</div><div>Ensure top-p / top-k stays on GPU; no CPU sync per token. Audit <code>pipeline/decode.py</code>.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Per-token CPU sync caps tok/s on fast GPU.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1–2 days • <span class="pill warn">low–med</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+3–8% small-model decode</div></div>
+</div>
+
+<div class="exp med">
+  <h3>E13 — mx_compile_coverage</h3>
+  <div class="row"><div class="k">Change</div><div>Wrap remaining hot-path helpers in <code>@mx.compile</code>. Audit vs deepseek_v4.py / qwen models.</div></div>
+  <div class="row"><div class="k">Hypothesis</div><div>Graph fusion saves dispatches; partial coverage today.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1–2 days • <span class="pill ok">low risk</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+2–8%</div></div>
+</div>
+
+<h3>Phase 3 — larger, gated</h3>
+
+<div class="exp large">
+  <h3>E14 — sliding_window_default_long_ctx</h3>
+  <div class="row"><div class="k">Change</div><div>Enable sliding window (already plumbed) for ctx &gt; 32k. Window = 16k.</div></div>
+  <div class="row"><div class="k">Effort</div><div>2–3 days • <span class="pill warn">med risk (quality)</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+30–80% prefill @ 64k+ ctx; 0% short ctx</div></div>
+  <div class="row"><div class="k">Gate</div><div>Only if agentic-long ctx typically &gt; 32k (measure first)</div></div>
+</div>
+
+<div class="exp large">
+  <h3>E15 — eagle3_evaluation</h3>
+  <div class="row"><div class="k">Change</div><div>Spike port of EAGLE-3 reference for one model. Measure acceptance vs MTP+ngram.</div></div>
+  <div class="row"><div class="k">Effort</div><div>1 week (spike) • <span class="pill bad">high if kept (maint debt)</span></div></div>
+  <div class="row"><div class="k">Gain</div><div>+30–60% if kept</div></div>
+  <div class="row"><div class="k">Gate</div><div>Only if E1–E13 cumulative misses agentic target</div></div>
+</div>
+
+<div class="exp large">
+  <h3>E16 — nax_kernel_port_t2</h3>
+  <div class="row"><div class="k">Change</div><div>See <code>nax-metal4-plan.md</code> §5 T2. Custom Metal4 path for hot GEMM sites.</div></div>
+  <div class="row"><div class="k">Effort</div><div>days • <span class="pill warn">med risk</span></div></div>
+  <div class="row"><div class="k">Gate</div><div>Only if NAX T1 (E10 + verify) leaves &gt;15% gap on M5</div></div>
+</div>
+
+<h3>Skip / deferred indefinitely</h3>
+<div class="exp skip">
+  <ul>
+    <li><strong>ReDrafter</strong> — needs trained heads per model. Maintenance prohibitive for solo.</li>
+    <li><strong>Full Metal4 fork (T3 NAX)</strong> — weeks; M5-only debt.</li>
+    <li><strong>W4A4 activation quant</strong> — depends on HW + custom kernels.</li>
+    <li><strong>Lookahead / Jacobi standalone</strong> — composes poorly with MTP.</li>
+  </ul>
+</div>
+
+<h2>3. Sequencing</h2>
+<p><strong>Strictly serial.</strong></p>
+<ul>
+  <li><span class="pill phase">Phase 1 (week 1)</span> E0 → E1 → E2 → E3 → E4 → E5 → E6</li>
+  <li><span class="pill phase">Phase 2 (week 2)</span> E7 → E8 → E9 → E10 → E11 → E12 → E13</li>
+  <li><span class="pill phase">Phase 3 (gated)</span> E14 → E15 → E16</li>
+</ul>
+<p class="meta">After each phase, compute cumulative agentic Δ% and decide whether the next phase is worth running.</p>
+
+<h2>4. Stop conditions</h2>
+<div class="callout">
+Stop running experiments when <strong>any</strong>:
+<ul>
+  <li>Agentic-short M5 ≥ +50% over T0 baseline</li>
+  <li>Three consecutive experiments revert</li>
+  <li>Maintenance ledger (§5) exceeds 200 LOC beyond baseline</li>
+</ul>
+</div>
+
+<h2>5. Maintenance ledger</h2>
+<p>Append per kept experiment. If cumulative LOC &gt; 200, halt Phase 2/3 entries.</p>
+<table>
+  <thead><tr><th>id</th><th>merged sha</th><th>LOC added</th><th>flags added</th><th>est ongoing cost</th></tr></thead>
+  <tbody><tr><td colspan="5" class="meta">— empty —</td></tr></tbody>
+</table>
+
+<h2>6. Open questions</h2>
+<ul>
+  <li>Q1 — does current bench fixture (<code>create snake game</code>) reflect real agentic mix? Add traces from Codex/Claude profiles?</li>
+  <li>Q2 — exact M5 device name string from <code>mx.device_info()</code>? Need for HARDWARE_PROFILES key match.</li>
+  <li>Q3 — does <code>--kv-cache-turboquant</code> cause drift on <code>qwen3.6-35b-nsc-ace-saber-8bit</code>? Drift gate first.</li>
+  <li>Q4 — mlx 0.30 + mlx-lm latest pair cleanly? Check before E10.</li>
+</ul>
+
+<h2>7. Next action</h2>
+<div class="callout ok">
+Build <strong>E0 prereq tooling</strong>:
+<ol>
+  <li>Create <code>evals/fixtures/agentic_{short,long}.txt</code> from GOAL.md fixture + 1 tool-only short.</li>
+  <li>Write <code>scripts/agentic_mixed.sh</code>.</li>
+  <li>Create <code>reports/exp/INDEX.md</code> skeleton.</li>
+  <li>Build shared <code>scripts/nax_summarize.py</code> (from NAX plan §4.6).</li>
+</ol>
+Then start <strong>E1</strong> (M5 HW profile entry) — simplest, lowest risk, unblocks several others.
+</div>
+
+<p class="footer">Sibling doc: <code>perf-experiments.md</code> — same plan, agent-readable.</p>
+</div>
+</body>
+</html>

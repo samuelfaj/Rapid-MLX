@@ -1,0 +1,13 @@
+{
+  "model": "/Users/samuelfajreldines/dev/models/Ornstein3.6-27B-MTP-NSC-ACE-SABER-MLX-8bit-MTPLX-Optimized-Speed",
+  "num_prompts": 3,
+  "prompt_file": "evals/fixtures/agentic_long.txt",
+  "max_tokens": 2048,
+  "prefill_tok_s": 0.6236579679040652,
+  "gen_tok_s": 17.218157063884735,
+  "total_time_s": 192.4131594169885,
+  "peak_gpu_mem_mb": 28561.160306930542,
+  "device_name": "Apple M5 Max",
+  "mlx_version": "0.31.2",
+  "git_sha": "47c6223f48eafb1e7f90f90b5f3d1093532a7c9c"
+}

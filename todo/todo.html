@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TODO — Execution Playbook</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1c2030;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #7cc4ff;
+    --accent-2: #ffb86b;
+    --ok: #61d095;
+    --warn: #ffcc66;
+    --bad: #ff6b6b;
+    --border: #262b3a;
+    --code-bg: #0b0d12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 36px 28px 80px; }
+  .layout { display: grid; grid-template-columns: 220px 1fr; gap: 28px; }
+  nav.toc {
+    position: sticky; top: 24px; align-self: start;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 14px;
+    max-height: calc(100vh - 48px); overflow-y: auto;
+    font-size: 13px;
+  }
+  nav.toc h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.06em; }
+  nav.toc a { display: block; color: var(--text); text-decoration: none; padding: 3px 6px; border-radius: 4px; }
+  nav.toc a:hover { background: var(--panel-2); color: var(--accent); }
+  nav.toc .step { padding-left: 14px; color: var(--muted); }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 22px; margin-bottom: 30px; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  h1 .sub { color: var(--accent); font-weight: 500; }
+  h2 { font-size: 22px; margin: 40px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 17px; margin: 24px 0 10px; color: var(--accent-2); }
+  h4 { font-size: 14px; margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta span { margin-right: 18px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.ok { background: #1f3a2c; color: var(--ok); }
+  .pill.warn { background: #3a3120; color: var(--warn); }
+  .pill.bad { background: #3a2222; color: var(--bad); }
+  .pill.info { background: #2b3654; color: var(--accent); }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; color: #ffd479; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    color: #d8dee9;
+    line-height: 1.45;
+  }
+  pre code { background: transparent; padding: 0; color: inherit; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: 0.04em; }
+  ul, ol { padding-left: 22px; }
+  ul li, ol li { margin: 4px 0; }
+  .rule {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--bad);
+    border-radius: 8px; padding: 12px 16px; margin: 12px 0;
+  }
+  .rule.ok { border-left-color: var(--ok); }
+  .rule.warn { border-left-color: var(--warn); }
+  .rule h4 { margin-bottom: 4px; color: var(--text); }
+  .step-card {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 16px 20px; margin: 16px 0;
+  }
+  .step-card.med { border-left-color: var(--accent-2); }
+  .step-card.large { border-left-color: var(--bad); }
+  .step-card.tooling { border-left-color: var(--ok); }
+  .step-card h3 { margin-top: 0; }
+  .badge-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 12px; }
+  .gate {
+    display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 12px;
+    background: var(--code-bg); border: 1px solid var(--border); color: var(--muted);
+    margin-right: 6px;
+  }
+  .gate strong { color: var(--text); }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 40px; text-align: center; }
+  details { margin: 8px 0; }
+  summary { cursor: pointer; color: var(--accent); padding: 4px 0; }
+  summary:hover { color: var(--accent-2); }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    nav.toc { position: static; max-height: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>TODO — Execution Playbook <span class="sub">— even a limited LLM agent can follow this</span></h1>
+  <p class="meta">
+    <span><span class="pill info">PLAYBOOK</span></span>
+    <span>Working dir: <code>/Users/samuelfajreldines/dev/rapid-mlx</code></span>
+    <span>One change at a time. Snapshot. Decide. Move on.</span>
+  </p>
+  <p>Source-of-truth playbook. Mirrors <code>todo/todo.md</code>. Companion specs: <code>nax-metal4-plan.html</code>, <code>perf-experiments.html</code>.</p>
+</header>
+
+<div class="layout">
+
+<nav class="toc">
+  <h3>Sections</h3>
+  <a href="#rules">0. Rules</a>
+  <a href="#tooling">1. Phase 0 — Tooling</a>
+  <a class="step" href="#T0-1">T0.1 reports skeleton</a>
+  <a class="step" href="#T0-2">T0.2 fixtures</a>
+  <a class="step" href="#T0-3">T0.3 bench flags</a>
+  <a class="step" href="#T0-4">T0.4 summarizer</a>
+  <a class="step" href="#T0-5">T0.5 sweep script</a>
+  <a class="step" href="#T0-6">T0.6 drift gate</a>
+  <a class="step" href="#T0-7">T0.7 commit</a>
+  <a href="#phase1">2. Phase 1 — Baseline + quick wins</a>
+  <a class="step" href="#T1-0">T1.0 baseline</a>
+  <a class="step" href="#E1">E1 M5 profile</a>
+  <a class="step" href="#E2">E2 MTP depth</a>
+  <a class="step" href="#E3">E3 KV turboquant</a>
+  <a class="step" href="#E4">E4 prefix cache</a>
+  <a class="step" href="#E5">E5 chunked prefill</a>
+  <a class="step" href="#E6">E6 power doc</a>
+  <a href="#phase2">3. Phase 2 — Small code</a>
+  <a class="step" href="#E7">E7 auto KV bits</a>
+  <a class="step" href="#E8">E8 ngram K profile</a>
+  <a class="step" href="#E9">E9 Metal4 detect</a>
+  <a class="step" href="#E10">E10 MLX bump</a>
+  <a class="step" href="#E11">E11 DFlash tune</a>
+  <a class="step" href="#E12">E12 sampler GPU</a>
+  <a class="step" href="#E13">E13 mx.compile</a>
+  <a href="#phase3">4. Phase 3 — Gated</a>
+  <a class="step" href="#E14">E14 sliding window</a>
+  <a class="step" href="#E15">E15 EAGLE-3</a>
+  <a class="step" href="#E16">E16 NAX kernels</a>
+  <a href="#skip">5. Skip list</a>
+  <a href="#ledger">6. Maintenance ledger</a>
+  <a href="#sweep">7. Sweep matrix</a>
+  <a href="#verdict">8. Verdict template</a>
+  <a href="#paths">9. File paths</a>
+  <a href="#start">10. Start here</a>
+</nav>
+
+<main>
+
+<!-- 0. Rules -->
+<h2 id="rules">0. Read first — operating rules</h2>
+<p>You MUST follow these without exception.</p>
+
+<div class="rule">
+  <h4>0.1 One change per step</h4>
+  Never bundle. Each step does exactly one thing. Find a second thing? Write it down. Do not do it.
+</div>
+
+<div class="rule">
+  <h4>0.2 Always paired snapshot</h4>
+  For every code/config change: snapshot BEFORE → apply → snapshot AFTER → decide. If you can't snapshot (no hw), STOP and tell the user.
+</div>
+
+<div class="rule">
+  <h4>0.3 Branch per step</h4>
+  <pre><code>git checkout -b exp/&lt;id&gt;-&lt;slug&gt;</code></pre>
+</div>
+
+<div class="rule">
+  <h4>0.4 Commit format</h4>
+  <pre><code>exp(&lt;id&gt;): &lt;description&gt;
+
+Refs: todo/todo.md</code></pre>
+</div>
+
+<div class="rule warn">
+  <h4>0.5 Decision gates — every step</h4>
+  <strong>KEEP if all true:</strong>
+  <table>
+    <tr><td><code>G1</code></td><td>agentic-short Δ tok/s ≥ <strong>+5%</strong> on M5</td></tr>
+    <tr><td><code>G2</code></td><td>agentic-long Δ tok/s ≥ <strong>0%</strong> on M5</td></tr>
+    <tr><td><code>G3</code></td><td>M1 / M3 within <strong>±2%</strong> (skip if hw unavailable)</td></tr>
+    <tr><td><code>G4</code></td><td>numeric drift mean_abs ≤ <strong>1e-3</strong> (if numerics touched)</td></tr>
+    <tr><td><code>G5</code></td><td>MTP+ngram acceptance Δpp within <strong>±1pp</strong></td></tr>
+    <tr><td><code>G6</code></td><td>change ≤ <strong>1 new flag</strong> AND ≤ <strong>50 LOC</strong></td></tr>
+  </table>
+  <strong>REVERT if ANY false.</strong>
+</div>
+
+<div class="rule ok">
+  <h4>0.6 Logging</h4>
+  After verdict, append one row to <code>reports/exp/INDEX.md</code>:
+  <pre><code>| &lt;id&gt; | &lt;slug&gt; | keep|revert | &lt;Δ short M5%&gt; | &lt;Δ long M5%&gt; | &lt;sha or "reverted"&gt; |</code></pre>
+</div>
+
+<div class="rule">
+  <h4>0.7 Stop conditions (HALT entire playbook)</h4>
+  Any of:
+  <ul>
+    <li>3 consecutive reverts</li>
+    <li>Maintenance ledger cumulative LOC &gt; 200</li>
+    <li>Agentic-short M5 cumulative gain ≥ +50% over T0</li>
+  </ul>
+</div>
+
+<div class="rule">
+  <h4>0.8 Hard no-go</h4>
+  <ul>
+    <li><strong>N1</strong> — never break M1 / M3 (G3)</li>
+    <li><strong>N2</strong> — never compile-time-only gate; always runtime detect</li>
+    <li><strong>N3</strong> — never skip drift gate (G4) when numerics change</li>
+    <li><strong>N4</strong> — never touch <code>vllm_mlx/models/deepseek_v4.py</code> lines 420 / 606 (HyperConnection kernels)</li>
+    <li><strong>N5</strong> — never use <code>--no-thinking</code> as default</li>
+    <li><strong>N6</strong> — never push to remote without user OK</li>
+  </ul>
+</div>
+
+<!-- 1. Phase 0 -->
+<h2 id="tooling">1. Phase 0 — Tooling (DO FIRST)</h2>
+<p>All later steps require these. Implement in order.</p>
+
+<div class="step-card tooling" id="T0-1">
+  <h3>T0.1 ✅ — Reports skeleton</h3>
+  <pre><code>mkdir -p reports/exp reports/nax/{t0_baseline,t1,t2,t3} evals/fixtures scripts</code></pre>
+  <p>Then create <code>reports/exp/INDEX.md</code>:</p>
+  <pre><code>| id | slug | verdict | Δ short M5 % | Δ long M5 % | merged sha or reverted |
+|----|------|---------|-------------:|------------:|------------------------|</code></pre>
+  <p><strong>Verify:</strong> <code>test -f reports/exp/INDEX.md && echo OK</code></p>
+</div>
+
+<div class="step-card tooling" id="T0-2">
+  <h3>T0.2 ✅ — Agentic fixture prompts</h3>
+  <p>Create <code>evals/fixtures/agentic_short.txt</code> (single line):</p>
+  <pre><code>List the files in the current directory and tell me which file is the largest. Use the available tools.</code></pre>
+  <p><code>evals/fixtures/agentic_long.txt</code>:</p>
+  <pre><code>Create a Snake game using HTML and TypeScript. Make sure it runs in the browser, has score tracking, game over state, and clean code. Output every file needed and explain how to run it.</code></pre>
+  <p><code>evals/fixtures/agentic_tool_heavy.txt</code>:</p>
+  <pre><code>Read pyproject.toml, then list every dependency under [project.dependencies], then for each one tell me its purpose in one short line.</code></pre>
+</div>
+
+<div class="step-card tooling" id="T0-3">
+  <h3>T0.3 ✅ — Add <code>--prompt-file</code> and <code>--report-json</code> to bench</h3>
+  <p>File: <code>vllm_mlx/cli.py</code>. After line 2248 inside <code>bench_parser</code>:</p>
+  <pre><code>bench_parser.add_argument(
+    "--prompt-file",
+    type=str,
+    default=None,
+    help="Path to a text file containing the prompt(s) — one per line.",
+)
+bench_parser.add_argument(
+    "--report-json",
+    type=str,
+    default=None,
+    help="Write a JSON metrics report to this path.",
+)</code></pre>
+  <p>In <code>bench_command</code> (line 968) — after model load, if <code>args.prompt_file</code> set, replace synthetic prompt list with file lines. After bench summary, if <code>args.report_json</code> set, dump:</p>
+  <pre><code>{
+  "model": args.model,
+  "num_prompts": len(prompts),
+  "prompt_file": args.prompt_file,
+  "max_tokens": args.max_tokens,
+  "prefill_tok_s": &lt;median&gt;,
+  "gen_tok_s": &lt;median&gt;,
+  "first_token_ms": &lt;median&gt;,
+  "peak_gpu_mem_mb": mx.metal.get_peak_memory() / 1024 / 1024,
+  "mtp_accept_rate": &lt;if available&gt;,
+  "ngram_accept_rate": &lt;if available&gt;,
+  "device_name": mx.device_info().get("device_name"),
+  "mlx_version": mlx.__version__,
+  "git_sha": &lt;git rev-parse HEAD&gt;
+}</code></pre>
+  <p><strong>Verify:</strong></p>
+  <pre><code>lightning-mlx bench qwen3.5-4b --prompt-file evals/fixtures/agentic_short.txt \
+  --num-prompts 1 --max-tokens 64 --report-json /tmp/test-report.json
+cat /tmp/test-report.json | python3 -m json.tool</code></pre>
+</div>
+
+<div class="step-card tooling" id="T0-4">
+  <h3>T0.4 ✅ — Summarizer</h3>
+  <p>Create <code>scripts/nax_summarize.py</code>:</p>
+  <pre><code>#!/usr/bin/env python3
+"""Compare two bench report directories. Output markdown delta table."""
+import json, sys
+from pathlib import Path
+
+
+def load_reports(d):
+    return {f.stem: json.loads(f.read_text()) for f in Path(d).rglob("*.json")}
+
+
+def pct(b, a):
+    return 0.0 if b == 0 else ((a - b) / b) * 100.0
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: nax_summarize.py &lt;before_dir&gt; &lt;after_dir&gt;", file=sys.stderr); sys.exit(2)
+    b, a = load_reports(sys.argv[1]), load_reports(sys.argv[2])
+    keys = sorted(set(b) | set(a))
+    print("| cell | prefill before | prefill after | Δ% | gen before | gen after | Δ% |")
+    print("|------|---------------:|--------------:|---:|-----------:|----------:|---:|")
+    for k in keys:
+        bb, aa = b.get(k, {}), a.get(k, {})
+        pb, pa = bb.get("prefill_tok_s", 0), aa.get("prefill_tok_s", 0)
+        gb, ga = bb.get("gen_tok_s", 0), aa.get("gen_tok_s", 0)
+        print(f"| {k} | {pb:.2f} | {pa:.2f} | {pct(pb,pa):+.1f}% | {gb:.2f} | {ga:.2f} | {pct(gb,ga):+.1f}% |")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+  <pre><code>chmod +x scripts/nax_summarize.py</code></pre>
+</div>
+
+<div class="step-card tooling" id="T0-5">
+  <h3>T0.5 ✅ — Sweep script</h3>
+  <p>Create <code>scripts/agentic_sweep.sh</code>:</p>
+  <pre><code>#!/usr/bin/env bash
+set -euo pipefail
+MODEL="${1:?missing model}"
+OUT="${2:?missing out dir}"
+mkdir -p "$OUT"
+
+lightning-mlx bench "$MODEL" \
+  --prompt-file evals/fixtures/agentic_short.txt \
+  --num-prompts 5 --max-tokens 256 \
+  --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
+  --prefill-step-size 8192 --mtp-optimistic \
+  --disable-prefix-cache \
+  --report-json "$OUT/short.json"
+
+lightning-mlx bench "$MODEL" \
+  --prompt-file evals/fixtures/agentic_tool_heavy.txt \
+  --num-prompts 3 --max-tokens 512 \
+  --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
+  --prefill-step-size 8192 --mtp-optimistic \
+  --disable-prefix-cache \
+  --report-json "$OUT/tool_heavy.json"
+
+lightning-mlx bench "$MODEL" \
+  --prompt-file evals/fixtures/agentic_long.txt \
+  --num-prompts 3 --max-tokens 2048 \
+  --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
+  --prefill-step-size 8192 --mtp-optimistic \
+  --disable-prefix-cache \
+  --report-json "$OUT/long.json"
+
+echo "DONE: $OUT"</code></pre>
+  <pre><code>chmod +x scripts/agentic_sweep.sh
+# verify
+./scripts/agentic_sweep.sh qwen3.5-4b /tmp/test-sweep
+ls /tmp/test-sweep</code></pre>
+</div>
+
+<div class="step-card tooling" id="T0-6">
+  <h3>T0.6 ✅ — Drift gate</h3>
+  <p>Create <code>evals/nax_drift_gate.py</code> (top-K logit capture per prompt) and <code>evals/nax_drift_compare.py</code> (diff two captures, fail if mean_abs &gt; 1e-3 or max_abs &gt; 1e-2). See <code>todo/todo.md</code> §T0.6 for full code.</p>
+  <p><strong>Verify:</strong></p>
+  <pre><code>python3 evals/nax_drift_gate.py --model qwen3.5-4b \
+  --prompts evals/fixtures/agentic_short.txt \
+  --output /tmp/drift.json</code></pre>
+</div>
+
+<div class="step-card tooling" id="T0-7">
+  <h3>T0.7 ✅ — Commit tooling</h3>
+  <pre><code>git checkout -b exp/T0-tooling
+git add reports/ evals/fixtures/ evals/nax_drift_gate.py evals/nax_drift_compare.py \
+        scripts/ vllm_mlx/cli.py
+git commit -m "$(cat &lt;&lt;'EOF'
+exp(T0): add agentic bench tooling — fixtures, sweep, summarizer, drift gate
+
+Refs: todo/todo.md
+EOF
+)"
+git checkout main && git merge --no-ff exp/T0-tooling</code></pre>
+  <p class="meta">Tooling commits skip the perf gates — they're infrastructure, not perf changes.</p>
+</div>
+
+<!-- Phase 1 -->
+<h2 id="phase1">2. Phase 1 — Baseline + config quick wins</h2>
+
+<div class="step-card" id="T1-0">
+  <h3>T1.0 ✅ — Capture T0 baseline (BLOCKING)</h3>
+  <p>Reference for every later step. Run on every available hw.</p>
+  <pre><code>mkdir -p reports/exp/T0/&lt;hw&gt;     # m1max | m3max | m5max
+
+./scripts/agentic_sweep.sh qwen3.6-35b-nsc-ace-saber-8bit \
+  reports/exp/T0/&lt;hw&gt;/qwen35b-nsc-ace-saber-8bit
+./scripts/agentic_sweep.sh qwen3.6-27b-8bit \
+  reports/exp/T0/&lt;hw&gt;/qwen27b-8bit
+
+git checkout -b exp/T0-baseline
+git add reports/exp/T0/
+git commit -m "exp(T0): baseline agentic sweep on &lt;hw&gt;"
+git checkout main && git merge --no-ff exp/T0-baseline</code></pre>
+</div>
+
+<div class="step-card" id="E1">
+  <h3>E1 ✅ — m5_hw_profile_entry <span class="pill ok">low risk</span></h3>
+  <p><strong>Goal:</strong> add M5 family to <code>HARDWARE_PROFILES</code>.</p>
+  <p>File: <code>vllm_mlx/optimizations.py</code>, after M4 block (~ line 75):</p>
+  <pre><code># M5 Series
+"M5":      {"bandwidth": 153,  "gpu_cores": 10},
+"M5 Pro":  {"bandwidth": 320,  "gpu_cores": 16},
+"M5 Max":  {"bandwidth": 600,  "gpu_cores": 40},
+"M5 Ultra":{"bandwidth": 1200, "gpu_cores": 80},</code></pre>
+  <p class="meta">Bandwidth: if no authoritative numbers yet, use M4 Max + 10% and add TODO comment. Mark in commit msg.</p>
+  <p><strong>Verify:</strong></p>
+  <pre><code>python3 -c "from vllm_mlx.optimizations import HARDWARE_PROFILES; assert 'M5 Max' in HARDWARE_PROFILES; print('OK')"</code></pre>
+  <p>Snapshot before = T0 baseline. Snapshot after:</p>
+  <pre><code>./scripts/agentic_sweep.sh qwen3.6-35b-nsc-ace-saber-8bit \
+  reports/exp/E1/after/&lt;hw&gt;/qwen35b-nsc-ace-saber-8bit
+python3 scripts/nax_summarize.py reports/exp/T0/&lt;hw&gt; reports/exp/E1/after/&lt;hw&gt; \
+  &gt; reports/exp/E1/summary.md</code></pre>
+  <p>Expected ~0% (no numeric effect). Keep if no regression.</p>
+</div>
+
+<div class="step-card" id="E2">
+  <h3>E2 — mtp_depth_sweep <span class="pill ok">low risk</span></h3>
+  <p>Sweep <code>--mtp-num-draft-tokens</code> ∈ {2, 3, 4, 5}. Bake winner into preset.</p>
+  <pre><code>for d in 2 3 4 5; do
+  mkdir -p reports/exp/E2/sweep/d$d
+  lightning-mlx bench qwen3.6-35b-nsc-ace-saber-8bit \
+    --prompt-file evals/fixtures/agentic_short.txt \
+    --num-prompts 5 --max-tokens 256 \
+    --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
+    --prefill-step-size 8192 --mtp-optimistic \
+    --mtp-num-draft-tokens $d \
+    --disable-prefix-cache \
+    --report-json reports/exp/E2/sweep/d$d/short.json
+done</code></pre>
+  <p>Find preset setter in <code>vllm_mlx/cli.py</code> (grep <code>mtp_num_draft_tokens</code>). Update only matched aliases. ≤ 5 LOC.</p>
+</div>
+
+<div class="step-card" id="E3">
+  <h3>E3 — kv_turboquant_default_on <span class="pill warn">numeric — drift gate first</span></h3>
+  <p>Mandatory drift gate before defaulting on:</p>
+  <pre><code>mkdir -p reports/exp/E3/drift
+python3 evals/nax_drift_gate.py --model qwen3.6-35b-nsc-ace-saber-8bit \
+  --prompts evals/fixtures/agentic_short.txt \
+  --output reports/exp/E3/drift/before.json
+# now turboquant on:
+LIGHTNING_TURBOQUANT=1 python3 evals/nax_drift_gate.py ... \
+  --output reports/exp/E3/drift/after.json
+python3 evals/nax_drift_compare.py reports/exp/E3/drift/before.json \
+  reports/exp/E3/drift/after.json</code></pre>
+  <p>If drift FAIL → revert. If PASS, auto-enable inside <code>cli.py</code> when alias matches <code>qwen3.6-*</code>, <code>ornstein*</code>, <code>qwopus*</code>. ≤ 15 LOC heuristic. Apply gates.</p>
+</div>
+
+<div class="step-card" id="E4">
+  <h3>E4 — prefix_cache_size_tune <span class="pill ok">low risk</span></h3>
+  <p>Sweep <code>--prefix-cache-size</code> ∈ {4096, 8192, 16384, 32768}. For each, run sweep with prefix cache ENABLED (drop <code>--disable-prefix-cache</code>). Use <code>agentic_tool_heavy.txt</code> twice — second run measures cache benefit.</p>
+  <p>Pick value maximizing 2nd-run TTFT improvement on M5 within +5 GB extra GPU mem. Update default in <code>vllm_mlx/cli.py</code>.</p>
+</div>
+
+<div class="step-card" id="E5">
+  <h3>E5 — chunked_prefill_default_on <span class="pill ok">low risk</span></h3>
+  <p>Default <code>--chunked-prefill-tokens 8192</code> for agentic aliases when ctx &gt; 16k. ≤ 15 LOC. Snapshot <code>agentic_long.txt</code> before/after.</p>
+</div>
+
+<div class="step-card" id="E6">
+  <h3>E6 ✅ — power_mode_doc <span class="pill ok">no risk</span></h3>
+  <p>Docs only — README section:</p>
+  <pre><code>## Sustained-performance tips
+
+sudo pmset -a powermode 2          # macOS — high power mode
+caffeinate -dimsu &amp;                 # prevent display sleep
+
+Enable macOS Game Mode in System Settings for priority boost.</code></pre>
+  <p>No bench. Commit + merge.</p>
+</div>
+
+<!-- Phase 2 -->
+<h2 id="phase2">3. Phase 2 — Small code, gated</h2>
+
+<div class="step-card med" id="E7">
+  <h3>E7 — auto_kv_bits_by_hw <span class="pill warn">numeric</span></h3>
+  <p>File: <code>vllm_mlx/scheduler.py</code>. Add helper:</p>
+  <pre><code>def auto_kv_bits_for_hw():
+    from vllm_mlx.optimizations import detect_hardware
+    hw = detect_hardware()
+    if hw.chip_name.startswith(("M1", "M2")):
+        return None  # keep fp16
+    if hw.chip_name.startswith("M5"):
+        return 6
+    return 8  # M3, M4, unknown</code></pre>
+  <p>Wire into config init when user didn't pass <code>--kv-cache-quantization-bits</code> AND turboquant is on. ≤ 30 LOC. Drift gate mandatory.</p>
+</div>
+
+<div class="step-card med" id="E8">
+  <h3>E8 — ngram_K_per_workload <span class="pill ok">low risk</span></h3>
+  <p>Extend <code>vllm_mlx/agents/profiles/&lt;name&gt;.yaml</code>:</p>
+  <pre><code>engine:
+  ngram_max_k: 6  # codex / claude profiles</code></pre>
+  <p>In <code>cli.py</code> agent resolver, override <code>args.ngram_num_draft_tokens</code> from profile if present. Touch only <code>codex.yaml</code>, <code>openclaude.yaml</code>, <code>cline.yaml</code>. Snapshot via <code>--agent codex</code> path.</p>
+</div>
+
+<div class="step-card med" id="E9">
+  <h3>E9 — nax_runtime_detect <span class="pill ok">low risk</span></h3>
+  <p>Create <code>vllm_mlx/runtime/metal4.py</code>:</p>
+  <pre><code>"""Metal 4 / Neural Accelerator runtime detection. Observability only."""
+from __future__ import annotations
+import functools, logging, os, platform
+import mlx.core as mx
+
+logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def device_name() -&gt; str:
+    try: return mx.device_info().get("device_name", "")
+    except Exception: return ""
+
+
+@functools.lru_cache(maxsize=1)
+def macos_version() -&gt; tuple[int, int]:
+    parts = platform.mac_ver()[0].split(".")
+    try: return int(parts[0]), int(parts[1]) if len(parts) &gt; 1 else 0
+    except (ValueError, IndexError): return (0, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def metal4_available() -&gt; bool:
+    if os.environ.get("LIGHTNING_DISABLE_METAL4") == "1": return False
+    return macos_version() &gt;= (26, 2)
+
+
+@functools.lru_cache(maxsize=1)
+def m5_nax_hint() -&gt; bool:
+    return metal4_available() and "M5" in device_name()
+
+
+def log_capabilities() -&gt; None:
+    logger.info("metal4=%s m5_nax=%s device=%s macos=%s",
+                metal4_available(), m5_nax_hint(), device_name(), macos_version())</code></pre>
+  <p>Call <code>log_capabilities()</code> in server startup. Surface in TUI. ≤ 50 LOC total.</p>
+</div>
+
+<div class="step-card med" id="E10">
+  <h3>E10 — mlx_floor_bump <span class="pill warn">watch mlx-lm compat</span></h3>
+  <pre><code># pyproject.toml — change:
+"mlx&gt;=0.29.0"  →  "mlx&gt;=0.30.0"
+
+uv lock</code></pre>
+  <p>Drift gate mandatory. Snapshot all 3 hw — M5 expected biggest gain (upstream NAX kicks in).</p>
+</div>
+
+<div class="step-card med" id="E11">
+  <h3>E11 — dflash_sweep <span class="pill ok">low risk</span></h3>
+  <p>DFlash shipped, un-tuned for agentic. Sweep block size {32, 64, 96, 128}. Pick winner per profile. Update default in <code>vllm_mlx/speculative/dflash_drafter.py</code> if different. ≤ 20 LOC.</p>
+</div>
+
+<div class="step-card med" id="E12">
+  <h3>E12 — sampler_gpu_path <span class="pill warn">numeric</span></h3>
+  <p>Audit <code>vllm_mlx/pipeline/decode.py</code> for per-token CPU syncs:</p>
+  <pre><code>grep -nE "\.item\(\)|\.tolist\(\)|np\.asarray" vllm_mlx/pipeline/decode.py</code></pre>
+  <p>Each is a sync. Replace with <code>mx.eval(...)</code> + on-device sampling. Public API unchanged. ≤ 50 LOC. Drift gate mandatory.</p>
+</div>
+
+<div class="step-card med" id="E13">
+  <h3>E13 — mx_compile_coverage <span class="pill warn">numeric</span></h3>
+  <p>Wrap pure helper fns in <code>@mx.compile</code>. Skip anything with <code>if x.item():</code> or python branches on tensor values. ≤ 30 LOC added. Drift gate mandatory.</p>
+</div>
+
+<!-- Phase 3 -->
+<h2 id="phase3">4. Phase 3 — Larger, gated</h2>
+
+<div class="step-card large" id="E14">
+  <h3>E14 — sliding_window_default_long_ctx</h3>
+  <p><strong>Gate:</strong> only if agentic-long actually exceeds 32k ctx in practice. Measure first.</p>
+  <p><code>vllm_mlx/attention.py:154</code> already plumbs sliding_window. Default to 16384 when ctx &gt; 32k on agentic profiles. Gate behind config flag. Quality bench (gsm8k) mandatory beyond drift gate.</p>
+</div>
+
+<div class="step-card large" id="E15">
+  <h3>E15 — eagle3_evaluation</h3>
+  <p><strong>Gate:</strong> only if E1–E13 cumulative gain &lt; +30% agentic-short on M5.</p>
+  <p>Spike: port one EAGLE-3 ref to MLX for qwen3.6-35b. Time-box 5 days. If acceptance × draft length not &gt; MTP+ngram → abandon and delete branch.</p>
+</div>
+
+<div class="step-card large" id="E16">
+  <h3>E16 — nax_kernel_port_t2</h3>
+  <p><strong>Gate:</strong> only if NAX T1 (E10 + E9 verify) leaves &gt;15% M5 gap vs antirez/ds4 numbers.</p>
+  <p>See <code>todo/nax-metal4-plan.md</code> §5 T2. Custom Metal4 kernels via <code>mx.fast.metal_kernel</code>.</p>
+</div>
+
+<!-- Skip -->
+<h2 id="skip">5. Skip indefinitely</h2>
+<div class="rule">
+  Do NOT attempt without explicit user approval:
+  <ul>
+    <li><strong>ReDrafter</strong> — per-model trained heads, maintenance prohibitive solo.</li>
+    <li><strong>Full Metal4 fork</strong> (T3 in NAX plan).</li>
+    <li><strong>W4A4 activation quant</strong>.</li>
+    <li><strong>Lookahead / Jacobi standalone</strong>.</li>
+  </ul>
+</div>
+
+<!-- Ledger -->
+<h2 id="ledger">6. Maintenance ledger</h2>
+<p>Update after every KEEP. Halt Phase 2/3 entries when cumulative LOC &gt; 200.</p>
+<table>
+  <thead><tr><th>id</th><th>sha</th><th>LOC added</th><th>flags added</th><th>est ongoing cost</th></tr></thead>
+  <tbody><tr><td colspan="5" class="meta">— empty —</td></tr></tbody>
+</table>
+
+<!-- Sweep -->
+<h2 id="sweep">7. Snapshot reference — sweep matrix</h2>
+<table>
+  <thead><tr><th>model</th><th>fixture</th><th>max_tokens</th><th>num_prompts</th><th>cell file</th></tr></thead>
+  <tbody>
+    <tr><td>qwen3.6-35b-nsc-ace-saber-8bit</td><td>agentic_short.txt</td><td>256</td><td>5</td><td>short.json</td></tr>
+    <tr><td>qwen3.6-35b-nsc-ace-saber-8bit</td><td>agentic_tool_heavy.txt</td><td>512</td><td>3</td><td>tool_heavy.json</td></tr>
+    <tr><td>qwen3.6-35b-nsc-ace-saber-8bit</td><td>agentic_long.txt</td><td>2048</td><td>3</td><td>long.json</td></tr>
+    <tr><td>qwen3.6-27b-8bit</td><td>agentic_short.txt</td><td>256</td><td>5</td><td>short.json</td></tr>
+    <tr><td>qwen3.6-27b-8bit</td><td>agentic_long.txt</td><td>2048</td><td>3</td><td>long.json</td></tr>
+  </tbody>
+</table>
+<p><code>agentic_sweep.sh</code> already encodes this. Use it.</p>
+
+<!-- Verdict -->
+<h2 id="verdict">8. Verdict template</h2>
+<p>Write <code>reports/exp/&lt;id&gt;/verdict.md</code>:</p>
+<pre><code># Verdict — &lt;id&gt; &lt;slug&gt;
+
+## Snapshot
+- Before: reports/exp/T0/&lt;hw&gt;/&lt;model&gt;
+- After:  reports/exp/&lt;id&gt;/after/&lt;hw&gt;/&lt;model&gt;
+- Diff:   reports/exp/&lt;id&gt;/summary.md
+
+## Gates
+- G1 (agentic-short Δ% M5): &lt;value&gt;% — &lt;PASS|FAIL&gt;
+- G2 (agentic-long Δ% M5):  &lt;value&gt;% — &lt;PASS|FAIL&gt;
+- G3 (M1/M3 regression):    &lt;value&gt;% / &lt;value&gt;% — &lt;PASS|FAIL|SKIP&gt;
+- G4 (drift mean_abs):      &lt;value&gt; — &lt;PASS|FAIL|N/A&gt;
+- G5 (acceptance Δpp):      &lt;value&gt; — &lt;PASS|FAIL&gt;
+- G6 (LOC added):           &lt;value&gt; — &lt;PASS|FAIL&gt;
+
+## Decision
+&lt;KEEP | REVERT&gt;
+
+## Reason
+&lt;one paragraph&gt;
+
+## Next
+&lt;next step id&gt;</code></pre>
+
+<!-- Paths -->
+<h2 id="paths">9. Hard reference — file paths</h2>
+<table>
+  <thead><tr><th>path</th><th>what</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm_mlx/cli.py</code></td><td>flag defs, bench_command, alias resolution</td></tr>
+    <tr><td><code>vllm_mlx/scheduler.py</code></td><td><code>SchedulerConfig</code> fields</td></tr>
+    <tr><td><code>vllm_mlx/optimizations.py</code></td><td><code>HARDWARE_PROFILES</code></td></tr>
+    <tr><td><code>vllm_mlx/agents/profiles/*.yaml</code></td><td>per-agent config</td></tr>
+    <tr><td><code>vllm_mlx/aliases.json</code></td><td>model alias map</td></tr>
+    <tr><td><code>vllm_mlx/server.py</code></td><td>startup hooks</td></tr>
+    <tr><td><code>vllm_mlx/runtime/metal4.py</code></td><td>NEW — capability detect (E9)</td></tr>
+    <tr><td><code>vllm_mlx/speculative/dflash_drafter.py</code></td><td>DFlash params</td></tr>
+    <tr><td><code>vllm_mlx/pipeline/decode.py</code></td><td>per-token loop</td></tr>
+    <tr><td><code>pyproject.toml</code></td><td>dep versions</td></tr>
+    <tr><td><code>uv.lock</code></td><td>re-lock after dep changes</td></tr>
+    <tr><td><code>reports/exp/INDEX.md</code></td><td>append-only log</td></tr>
+    <tr><td><code>reports/exp/&lt;id&gt;/</code></td><td>per-step artifacts</td></tr>
+    <tr><td><code>scripts/agentic_sweep.sh</code></td><td>bench fixture runner</td></tr>
+    <tr><td><code>scripts/nax_summarize.py</code></td><td>delta summary</td></tr>
+    <tr><td><code>evals/nax_drift_gate.py</code></td><td>logit drift capture</td></tr>
+    <tr><td><code>evals/nax_drift_compare.py</code></td><td>drift comparator</td></tr>
+    <tr><td><code>evals/fixtures/agentic_*.txt</code></td><td>bench prompts</td></tr>
+  </tbody>
+</table>
+
+<!-- Start -->
+<h2 id="start">10. Next action (start here)</h2>
+<div class="rule ok">
+  <ol>
+    <li>Read §0 fully.</li>
+    <li>Execute Phase 0 (T0.1 → T0.7).</li>
+    <li>Capture T0 baseline (§2 T1.0) on whatever hw you have.</li>
+    <li>Run E1. Follow gates.</li>
+    <li>Continue serially through queue.</li>
+  </ol>
+</div>
+
+<p class="footer">Sibling docs: <code>todo.md</code> (agent-readable mirror), <code>nax-metal4-plan.{md,html}</code>, <code>perf-experiments.{md,html}</code>.</p>
+
+</main>
+</div>
+</div>
+</body>
+</html>

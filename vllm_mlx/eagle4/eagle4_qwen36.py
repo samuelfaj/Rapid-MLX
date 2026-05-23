@@ -110,8 +110,10 @@ def extract_frozen(model_path: str, out: Path):
     def find(p, path=""):
         if isinstance(p, dict):
             for k, v in p.items():
-                if isinstance(v, (dict, mx.array)):
-                    yield from find(v, f"{path}.{k}" if path else k)
+                yield from find(v, f"{path}.{k}" if path else k)
+        elif isinstance(p, (list, tuple)):
+            for i, v in enumerate(p):
+                yield from find(v, f"{path}[{i}]" if path else f"[{i}]")
         elif isinstance(p, mx.array):
             yield (path, p)
 
@@ -138,9 +140,9 @@ def extract_frozen(model_path: str, out: Path):
         raise RuntimeError("output_norm not found in model parameters")
 
     np.savez(out,
-             token_embd=np.array(token_embd),
-             lm_head=np.array(lm_head),
-             output_norm=np.array(output_norm))
+             token_embd=np.array(token_embd.astype(mx.float16), copy=False),
+             lm_head=np.array(lm_head.astype(mx.float16), copy=False),
+             output_norm=np.array(output_norm.astype(mx.float16), copy=False))
     print(f"[extract] wrote {out} (token_embd={token_embd.shape}, lm_head={lm_head.shape}, output_norm={output_norm.shape})", flush=True)
 
 

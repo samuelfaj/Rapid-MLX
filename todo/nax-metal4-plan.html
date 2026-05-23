@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NAX / Metal4 Plan — Lightning-MLX</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1c2030;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #7cc4ff;
+    --accent-2: #ffb86b;
+    --ok: #61d095;
+    --warn: #ffcc66;
+    --bad: #ff6b6b;
+    --border: #262b3a;
+    --code-bg: #0b0d12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 40px 28px 80px; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 32px; }
+  h1 { font-size: 32px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  h1 .sub { color: var(--accent); font-weight: 500; }
+  h2 { font-size: 22px; margin: 40px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 17px; margin: 26px 0 10px; color: var(--accent-2); }
+  p, li { color: var(--text); }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta span { margin-right: 18px; }
+  .pill {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  }
+  .pill.plan { background: #2b3654; color: var(--accent); }
+  .pill.ok { background: #1f3a2c; color: var(--ok); }
+  .pill.warn { background: #3a3120; color: var(--warn); }
+  .pill.bad { background: #3a2222; color: var(--bad); }
+  .grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    margin: 18px 0;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card h4 {
+    margin: 0 0 6px; font-size: 14px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--muted);
+  }
+  .card .v { font-size: 20px; font-weight: 600; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; color: #ffd479; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    color: #d8dee9;
+  }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  th, td {
+    text-align: left; padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+  ul { padding-left: 22px; }
+  ul li { margin: 4px 0; }
+  .tier {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin: 18px 0;
+  }
+  .tier.t2 { border-left-color: var(--accent-2); }
+  .tier.t3 { border-left-color: var(--bad); }
+  .tier h3 { margin-top: 0; }
+  .tier .tier-meta { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  .callout {
+    background: #1a1f2c;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    padding: 12px 16px; border-radius: 6px;
+    margin: 14px 0;
+  }
+  .callout.bad { border-left-color: var(--bad); }
+  .callout.ok { border-left-color: var(--ok); }
+  .kbd {
+    display: inline-block; padding: 1px 8px; border-radius: 4px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    font-family: "SF Mono", monospace; font-size: 12px;
+  }
+  .legend { font-size: 13px; color: var(--muted); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 36px 0; }
+  a { color: var(--accent); }
+  .num { color: var(--accent-2); font-weight: 600; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>NAX / Metal4 Tensor API <span class="sub">— Lightning-MLX implementation plan</span></h1>
+  <p class="meta">
+    <span><span class="pill plan">PLANNING</span></span>
+    <span>Created 2026-05-23</span>
+    <span>Inspired by antirez/ds4</span>
+  </p>
+  <p>antirez's <a href="https://github.com/antirez/ds4">ds4</a> ships custom Metal 4 Tensor kernels and reports <strong>40–80% prefill speedup</strong> on M5 Max via Apple's Neural Accelerators (NAX). This plan lays out how Lightning-MLX captures the same wins, in tiers, without regressing M1–M4 users.</p>
+</header>
+
+<h2>1. TL;DR</h2>
+<div class="grid">
+  <div class="card">
+    <h4>Free win</h4>
+    <div class="v">MLX 0.30+ already adds NAX</div>
+    <p class="meta">Bump <code>mlx&gt;=0.30.0</code>, measure, ship.</p>
+  </div>
+  <div class="card">
+    <h4>Custom kernels here</h4>
+    <div class="v">2 spots, not GEMM</div>
+    <p class="meta">HyperConnection fused ops at <code>deepseek_v4.py:420,606</code>. Out of scope for NAX.</p>
+  </div>
+  <div class="card">
+    <h4>Hot path</h4>
+    <div class="v">Prefill GEMM &amp; SDPA</div>
+    <p class="meta">Both go through <code>mx.fast.*</code> → MLX picks NAX automatically on M5.</p>
+  </div>
+  <div class="card">
+    <h4>Deep dive only if</h4>
+    <div class="v">T1 leaves &gt;15% gap</div>
+    <p class="meta">T2 ports MTPLX custom matmul kernels. T3 = full fork. Default: stop at T1.</p>
+  </div>
+</div>
+
+<h2>2. Goal &amp; pass criteria</h2>
+<p>Match ds4's gains on M5+ <em>without</em> regressing M1–M4 and <em>without</em> breaking MTPLX/MTP/n-gram acceptance.</p>
+<table>
+  <thead><tr><th>ID</th><th>Criterion</th><th>Target</th></tr></thead>
+  <tbody>
+    <tr><td>P1</td><td>Prefill t/s @ 1k/10k/50k/100k on M5 Max</td><td>≥ +20% vs current baseline</td></tr>
+    <tr><td>P2</td><td>Generation t/s on M5 Max</td><td>≥ +5% vs baseline</td></tr>
+    <tr><td>P3</td><td>M1–M4 regression</td><td>within ±2% noise band</td></tr>
+    <tr><td>P4</td><td>Logit drift @ 4k/16k/64k vs legacy</td><td>mean abs &lt; 1e-3</td></tr>
+    <tr><td>P5</td><td>MTP + n-gram acceptance rate</td><td>within ±1pp</td></tr>
+  </tbody>
+</table>
+
+<h2>3. How antirez/ds4 did it</h2>
+
+<h3>Detection (<code>ds4_metal.m</code>)</h3>
+<pre><code>g_metal4_family_supported = !metal4_disabled
+    && [g_device supportsFamily:MTLGPUFamilyMetal4] ? 1 : 0;
+g_metal4_queue_supported  = [g_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
+if (g_metal4_family_supported && ds4_gpu_device_name_contains("M5")) {
+    g_metal4_m5_neural_accelerators_hint = 1;
+}</code></pre>
+<p>Plus a compile-time probe: tries to build a test tensor kernel; on failure logs <code>"Metal 4 tensor API probe failed; using legacy Metal kernels"</code> and falls back.</p>
+
+<h3>Kernels (<code>metal/dense.metal</code> 578 LOC, <code>metal/moe.metal</code> 753 LOC)</h3>
+<p>Everything guarded by <code>#ifdef DS4_METAL_HAS_TENSOR</code>. Includes:</p>
+<pre><code>#include &lt;metal_tensor&gt;
+#include &lt;MetalPerformancePrimitives/MetalPerformancePrimitives.h&gt;</code></pre>
+<p>APIs used:</p>
+<ul>
+  <li><code>matmul2d</code> + <code>matmul2d_descriptor</code></li>
+  <li><code>tensor()</code> with <code>dextents&lt;int32_t,2&gt;</code></li>
+  <li><code>execution_simdgroups&lt;4&gt;</code></li>
+  <li><code>get_destination_cooperative_tensor</code></li>
+  <li><code>simdgroup_load / simdgroup_store / simdgroup_multiply_accumulate</code></li>
+</ul>
+<p>Tile params: <strong>64×32 output, NK=32 inner, NL0=2 / NL1=4 loader splits</strong>. Direct-RHS variants pin NR0=64, sweep NR1 ∈ {32, 64, 128}.</p>
+<p>Strategy:</p>
+<ul>
+  <li><strong>Dense GEMM</strong>: dequant weight → fp16 staging in threadgroup mem → cooperative <code>matmul2d</code> on 4 simdgroups → store.</li>
+  <li><strong>MoE</strong>: pre-computed expert-major index map keeps cooperative matmul dense per tile.</li>
+  <li><strong>Quant matvec (decode)</strong>: stays legacy — memory-bound, tensor doesn't help.</li>
+</ul>
+
+<h3>Validation harness (later cleaned up)</h3>
+<p>Initial commit added ~11K LOC of drift &amp; bench tooling. Cleanup commit removed most of it but the pattern is informative:</p>
+<ul>
+  <li><code>compare_logit_drift.py</code> — logit-level diff vs legacy path</li>
+  <li><code>run_chunked_prefill_drift_gate.py</code> — chunked prefill correctness</li>
+  <li><code>run_mpp_compare_probe.py</code> — MPP A/B probe</li>
+  <li><code>run_quality_drift_gate.py</code> — end-to-end quality drift</li>
+</ul>
+
+<h2>4. Current Lightning-MLX state</h2>
+<div class="grid">
+  <div class="card">
+    <h4>MLX pin</h4>
+    <div class="v">mlx&gt;=0.29.0</div>
+    <p class="meta">Lockfile resolves <strong>mlx==0.31.2</strong>.</p>
+  </div>
+  <div class="card">
+    <h4>Upstream NAX</h4>
+    <div class="v">MLX 0.30.0</div>
+    <p class="meta">Release notes: <em>"Support for Neural Accelerators on M5 (macOS ≥ 26.2)"</em>.</p>
+  </div>
+  <div class="card">
+    <h4>Long-ctx GQA</h4>
+    <div class="v">MLX 0.30.4</div>
+    <p class="meta">Faster fused vector GQA on Metal.</p>
+  </div>
+  <div class="card">
+    <h4>Custom Metal in repo</h4>
+    <div class="v">2 kernels</div>
+    <p class="meta"><code>deepseek_v4.py:420</code>, <code>:606</code> — HyperConnection, not GEMM.</p>
+  </div>
+</div>
+<div class="callout ok">
+  Most of Lightning-MLX's hot path (matmul, SDPA, RoPE, RMSNorm) goes through <code>mx.fast.*</code>. MLX 0.30+ rewires those to NAX automatically on M5. <strong>That's the cheap win.</strong>
+</div>
+
+<h2>5. Metrics framework — before / after</h2>
+<div class="callout bad">
+  <strong>Mandatory.</strong> Every tier captures a fresh BEFORE snapshot, applies changes, captures AFTER, writes a comparison row. No tier ships without paired data committed to <code>reports/nax/</code>.
+</div>
+
+<h3>5.1 Snapshot fields (per cell)</h3>
+<ul>
+  <li><code>prefill_tok_s</code> — median of N=3 runs</li>
+  <li><code>gen_tok_s</code> — median of N=3 runs</li>
+  <li><code>first_token_ms</code> — TTFT</li>
+  <li><code>peak_rss_mb</code></li>
+  <li><code>peak_gpu_mem_mb</code> — via <code>mx.metal.get_peak_memory()</code></li>
+  <li><code>mtp_accept_rate</code>, <code>ngram_accept_rate</code></li>
+  <li>env: <code>mlx_version</code>, <code>lightning_mlx_sha</code>, <code>macos_version</code>, <code>device_name</code>, <code>nax_enabled</code></li>
+</ul>
+
+<h3>5.2 Cell matrix — 144 cells</h3>
+<table>
+  <thead><tr><th>Axis</th><th>Values</th></tr></thead>
+  <tbody>
+    <tr><td>Models (3)</td><td><code>qwen3.6-27b-8bit</code>, <code>qwen3.6-35b-8bit</code>, <code>qwen3.6-35b-nsc-ace-saber-8bit</code></td></tr>
+    <tr><td>Contexts (4)</td><td><code>1024</code>, <code>10240</code>, <code>51200</code>, <code>102400</code></td></tr>
+    <tr><td>Modes (4)</td><td><code>mtp_only</code>, <code>mtp+ngram</code>, <code>mtp_only_no_nax</code>, <code>mtp+ngram_no_nax</code></td></tr>
+    <tr><td>Hardware (3)</td><td><code>M1-Max</code>, <code>M3-Max</code>, <code>M5-Max</code> — all three required for P3 regression check</td></tr>
+  </tbody>
+</table>
+<p class="legend">Skip cells that OOM on smaller hw; document the skip.</p>
+
+<h3>5.3 Bench command (anchor — same flags every run)</h3>
+<pre><code>lightning-mlx bench &lt;model&gt; \
+  --num-prompts 3 --max-tokens 512 --disable-prefix-cache \
+  --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
+  --prefill-step-size 8192 --mtp-num-draft-tokens 3 --mtp-optimistic \
+  --ctx-size &lt;ctx&gt; \
+  --report-json reports/nax/&lt;tier&gt;/&lt;run-id&gt;.json</code></pre>
+<p>NAX-off variant: <code>LIGHTNING_DISABLE_METAL4=1</code> env (introduced in T2.3). For T1 baseline use <code>MLX_DISABLE_METAL4=1</code> if MLX exposes it, else rebuild MLX without 0.30+ support.</p>
+
+<h3>5.4 Comparison table (auto-generated, committed)</h3>
+<p>Output: <code>reports/nax/&lt;tier&gt;/summary.md</code>:</p>
+<pre><code>| model | ctx | mode | hw | prefill_before | prefill_after | Δ% | gen_before | gen_after | Δ% | drift | accept_Δpp |</code></pre>
+<table>
+  <thead><tr><th>Color</th><th>Threshold</th></tr></thead>
+  <tbody>
+    <tr><td><span class="pill ok">PASS</span></td><td>Δ% prefill ≥ +20% (M5)</td></tr>
+    <tr><td><span class="pill warn">WEAK</span></td><td>0 &lt; Δ% prefill &lt; +20% (M5)</td></tr>
+    <tr><td><span class="pill bad">FAIL</span></td><td>Δ% prefill ≤ 0 (M5)</td></tr>
+    <tr><td><span class="pill bad">REGRESSION</span></td><td>|Δ%| &gt; 2% on M1/M3</td></tr>
+    <tr><td><span class="pill bad">FAIL drift</span></td><td>mean_abs &gt; 1e-3</td></tr>
+    <tr><td><span class="pill bad">FAIL accept</span></td><td>|accept_Δpp| &gt; 1</td></tr>
+  </tbody>
+</table>
+
+<h3>5.5 Drift measurement</h3>
+<pre><code>python evals/nax_drift_gate.py \
+  --model &lt;model&gt; --prompts evals/golden_prompts.jsonl \
+  --ctx 4096,16384,65536 \
+  --output reports/nax/&lt;tier&gt;/drift.json</code></pre>
+<p>Records <code>mean_abs</code>, <code>max_abs</code>, <code>kl_divergence</code>, <code>top1_match_rate</code>, <code>top5_match_rate</code>.</p>
+
+<h3>5.6 Bench tooling prerequisites (blocking)</h3>
+<table>
+  <thead><tr><th>ID</th><th>Task</th></tr></thead>
+  <tbody>
+    <tr><td>M1</td><td>Extend <code>lightning-mlx bench</code> with <code>--report-json &lt;path&gt;</code> if absent</td></tr>
+    <tr><td>M2</td><td>Add <code>--ctx-size</code> flag if absent</td></tr>
+    <tr><td>M3</td><td>Wire <code>mx.metal.get_peak_memory()</code> into output</td></tr>
+    <tr><td>M4</td><td>Create <code>reports/nax/{t0_baseline,t1,t2,t3}/</code> with README per dir</td></tr>
+    <tr><td>M5</td><td>Write <code>scripts/nax_bench_sweep.sh</code> — loops matrix, dumps JSON</td></tr>
+    <tr><td>M6</td><td>Write <code>scripts/nax_summarize.py</code> — reads tier JSON dirs, emits <code>summary.md</code></td></tr>
+    <tr><td>M7</td><td>Write <code>evals/nax_drift_gate.py</code> — slim port of ds4 <code>compare_logit_drift.py</code></td></tr>
+  </tbody>
+</table>
+
+<h3>5.7 Acceptance ritual (every tier)</h3>
+<ol>
+  <li>Capture BEFORE on all 3 hw. Commit JSON.</li>
+  <li>Apply tier changes.</li>
+  <li>Capture AFTER on all 3 hw, same flags.</li>
+  <li>Generate <code>summary.md</code>, commit.</li>
+  <li>Check P1–P5 from §2.</li>
+  <li>Any gate red → do not merge; iterate or downgrade scope.</li>
+  <li>All green → merge, log entry in §10.</li>
+</ol>
+
+<h2>6. Tiered plan</h2>
+
+<div class="tier">
+  <h3>T1 — Free win (audit + verify + measure)</h3>
+  <p class="tier-meta">Effort: hours • Risk: none</p>
+  <ol start="0">
+    <li><code>prereq_bench_tooling</code> — finish §5.6 M1–M7. Blocking.</li>
+    <li><code>capture_baseline_t0</code> — run sweep on <strong>all 3 hw</strong> with current MLX 0.31.2 → <code>reports/nax/t0_baseline/</code>. Commit.</li>
+    <li><code>verify_mlx_nax_path</code> — on M5 Max + macOS ≥ 26.2, dump <code>mx.metal.device_info()</code>, confirm tensor kernels selected.</li>
+    <li><code>bump_mlx_floor</code> — raise <code>pyproject.toml</code> to <code>mlx&gt;=0.30.0</code>. Re-lock.</li>
+    <li><code>capture_after_t1</code> — re-run sweep on all 3 hw → <code>reports/nax/t1/</code>.</li>
+    <li><code>bench_decode_breakout</code> — extract decode rows + first-token-ms.</li>
+    <li><code>bench_mtp_acceptance</code> — verify acceptance Δpp ≤ 1.</li>
+    <li><code>drift_gate_t1</code> — mean abs ≤ 1e-3 vs t0 baseline.</li>
+    <li><code>gen_summary_t1</code> — <code>scripts/nax_summarize.py t0_baseline t1</code> → <code>summary.md</code>. Commit.</li>
+    <li><code>doc_update</code> — README on M5 + macOS 26.2 requirement.</li>
+  </ol>
+  <p><strong>Files:</strong> <code>pyproject.toml</code>, <code>uv.lock</code>, <code>README.md</code>, new <code>reports/nax-t1-bench.md</code>.</p>
+  <p><strong>Gate:</strong> if P1 + P2 met by upstream alone → ship, stop. If &lt;50% of gain captured → T2 mandatory.</p>
+</div>
+
+<div class="tier t2">
+  <h3>T2 — MTPLX custom kernel audit + Metal4 path</h3>
+  <p class="tier-meta">Effort: days • Risk: medium • Gate: only if T1 leaves &gt;15% headroom</p>
+  <ol>
+    <li><code>audit_custom_kernels</code> — exhaustive grep for <code>mx.fast.metal_kernel</code>, <code>@mx.compile</code>, raw Metal sources across <code>vllm_mlx/{models,speculative,attention.py,optimizations.py}</code>. Classify GEMM vs other.</li>
+    <li><code>identify_matmul_hot_paths</code> — profile MTP draft verify, n-gram verify batched matvec, custom prefill GEMM. Drop anything &lt; 2% of total time.</li>
+    <li><code>add_metal4_gate</code> — new module <code>vllm_mlx/runtime/metal4.py</code>:
+      <ul>
+        <li><code>metal4_available() -&gt; bool</code></li>
+        <li><code>m5_nax_hint() -&gt; bool</code></li>
+        <li>Env override <code>LIGHTNING_DISABLE_METAL4=1</code></li>
+      </ul>
+    </li>
+    <li><code>port_matmul_kernels</code> — for each hot GEMM kernel, add Metal4 variant guarded by <code>#ifdef LMLX_METAL_HAS_TENSOR</code>. Start tiles at ds4's <strong>64×32, NK=32, 4 simdgroups</strong>.</li>
+    <li><code>drift_harness</code> — port slim <code>evals/nax_drift_gate.py</code> from ds4. Fail on mean abs &gt; 1e-3 or max abs &gt; 1e-2 at 4k / 16k / 64k.</li>
+    <li><code>ci_gate</code> — blocking on M5 CI if available, else documented manual gate.</li>
+    <li><code>capture_before_t2</code> — re-snapshot from <code>reports/nax/t1/</code> as T2 baseline. Confirm hashes match committed JSON.</li>
+    <li><code>bench_t2</code> — re-run sweep on all 3 hw after kernel ports → <code>reports/nax/t2/</code>.</li>
+    <li><code>drift_gate_t2</code> — diff vs T1 baseline AND vs legacy-off path. Both required.</li>
+    <li><code>gen_summary_t2</code> — <code>scripts/nax_summarize.py t1 t2</code> → <code>summary.md</code>. Commit.</li>
+  </ol>
+  <p><strong>Gate:</strong> all of P1–P5.</p>
+</div>
+
+<div class="tier t3">
+  <h3>T3 — Full custom Metal4 kernel suite (fork-and-tune)</h3>
+  <p class="tier-meta">Effort: weeks • Risk: high • Gate: only if T1+T2 still leave &gt;15% headroom AND priority justifies maintenance</p>
+  <ul>
+    <li>Hand-tuned Metal4 kernels replacing MLX matmul for hot shapes only: q/k/v/o proj fused, gate_up_proj fused for SwiGLU, MoE expert GEMM (mirror ds4's <code>metal/moe.metal</code>).</li>
+    <li>Ship as MLX patch loaded at import time (existing pattern in <code>vllm_mlx/patches/</code>).</li>
+    <li>Per-layer logit gates in drift harness (max abs ≤ 1e-2 per layer).</li>
+    <li><code>capture_before_t3</code> — snapshot from <code>reports/nax/t2/</code>.</li>
+    <li><code>bench_t3</code> — sweep on all 3 hw → <code>reports/nax/t3/</code>.</li>
+    <li><code>gen_summary_t3</code> — diff vs T2. Commit.</li>
+    <li>Pin M5-only maintenance commitment in docs.</li>
+  </ul>
+  <div class="callout bad"><strong>Default:</strong> do NOT enter T3 unless data forces it. Every custom kernel is debt.</div>
+</div>
+
+<h2>7. Risks</h2>
+<table>
+  <thead><tr><th>ID</th><th>Risk</th><th>Mitigation</th></tr></thead>
+  <tbody>
+    <tr><td>R1</td><td>HW fragmentation — NAX is M5+ only.</td><td>Runtime gating mandatory. Legacy path always present.</td></tr>
+    <tr><td>R2</td><td>OS requirement — macOS ≥ 26.2.</td><td>Detect at startup. Graceful fallback. Doc it.</td></tr>
+    <tr><td>R3</td><td>MLX version churn around NAX hooks.</td><td>Pin minor (<code>mlx</code> + <code>mlx-lm</code> together). Snapshot lockfile.</td></tr>
+    <tr><td>R4</td><td>MTPLX dispatch order interaction.</td><td>T2.5 drift gate. T2.7 MTP acceptance bench.</td></tr>
+    <tr><td>R5</td><td>Quant path — most models are 4/6/8-bit.</td><td>Bench must confirm gain with dequant→fp16 staging (ds4 pattern).</td></tr>
+    <tr><td>R6</td><td>Custom kernel maintenance debt.</td><td>T3 only if measured ROI &gt; 1 quarter eng time.</td></tr>
+  </tbody>
+</table>
+
+<h2>8. Hard no-go</h2>
+<ul>
+  <li>N1 — no compile-time-only gating. Runtime detect mandatory.</li>
+  <li>N2 — no M5-only ship. Legacy fallback always present.</li>
+  <li>N3 — no kernel merge without drift gate green.</li>
+  <li>N4 — no MTP acceptance regression &gt; 1pp.</li>
+  <li>N5 — do not touch existing HC kernels (<code>deepseek_v4.py:420,606</code>). Not GEMM, out of scope.</li>
+</ul>
+
+<h2>9. Open questions</h2>
+<ul>
+  <li>Q1 — does MLX 0.30+ expose a runtime NAX disable flag, or must we rebuild MLX for A/B?</li>
+  <li>Q2 — does <code>mlx-lm</code> pin a max <code>mlx</code> version that blocks the 0.30+ bump?</li>
+  <li>Q3 — is there CI hardware on M5? If not, T2 drift gate is manual-only.</li>
+  <li>Q4 — do MTPLX custom kernels include any GEMM-shaped Metal kernel beyond <code>mx.fast.scaled_dot_product_attention</code>? (T2.1 answers.)</li>
+</ul>
+
+<h2>10. Decision log</h2>
+<ul>
+  <li><strong>2026-05-23</strong> — antirez published M5 NAX result (40–80% prefill on DS4). Inspired this plan.</li>
+  <li><strong>2026-05-23</strong> — confirmed MLX 0.30.0 already supports NAX upstream. Plan biased toward T1 first.</li>
+  <li><strong>2026-05-23</strong> — confirmed Lightning-MLX custom kernels at <code>deepseek_v4.py:420,606</code> are HyperConnection, not GEMM ⇒ out of scope for NAX port.</li>
+</ul>
+
+<h2>11. Next action</h2>
+<div class="callout ok">
+  Execute <strong>T1.0</strong> (<code>prereq_bench_tooling</code>) — implement bench JSON output, ctx flag, peak-mem capture, sweep script, summarizer, drift gate. Then <strong>T1.1</strong> baseline capture on all 3 hw (M1/M3/M5). Then <strong>T1.2</strong> NAX verify on M5 + macOS ≥ 26.2.
+</div>
+<div class="callout bad">
+  <strong>No code change ships without paired before/after snapshot committed to <code>reports/nax/</code>.</strong>
+</div>
+
+<p class="footer">Sibling doc: <code>nax-metal4-plan.md</code> — same plan, agent-readable.</p>
+</div>
+</body>
+</html>

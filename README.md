@@ -188,6 +188,17 @@ curl http://localhost:8010/v1/chat/completions \
 - **Apple Silicon first**: built around MLX and local Mac inference.
 - **MTPLX optimized preset** behind one simple command.
 
+## Sustained-performance tips
+
+For sustained generation speed (e.g. coding agents over many turns):
+
+```bash
+sudo pmset -a powermode 2          # macOS — high power mode
+caffeinate -dimsu &                 # prevent display sleep during long sessions
+```
+
+Enable macOS Game Mode in System Settings for thread priority boost.
+
 ## Built On
 
 - [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX)

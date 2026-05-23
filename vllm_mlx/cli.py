@@ -1125,6 +1125,7 @@ def bench_command(args):
             import json
             import subprocess as _sp
             from pathlib import Path as _Path
+            import mlx.core as mx
 
             _Path(args.report_json).parent.mkdir(parents=True, exist_ok=True)
             report = {

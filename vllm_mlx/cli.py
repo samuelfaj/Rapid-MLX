@@ -124,7 +124,7 @@ def _apply_qwen36_mtplx_preset(
         if not _has_cli_option(raw_args, "--completion-batch-size"):
             args.completion_batch_size = 1
         if not _has_cli_option(raw_args, "--mtp-num-draft-tokens"):
-            args.mtp_num_draft_tokens = 3
+            args.mtp_num_draft_tokens = 5
         if not _has_cli_option(raw_args, "--mtp-optimistic"):
             args.mtp_optimistic = True
         return

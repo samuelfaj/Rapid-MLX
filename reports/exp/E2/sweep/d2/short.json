@@ -1,0 +1,13 @@
+{
+  "model": "/Users/samuelfajreldines/dev/models/Qwen3.6-35B-A3B-NSC-ACE-SABER-MLX-8bit-MTPLX-Optimized-Speed",
+  "num_prompts": 5,
+  "prompt_file": "evals/fixtures/agentic_short.txt",
+  "max_tokens": 256,
+  "prefill_tok_s": 14.147980963579842,
+  "gen_tok_s": 127.73605669974943,
+  "total_time_s": 7.421553666936234,
+  "peak_gpu_mem_mb": 36880.061697006226,
+  "device_name": "Apple M5 Max",
+  "mlx_version": "0.31.2",
+  "git_sha": "8c7861ffae864e68c120fb083a2ffcf939902194"
+}

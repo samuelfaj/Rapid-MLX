@@ -1136,7 +1136,7 @@ def bench_command(args):
                 "prefill_tok_s": total_prompt_tokens / total_time if total_time > 0 else 0,
                 "gen_tok_s": total_completion_tokens / total_time if total_time > 0 else 0,
                 "total_time_s": total_time,
-                "peak_gpu_mem_mb": mx.metal.get_peak_memory() / 1024 / 1024,
+                "peak_gpu_mem_mb": mx.get_peak_memory() / 1024 / 1024,
                 "device_name": mx.device_info().get("device_name", "unknown"),
                 "mlx_version": mx.__version__,
                 "git_sha": _sp.check_output(

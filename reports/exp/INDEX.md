@@ -14,4 +14,4 @@
 | E11 | dflash-sweep | blocked | N/A | N/A | 801f165 |
 | E12 | sampler-gpu | skip | N/A | N/A | 354d690 |
 | E13 | mx-compile | skip | N/A | N/A | 663bce3 |
-| E15 | eagle3-spike | 🔄 Day 1 | N/A | N/A | 94db4a3 |
+| E15 | eagle3-spike | abandon | N/A | N/A | cddf056 |

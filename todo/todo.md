@@ -531,7 +531,7 @@ git branch -D exp/E2-mtp-depth
 
 If keep, commit + merge + log.
 
-### E3 — kv_turboquant_default_on
+### E3 🚫 — kv_turboquant_default_on
 
 **Goal:** Default turboquant on for agentic profiles.
 
@@ -560,7 +560,7 @@ If drift PASS, modify default. Where:
 
 Snapshot before/after using sweep script. Apply gates.
 
-### E4 — prefix_cache_size_tune
+### E4 ❌ — prefix_cache_size_tune
 
 **Goal:** Tune `--prefix-cache-size` upward where memory allows.
 
@@ -576,7 +576,7 @@ Edit default in `vllm_mlx/cli.py` (`--prefix-cache-size` definition).
 
 Apply gates.
 
-### E5 — chunked_prefill_default_on
+### E5 🚫 — chunked_prefill_default_on
 
 ```bash
 git checkout -b exp/E5-chunked-prefill
@@ -613,7 +613,7 @@ No bench needed (doc-only). Commit + merge.
 
 ## 3. Phase 2 — Small code, gated
 
-### E7 — auto_kv_bits_by_hw
+### E7 ⏭️ — auto_kv_bits_by_hw
 
 ```bash
 git checkout -b exp/E7-auto-kv-bits
@@ -748,7 +748,7 @@ Snapshot all 3 hw before/after. M5 expected to show biggest gain.
 
 If `mlx-lm` is pinned to incompatible MLX, abort and document.
 
-### E11 — dflash_sweep
+### E11 🚫 — dflash_sweep
 
 ```bash
 git checkout -b exp/E11-dflash-tune
@@ -760,7 +760,7 @@ Find flags by `grep -nE "dflash|--adaptive" vllm_mlx/cli.py`. For each block siz
 
 Update default in `vllm_mlx/speculative/dflash_drafter.py` if winner != current default. ≤ 20 LOC.
 
-### E12 — sampler_gpu_path
+### E12 ⏭️ — sampler_gpu_path
 
 ```bash
 git checkout -b exp/E12-sampler-gpu
@@ -772,7 +772,7 @@ Replace with `mx.eval(...)` + on-device sampling. Keep public API unchanged. ≤
 
 Drift gate mandatory.
 
-### E13 — mx_compile_coverage
+### E13 ⏭️ — mx_compile_coverage
 
 ```bash
 git checkout -b exp/E13-mx-compile
@@ -803,7 +803,7 @@ git checkout -b exp/E14-sliding-window
 
 Quality bench mandatory — drift gate alone insufficient. Run gsm8k on `evals/gsm8k_qwen3_0.6b_results.json` reference.
 
-### E15 — eagle3_evaluation
+### E15 ✅ — eagle3_evaluation
 
 **Gate:** only if E1–E13 cumulative gain < +30% agentic-short on M5.
 

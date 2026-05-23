@@ -423,7 +423,7 @@ python3 scripts/nax_summarize.py reports/exp/T0/&lt;hw&gt; reports/exp/E1/after/
 </div>
 
 <div class="step-card" id="E2">
-  <h3>E2 — mtp_depth_sweep <span class="pill ok">low risk</span></h3>
+  <h3>E2 ✅ — mtp_depth_sweep <span class="pill ok">low risk</span></h3>
   <p>Sweep <code>--mtp-num-draft-tokens</code> ∈ {2, 3, 4, 5}. Bake winner into preset.</p>
   <pre><code>for d in 2 3 4 5; do
   mkdir -p reports/exp/E2/sweep/d$d
@@ -440,7 +440,7 @@ done</code></pre>
 </div>
 
 <div class="step-card" id="E3">
-  <h3>E3 — kv_turboquant_default_on <span class="pill warn">numeric — drift gate first</span></h3>
+  <h3>E3 🚫 — kv_turboquant_default_on <span class="pill warn">numeric — drift gate first</span></h3>
   <p>Mandatory drift gate before defaulting on:</p>
   <pre><code>mkdir -p reports/exp/E3/drift
 python3 evals/nax_drift_gate.py --model qwen3.6-35b-nsc-ace-saber-8bit \
@@ -455,13 +455,13 @@ python3 evals/nax_drift_compare.py reports/exp/E3/drift/before.json \
 </div>
 
 <div class="step-card" id="E4">
-  <h3>E4 — prefix_cache_size_tune <span class="pill ok">low risk</span></h3>
+  <h3>E4 ❌ — prefix_cache_size_tune <span class="pill ok">low risk</span></h3>
   <p>Sweep <code>--prefix-cache-size</code> ∈ {4096, 8192, 16384, 32768}. For each, run sweep with prefix cache ENABLED (drop <code>--disable-prefix-cache</code>). Use <code>agentic_tool_heavy.txt</code> twice — second run measures cache benefit.</p>
   <p>Pick value maximizing 2nd-run TTFT improvement on M5 within +5 GB extra GPU mem. Update default in <code>vllm_mlx/cli.py</code>.</p>
 </div>
 
 <div class="step-card" id="E5">
-  <h3>E5 — chunked_prefill_default_on <span class="pill ok">low risk</span></h3>
+  <h3>E5 🚫 — chunked_prefill_default_on <span class="pill ok">low risk</span></h3>
   <p>Default <code>--chunked-prefill-tokens 8192</code> for agentic aliases when ctx &gt; 16k. ≤ 15 LOC. Snapshot <code>agentic_long.txt</code> before/after.</p>
 </div>
 
@@ -495,7 +495,7 @@ Enable macOS Game Mode in System Settings for priority boost.</code></pre>
 </div>
 
 <div class="step-card med" id="E8">
-  <h3>E8 — ngram_K_per_workload <span class="pill ok">low risk</span></h3>
+  <h3>E8 ✅ — ngram_K_per_workload <span class="pill ok">low risk</span></h3>
   <p>Extend <code>vllm_mlx/agents/profiles/&lt;name&gt;.yaml</code>:</p>
   <pre><code>engine:
   ngram_max_k: 6  # codex / claude profiles</code></pre>
@@ -503,7 +503,7 @@ Enable macOS Game Mode in System Settings for priority boost.</code></pre>
 </div>
 
 <div class="step-card med" id="E9">
-  <h3>E9 — nax_runtime_detect <span class="pill ok">low risk</span></h3>
+  <h3>E9 ✅ — nax_runtime_detect <span class="pill ok">low risk</span></h3>
   <p>Create <code>vllm_mlx/runtime/metal4.py</code>:</p>
   <pre><code>"""Metal 4 / Neural Accelerator runtime detection. Observability only."""
 from __future__ import annotations
@@ -544,7 +544,7 @@ def log_capabilities() -&gt; None:
 </div>
 
 <div class="step-card med" id="E10">
-  <h3>E10 — mlx_floor_bump <span class="pill warn">watch mlx-lm compat</span></h3>
+  <h3>E10 ✅ — mlx_floor_bump <span class="pill warn">watch mlx-lm compat</span></h3>
   <pre><code># pyproject.toml — change:
 "mlx&gt;=0.29.0"  →  "mlx&gt;=0.30.0"
 
@@ -553,19 +553,19 @@ uv lock</code></pre>
 </div>
 
 <div class="step-card med" id="E11">
-  <h3>E11 — dflash_sweep <span class="pill ok">low risk</span></h3>
+  <h3>E11 🚫 — dflash_sweep <span class="pill ok">low risk</span></h3>
   <p>DFlash shipped, un-tuned for agentic. Sweep block size {32, 64, 96, 128}. Pick winner per profile. Update default in <code>vllm_mlx/speculative/dflash_drafter.py</code> if different. ≤ 20 LOC.</p>
 </div>
 
 <div class="step-card med" id="E12">
-  <h3>E12 — sampler_gpu_path <span class="pill warn">numeric</span></h3>
+  <h3>E12 ⏭️ — sampler_gpu_path <span class="pill warn">numeric</span></h3>
   <p>Audit <code>vllm_mlx/pipeline/decode.py</code> for per-token CPU syncs:</p>
   <pre><code>grep -nE "\.item\(\)|\.tolist\(\)|np\.asarray" vllm_mlx/pipeline/decode.py</code></pre>
   <p>Each is a sync. Replace with <code>mx.eval(...)</code> + on-device sampling. Public API unchanged. ≤ 50 LOC. Drift gate mandatory.</p>
 </div>
 
 <div class="step-card med" id="E13">
-  <h3>E13 — mx_compile_coverage <span class="pill warn">numeric</span></h3>
+  <h3>E13 ⏭️ — mx_compile_coverage <span class="pill warn">numeric</span></h3>
   <p>Wrap pure helper fns in <code>@mx.compile</code>. Skip anything with <code>if x.item():</code> or python branches on tensor values. ≤ 30 LOC added. Drift gate mandatory.</p>
 </div>
 
@@ -579,7 +579,7 @@ uv lock</code></pre>
 </div>
 
 <div class="step-card large" id="E15">
-  <h3>E15 — eagle3_evaluation</h3>
+  <h3>E15 ✅ — eagle3_evaluation</h3>
   <p><strong>Gate:</strong> only if E1–E13 cumulative gain &lt; +30% agentic-short on M5.</p>
   <p>Spike: port one EAGLE-3 ref to MLX for qwen3.6-35b. Time-box 5 days. If acceptance × draft length not &gt; MTP+ngram → abandon and delete branch.</p>
 </div>

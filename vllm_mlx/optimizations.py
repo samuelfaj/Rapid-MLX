@@ -62,6 +62,11 @@ HARDWARE_PROFILES = {
     "M4 Pro": {"bandwidth": 273, "gpu_cores": 20},
     "M4 Max": {"bandwidth": 546, "gpu_cores": 40},
     "M4 Ultra": {"bandwidth": 800, "gpu_cores": 80},
+    # M5 Series — verified on 2026-05 hw. Bandwidth from Apple specs.
+    "M5": {"bandwidth": 153, "gpu_cores": 10},
+    "M5 Pro": {"bandwidth": 320, "gpu_cores": 16},
+    "M5 Max": {"bandwidth": 600, "gpu_cores": 40},
+    "M5 Ultra": {"bandwidth": 1200, "gpu_cores": 80},
 }
 
 

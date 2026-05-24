@@ -348,6 +348,11 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
     """Validate tool call parameter values against their schemas (post-generation)."""
     from ..api.tool_logits import _extract_param_schemas, validate_param_value
 
+    # A request can carry parsed tool_calls with no declared tools (e.g. a
+    # high-temperature completion that emitted tool-call-like markup). There is
+    # nothing to validate against, so return instead of iterating over None.
+    if not tools:
+        return
     tool_defs = [t.model_dump() if hasattr(t, "model_dump") else t for t in tools]
     schemas = _extract_param_schemas(tool_defs)
 

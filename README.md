@@ -22,12 +22,12 @@ lightning-mlx serve ornstein3.6-27b-nsc-ace-saber
 ## Raw Decode Benchmarks
 
 The Lightning MLX MTPLX raw-decode rows were run with explicit max-performance
-benchmark settings (default `--mtp-num-draft-tokens 5` since v2.1, was 3 in earlier versions):
+benchmark settings:
 
 | Model | mlx-lm | oMLX | Rapid MLX | **Lightning MLX (MTPLX)** |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.6-27B | 29.80 tok/s | 31.80 tok/s | 32.37 tok/s | **51.42 tok/s** |
-| Qwen3.6-35B | 110.37 tok/s | 114.59 tok/s | 106.00 tok/s | **192.84 tok/s** |
+| Qwen3.6-27B | 29.80 tok/s | 31.80 tok/s | 32.37 tok/s | **70.35 tok/s** |
+| Qwen3.6-35B | 110.37 tok/s | 114.59 tok/s | 106.00 tok/s | **226.01 tok/s** |
 
 Used:
 
@@ -35,12 +35,12 @@ Used:
 lightning-mlx bench qwen3.6-27b \
 --num-prompts 3 --max-tokens 512 --disable-prefix-cache \
 --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
---prefill-step-size 8192 --mtp-num-draft-tokens 5 --mtp-optimistic
+--prefill-step-size 8192 --mtp-num-draft-tokens 3 --mtp-optimistic
 
 lightning-mlx bench qwen3.6-35b \
 --num-prompts 3 --max-tokens 512 --disable-prefix-cache \
 --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
---prefill-step-size 8192 --mtp-num-draft-tokens 5 --mtp-optimistic
+--prefill-step-size 8192 --mtp-num-draft-tokens 3 --mtp-optimistic
 ```
 
 ## Agentic Benchmarks

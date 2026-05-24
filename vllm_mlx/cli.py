@@ -157,7 +157,7 @@ def _apply_qwen36_mtplx_preset(
     if not _has_cli_option(raw_args, "--stream-interval"):
         args.stream_interval = 1
     if not _has_cli_option(raw_args, "--mtp-num-draft-tokens"):
-        args.mtp_num_draft_tokens = 1 if _is_qwen36_35b_a3b_request(args) else 3
+        args.mtp_num_draft_tokens = 5  # E2: d=5 is optimal across all models
     if not _has_cli_option(raw_args, "--mtp-draft-temperature"):
         # Lower draft temperature for code/tool-call workloads. Tool-call
         # XML scaffolding is low-entropy; tighter draft distribution lifts

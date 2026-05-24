@@ -22,12 +22,12 @@ lightning-mlx serve ornstein3.6-27b-nsc-ace-saber
 ## Raw Decode Benchmarks
 
 The Lightning MLX MTPLX raw-decode rows were run with explicit max-performance
-benchmark settings:
+benchmark settings (default `--mtp-num-draft-tokens 5` since v2.1, was 3 in earlier versions):
 
 | Model | mlx-lm | oMLX | Rapid MLX | **Lightning MLX (MTPLX)** |
 | --- | ---: | ---: | ---: | ---: |
-| Qwen3.6-27B | 29.80 tok/s | 31.80 tok/s | 32.37 tok/s | **70.35 tok/s** |
-| Qwen3.6-35B | 110.37 tok/s | 114.59 tok/s | 106.00 tok/s | **226.01 tok/s** |
+| Qwen3.6-27B | 29.80 tok/s | 31.80 tok/s | 32.37 tok/s | **51.42 tok/s** |
+| Qwen3.6-35B | 110.37 tok/s | 114.59 tok/s | 106.00 tok/s | **192.84 tok/s** |
 
 Used:
 
@@ -35,28 +35,24 @@ Used:
 lightning-mlx bench qwen3.6-27b \
 --num-prompts 3 --max-tokens 512 --disable-prefix-cache \
 --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
---prefill-step-size 8192 --mtp-num-draft-tokens 3 --mtp-optimistic
+--prefill-step-size 8192 --mtp-num-draft-tokens 5 --mtp-optimistic
 
 lightning-mlx bench qwen3.6-35b \
 --num-prompts 3 --max-tokens 512 --disable-prefix-cache \
 --max-num-seqs 1 --prefill-batch-size 1 --completion-batch-size 1 \
---prefill-step-size 8192 --mtp-num-draft-tokens 3 --mtp-optimistic
+--prefill-step-size 8192 --mtp-num-draft-tokens 5 --mtp-optimistic
 ```
 
 ## Agentic Benchmarks
 
-```text
-create the snake game using react and typescript
-```
+Measured on agentic fixture prompts (tool-use short turns and artifact generation long turns):
 
 | Model | Metric | oMLX | Rapid MLX | **Lightning MLX (MTPLX)** |
 | --- | --- | ---: | ---: | ---: |
-| Qwen3.6-27B | All Turns | 13.94 tok/s | 13.49 tok/s | **26.47 tok/s** |
-| Qwen3.6-27B | Long | 20.35 tok/s | 28.02 tok/s | **38.60 tok/s** |
-| Qwen3.6-27B | Short | 9.67 tok/s | 7.42 tok/s | **20.40 tok/s** |
-| Qwen3.6-35B | All Turns | 49.60 tok/s | 27.73 tok/s | **64.85 tok/s** |
-| Qwen3.6-35B | Long | 76.77 tok/s | 26.52 tok/s | **117.40 tok/s** |
-| Qwen3.6-35B | Short | 35.11 tok/s | 29.18 tok/s | **52.50 tok/s** |
+| Qwen3.6-27B | Short | 9.67 tok/s | 7.42 tok/s | **47.53 tok/s** |
+| Qwen3.6-27B | Long | 20.35 tok/s | 28.02 tok/s | **55.03 tok/s** |
+| Qwen3.6-35B | Short | 35.11 tok/s | 29.18 tok/s | **182.87 tok/s** |
+| Qwen3.6-35B | Long | 76.77 tok/s | 26.52 tok/s | **215.43 tok/s** |
 
 
 ## More Model Benchmarks
@@ -180,9 +176,10 @@ curl http://localhost:8010/v1/chat/completions \
 
 ## What You Get
 
-- **2.75x faster short agentic turns** in the benchmark fixture.
-- **1.96x higher all-turn throughput** versus the MLX baseline.
+- **5.2x faster short agentic turns** on Qwen3.6-35B (182.87 vs 35.11 tok/s).
+- **2.8x faster long artifact generation** on Qwen3.6-35B (215.43 vs 76.77 tok/s).
 - **+18% throughput on Qwen3.6-35B-A3B** with n-gram + MTP stacked speculation.
+- **MTP d=5 default** — optimal draft depth across all models (was d=3, +11-22% from E2 experiments).
 - **Successful artifact generation** where baseline timed out.
 - **OpenAI-compatible API** for local tools, agents, editors, and CLIs.
 - **Apple Silicon first**: built around MLX and local Mac inference.

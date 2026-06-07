@@ -300,7 +300,7 @@ def _apply_ornstein_mtplx_preset(
     if not _has_cli_option(raw_args, "--tool-call-parser"):
         args.tool_call_parser = "qwen3_xml"
     if not _has_cli_option(raw_args, "--mtp-num-draft-tokens"):
-        args.mtp_num_draft_tokens = 3
+        args.mtp_num_draft_tokens = 2
     if not _has_cli_option(raw_args, "--mtp-draft-temperature"):
         args.mtp_draft_temperature = 0.5
 

@@ -297,6 +297,12 @@ def _apply_ornstein_mtplx_preset(
         args.default_top_p = 0.95
     if not _has_cli_option(raw_args, "--enable-auto-tool-choice"):
         args.enable_auto_tool_choice = True
+    if not _has_cli_option(raw_args, "--tool-call-parser"):
+        args.tool_call_parser = "qwen3_xml"
+    if not _has_cli_option(raw_args, "--mtp-num-draft-tokens"):
+        args.mtp_num_draft_tokens = 2
+    if not _has_cli_option(raw_args, "--mtp-draft-temperature"):
+        args.mtp_draft_temperature = 0.5
 
     # N-gram default OFF for Ornstein3.6-35B-A3B-SABER. Empirical on
     # Qwen3.6-35B-A3B (same backbone): MTP-only beats MTP+ngram on this

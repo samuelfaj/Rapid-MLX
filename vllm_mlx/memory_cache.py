@@ -908,6 +908,11 @@ class MemoryAwarePrefixCache:
                 f"cache_layers={len(best_lcp_entry.cache)} "
                 f"layer_types={[type(lc).__name__ for lc in best_lcp_entry.cache[:3]]}"
             )
+            logger.debug(
+                f"[cache_fetch] LCP divergence tokens: "
+                f"cached={list(best_lcp_entry.tokens[best_lcp_length:best_lcp_length + 8])} "
+                f"request={list(tokens[best_lcp_length:best_lcp_length + 8])}"
+            )
 
             if not has_non_trimmable:
                 trimmed_cache = _trim_cache_offset(best_lcp_entry.cache, excess)

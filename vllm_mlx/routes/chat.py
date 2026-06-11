@@ -1181,6 +1181,12 @@ async def stream_chat_completion(
         stop_after_tool_call = False
         emitted_content = False
         invalid_tool_call_seen = False
+        # OpenAI streaming contract: exactly one chunk must carry a
+        # finish_reason before [DONE]. Several agentic-heuristic paths below
+        # (e.g. suppressing a junk finish event after a tool-result turn) can
+        # otherwise end the stream without one, which strict clients (pi,
+        # openai-python) reject with "Stream ended without finish_reason".
+        finish_chunk_sent = False
 
         # Stream content — PostProcessor handles reasoning/tool/sanitize
         async for output in engine.stream_chat(messages=messages, **kwargs):
@@ -1257,6 +1263,7 @@ async def stream_chat_completion(
                     _tc_sse = _fast_tool_call_sse(event.tool_calls)
                     logger.debug(f"[SSE-TC] {_tc_sse.strip()[:300]}")
                     yield _tc_sse
+                    finish_chunk_sent = True
                     stop_after_tool_call = True
                     break
 
@@ -1288,6 +1295,7 @@ async def stream_chat_completion(
                         usage=get_usage(output) if output.finished else None,
                     )
                     yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                    finish_chunk_sent = True
 
         # Fallback tool call detection
         if not stop_after_tool_call:
@@ -1479,6 +1487,7 @@ async def stream_chat_completion(
                     _fb_sse = _fast_tool_call_sse(event.tool_calls)
                     logger.debug(f"[SSE-FALLBACK-TC] {_fb_sse.strip()[:300]}")
                     yield _fb_sse
+                    finish_chunk_sent = True
 
         # Log throughput
         elapsed = time.perf_counter() - start_time
@@ -1486,6 +1495,29 @@ async def stream_chat_completion(
         logger.info(
             f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
         )
+
+        # Guarantee the finish chunk. If every emission path above was
+        # suppressed (junk-content finish after a tool-result turn, parser
+        # holding state at EOS, ...), synthesize one so the stream stays
+        # OpenAI-conformant.
+        if not finish_chunk_sent:
+            logger.debug("No finish chunk emitted; synthesizing finish_reason=stop")
+            final_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_resolve_model_name(request.model),
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+            )
+            yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
 
         # Send final chunk with usage if requested
         if include_usage:

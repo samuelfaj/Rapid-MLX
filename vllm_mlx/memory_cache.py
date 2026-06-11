@@ -712,6 +712,37 @@ class MemoryAwarePrefixCache:
             return _dequantize_cache(cache)
         return cache
 
+    def peek_prefix_length(self, tokens: list[int]) -> int:
+        """Return how many leading tokens of ``tokens`` are covered by a
+        stored entry, without copying caches, touching LRU order, or
+        recording stats.
+
+        Used by the cache-warmup path to decide whether prefilling a
+        boundary prefix is worth a separate pass. Only exact and
+        strict-prefix entries count -- supersequence/LCP entries need a trim
+        that hybrid (non-trimmable) models cannot do, so they are ignored.
+        """
+        if not tokens:
+            return 0
+        tokens_key = tuple(tokens)
+        with self._lock:
+            if tokens_key in self._entries:
+                return len(tokens)
+            sorted_keys = self._sorted_keys
+            if not sorted_keys:
+                return 0
+            idx = bisect.bisect_left(sorted_keys, tokens_key)
+            for i in range(idx - 1, -1, -1):
+                cached_key = sorted_keys[i]
+                cached_len = len(cached_key)
+                if cached_len >= len(tokens_key):
+                    continue
+                if tokens_key[:cached_len] == cached_key:
+                    return cached_len
+                if cached_key[0] != tokens_key[0]:
+                    break
+        return 0
+
     def fetch(self, tokens: list[int]) -> tuple[list[Any] | None, list[int]]:
         """
         Find cached KV state for the given tokens.

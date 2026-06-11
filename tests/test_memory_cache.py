@@ -639,3 +639,52 @@ class TestConcurrentAccess:
         # remove_sorted must precede pop_entries — see _evict_lru / remove
         # docstrings.
         assert order == ["remove_sorted", "pop_entries"], order
+
+
+class TestPeekPrefixLength:
+    """Tests for peek_prefix_length (cache-warmup support)."""
+
+    @pytest.fixture
+    def cache(self):
+        config = MemoryCacheConfig(max_memory_mb=1, max_entries=10)
+        return MemoryAwarePrefixCache(MagicMock(), config)
+
+    def _kv(self):
+        return [MockKVCache(100, 100)]
+
+    def test_empty_cache(self, cache):
+        assert cache.peek_prefix_length([1, 2, 3]) == 0
+
+    def test_empty_tokens(self, cache):
+        assert cache.peek_prefix_length([]) == 0
+
+    def test_exact_match(self, cache):
+        cache.store([1, 2, 3], self._kv())
+        assert cache.peek_prefix_length([1, 2, 3]) == 3
+
+    def test_strict_prefix(self, cache):
+        cache.store([1, 2, 3], self._kv())
+        assert cache.peek_prefix_length([1, 2, 3, 4, 5]) == 3
+
+    def test_longest_prefix_wins(self, cache):
+        cache.store([1, 2], self._kv())
+        cache.store([1, 2, 3], self._kv())
+        assert cache.peek_prefix_length([1, 2, 3, 4]) == 3
+
+    def test_diverging_entry_not_counted(self, cache):
+        cache.store([1, 2, 9], self._kv())
+        assert cache.peek_prefix_length([1, 2, 3, 4]) == 0
+
+    def test_supersequence_not_counted(self, cache):
+        # A longer stored entry would need a trim to serve the shorter
+        # request, which non-trimmable (hybrid) models cannot do.
+        cache.store([1, 2, 3, 4, 5], self._kv())
+        assert cache.peek_prefix_length([1, 2, 3]) == 0
+
+    def test_no_stats_or_lru_side_effects(self, cache):
+        cache.store([1, 2, 3], self._kv())
+        hits, misses = cache._stats.hits, cache._stats.misses
+        cache.peek_prefix_length([1, 2, 3, 4])
+        cache.peek_prefix_length([9, 9])
+        assert cache._stats.hits == hits
+        assert cache._stats.misses == misses

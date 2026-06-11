@@ -197,6 +197,7 @@ _no_thinking: bool = (
 
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
+_tool_retry: bool = True  # Server-side tool-intent retry generations
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
 
 # Concurrency cap (--max-concurrent): max in-flight inference requests.
@@ -776,6 +777,7 @@ def _sync_config() -> None:
     cfg.no_thinking = _no_thinking
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
+    cfg.tool_retry = _tool_retry
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
     cfg.mcp_executor = _mcp_executor
     cfg.model_registry = _model_registry

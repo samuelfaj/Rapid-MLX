@@ -109,6 +109,19 @@ def _strip_trailing_calling_tool_prefix(text: str) -> str | None:
     return None
 
 
+def _inside_open_tool_markup(text: str) -> bool:
+    """True while a well-formed <tool_call> block is still open.
+
+    The degraded-marker fallback must not run in this state: its markers
+    match in-progress well-formed XML too, and parse_tool_calls over an
+    incomplete buffer salvages a TRUNCATED call (e.g. command "find" out of
+    "find /Users/... -name ..."), which then suppresses the rest of the
+    stream. The streaming parser owns well-formed markup; finalize() parses
+    the complete buffer if the stream ends before the block closes.
+    """
+    return text.count("<tool_call>") > text.count("</tool_call>")
+
+
 def _has_degraded_tool_marker(text: str) -> bool:
     return any(
         marker in text
@@ -295,8 +308,11 @@ class StreamingPostProcessor:
 
             if not self._tool_call_has_required_args(name, arguments):
                 logger.debug(
-                    "Dropping malformed tool call missing required arguments: %s",
+                    "Dropping malformed tool call missing required arguments: %s "
+                    "arguments=%r accumulated=%r",
                     name,
+                    arguments,
+                    (self.tool_accumulated_text or self.accumulated_text)[-400:],
                 )
                 continue
 
@@ -781,7 +797,9 @@ class StreamingPostProcessor:
         )
 
         if tool_result is None:
-            if _has_degraded_tool_marker(self.tool_accumulated_text):
+            if not _inside_open_tool_markup(
+                self.tool_accumulated_text
+            ) and _has_degraded_tool_marker(self.tool_accumulated_text):
                 _, tool_calls = parse_tool_calls(
                     self.tool_accumulated_text, self.request
                 )
@@ -796,10 +814,30 @@ class StreamingPostProcessor:
             return None  # inside tool markup
 
         if "tool_calls" in tool_result:
-            self.tool_calls_detected = True
-            return tool_result
+            # The qwen3coder parser streams vLLM-style incremental deltas:
+            # first a header chunk (name set, arguments empty), then argument
+            # fragments (no name). This pipeline expects complete calls --
+            # treating the header chunk as the full call validated/dropped it
+            # as "missing required arguments" and then swallowed the rest of
+            # the stream. Accept only complete emissions (the coarse-delta
+            # path); for fragments keep buffering and let finalize() parse
+            # the assembled call from the accumulated text.
+            calls = tool_result["tool_calls"] or []
 
-        if _has_degraded_tool_marker(self.tool_accumulated_text):
+            def _is_complete(call: dict) -> bool:
+                function = call.get("function") or {}
+                return bool(function.get("name")) and function.get(
+                    "arguments"
+                ) not in ("", None)
+
+            if calls and all(_is_complete(c) for c in calls):
+                self.tool_calls_detected = True
+                return tool_result
+            return None
+
+        if not _inside_open_tool_markup(
+            self.tool_accumulated_text
+        ) and _has_degraded_tool_marker(self.tool_accumulated_text):
             _, tool_calls = parse_tool_calls(self.tool_accumulated_text, self.request)
             if tool_calls:
                 chunks = self._tool_calls_to_stream_chunks(tool_calls)

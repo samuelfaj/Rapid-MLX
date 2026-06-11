@@ -487,6 +487,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         num_images: int = 0,
         enable_thinking: bool | None = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         """Apply chat template to messages.
 
@@ -528,6 +529,7 @@ class BatchedEngine(BaseEngine):
             tools=tools,
             enable_thinking=enable_thinking,
             model_name=self._model_name,
+            add_generation_prompt=add_generation_prompt,
         )
 
     @staticmethod
@@ -793,55 +795,119 @@ class BatchedEngine(BaseEngine):
         )
 
     def _compute_prefix_boundary(
-        self, messages: list[dict[str, Any]], tools: list[dict] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        enable_thinking: bool | None = None,
     ) -> int:
-        """Compute token count for the shared prefix across message variations.
+        """Compute the token count of the cache-stable message history.
 
-        Uses a two-tokenization approach: tokenize the full prompt twice
-        (once as-is, once with the last user message replaced by a dummy)
-        and find the longest common prefix (LCP).  This gives the exact
-        boundary where different user suffixes diverge, avoiding template
-        discrepancies (e.g. Qwen3 <think> markers on last assistant).
+        Renders the conversation twice -- with and without the generation
+        prompt -- and returns the longest common prefix (LCP) of the two
+        token sequences. Everything up to that point is the rendered
+        history, which the *next* request reproduces verbatim; everything
+        after it is the volatile generation suffix (assistant header plus
+        soft tokens such as Qwen3's empty ``<think>`` block under
+        no-thinking) that the next request does NOT reproduce. Snapshotting
+        the cache at this boundary is what lets multi-turn agentic requests
+        hit the prefix cache even on models whose cache layers cannot be
+        trimmed (hybrid GatedDeltaNet/Mamba).
+
+        ``enable_thinking`` must match the real prompt render -- the
+        generation suffix depends on it.
         """
-        # Find index of last user message
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx is None or last_user_idx == 0:
+        if len(messages) < 2:
             return 0
         try:
             template_tools = convert_tools_for_template(tools) if tools else None
 
-            # Tokenize the real prompt
-            real_prompt = self._apply_chat_template(messages, template_tools)
-
-            # Build a dummy variant with different last user content
-            dummy_messages = list(messages)
-            dummy_messages[last_user_idx] = {
-                **messages[last_user_idx],
-                "content": "XXXXXXXXXX",
-            }
-            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+            with_gen = self._apply_chat_template(
+                messages,
+                template_tools,
+                enable_thinking=enable_thinking,
+            )
+            without_gen = self._apply_chat_template(
+                messages,
+                template_tools,
+                enable_thinking=enable_thinking,
+                add_generation_prompt=False,
+            )
 
             tokenizer = self.tokenizer
             if hasattr(tokenizer, "tokenizer"):
                 tokenizer = tokenizer.tokenizer
 
-            real_tokens = tokenizer.encode(real_prompt)
-            dummy_tokens = tokenizer.encode(dummy_prompt)
+            with_tokens = tokenizer.encode(with_gen)
+            without_tokens = tokenizer.encode(without_gen)
 
-            # Find LCP — the point where the two diverge is the boundary
+            # LCP -- the point where the two renders diverge is the boundary
             lcp = 0
-            for j in range(min(len(real_tokens), len(dummy_tokens))):
-                if real_tokens[j] != dummy_tokens[j]:
+            for j in range(min(len(with_tokens), len(without_tokens))):
+                if with_tokens[j] != without_tokens[j]:
                     break
                 lcp = j + 1
 
             return lcp
         except Exception:
             return 0
+
+    # Cache warmup thresholds: skip short histories (their re-prefill cost is
+    # trivial) and skip when the cache already covers most of the boundary.
+    _WARM_MIN_BOUNDARY_TOKENS = 512
+    _WARM_MIN_NEW_TOKENS = 256
+
+    async def _maybe_warm_prefix(self, prompt: str, boundary: int) -> None:
+        """Ensure a prefix-cache entry exists keyed exactly at ``boundary``.
+
+        Prompt snapshots are keyed by the FULL prompt, which ends in the
+        volatile generation suffix (assistant header, soft think tokens)
+        that the next request never reproduces. On models with
+        non-trimmable cache layers (hybrid GatedDeltaNet/Mamba) that means
+        multi-turn agentic requests miss the prefix cache forever and
+        re-prefill the whole conversation every turn.
+
+        Prefilling the stable history as its own 1-token pass plants a
+        snapshot keyed exactly at the boundary; the real request (and every
+        subsequent turn, including internal tool-retry requests) then hits
+        it as a strict prefix. Net cost is ~zero: the boundary tokens would
+        have been prefilled by the real request anyway, which now starts
+        from the cached boundary instead.
+        """
+        cfg = self._scheduler_config
+        if cfg is not None and not getattr(cfg, "cache_warmup", True):
+            return
+        if boundary < self._WARM_MIN_BOUNDARY_TOKENS or self._engine is None:
+            return
+        engine_core = getattr(self._engine, "engine", None)
+        scheduler = getattr(engine_core, "scheduler", None)
+        cache = getattr(scheduler, "memory_aware_cache", None)
+        if cache is None:
+            return
+        try:
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+            tokens = tokenizer.encode(prompt)
+            boundary = min(boundary, len(tokens))
+            prefix = tokens[:boundary]
+            covered = cache.peek_prefix_length(prefix)
+            if boundary - covered < self._WARM_MIN_NEW_TOKENS:
+                return
+
+            from ..request import SamplingParams
+
+            logger.info(
+                f"[cache_warmup] prefilling history boundary: {boundary} tokens "
+                f"({covered} already cached)"
+            )
+            request_id = await self._engine.add_request(
+                prompt=prefix,
+                sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+            )
+            async for _ in self._engine.stream_outputs(request_id):
+                pass
+        except Exception as exc:
+            logger.debug(f"[cache_warmup] skipped: {exc}")
 
     async def stream_chat(
         self,
@@ -897,10 +963,14 @@ class BatchedEngine(BaseEngine):
             enable_thinking=enable_thinking,
         )
 
-        # Compute prefix boundary for cache
-        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        # Compute prefix boundary for cache; plant a boundary snapshot so
+        # follow-up turns prefix-hit instead of re-prefilling the history.
+        prefix_boundary = self._compute_prefix_boundary(
+            messages, tools, enable_thinking
+        )
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+            await self._maybe_warm_prefix(prompt, prefix_boundary)
 
         async for output in self.stream_generate(
             prompt=prompt,

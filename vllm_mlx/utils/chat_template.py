@@ -91,6 +91,7 @@ def apply_chat_template(
     tools: list[dict] | None = None,
     enable_thinking: bool | None = None,
     model_name: str = "",
+    add_generation_prompt: bool = True,
 ) -> str:
     """Apply a chat template to messages with consistent fallback behavior.
 
@@ -128,7 +129,7 @@ def apply_chat_template(
 
     template_kwargs: dict = {
         "tokenize": False,
-        "add_generation_prompt": True,
+        "add_generation_prompt": add_generation_prompt,
         "enable_thinking": enable_thinking,
     }
     if tools:

@@ -74,6 +74,11 @@ class SchedulerConfig:
     # Prefix cache settings
     enable_prefix_cache: bool = True
     prefix_cache_size: int = 100  # Max cached entries (legacy, ignored if memory-aware)
+    # Prefill the stable message-history prefix as a separate pass so a
+    # snapshot lands exactly at the boundary (see BatchedEngine._maybe_warm_prefix).
+    # Without it, multi-turn agentic requests never hit the prefix cache on
+    # models with non-trimmable (hybrid GatedDeltaNet/Mamba) cache layers.
+    cache_warmup: bool = True
 
     # Memory-aware cache settings (recommended for large models)
     use_memory_aware_cache: bool = True  # Use memory-based eviction

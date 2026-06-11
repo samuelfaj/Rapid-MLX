@@ -652,6 +652,7 @@ def serve_command(args):
         prefill_step_size=args.prefill_step_size,
         enable_prefix_cache=enable_prefix_cache,
         prefix_cache_size=args.prefix_cache_size,
+        cache_warmup=not getattr(args, "no_cache_warmup", False),
         # Memory-aware cache options
         use_memory_aware_cache=not args.no_memory_aware_cache,
         cache_memory_mb=args.cache_memory_mb,
@@ -1039,6 +1040,7 @@ def bench_command(args):
             prefill_step_size=args.prefill_step_size,
             enable_prefix_cache=enable_prefix_cache,
             prefix_cache_size=args.prefix_cache_size,
+            cache_warmup=not getattr(args, "no_cache_warmup", False),
             # Memory-aware cache options
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
@@ -1697,6 +1699,15 @@ Examples:
         "--disable-prefix-cache",
         action="store_true",
         help="Disable prefix caching",
+    )
+    serve_parser.add_argument(
+        "--no-cache-warmup",
+        action="store_true",
+        help=(
+            "Disable the boundary cache-warmup pass (a separate prefill of the "
+            "stable message history that lets multi-turn agentic requests hit "
+            "the prefix cache on models with non-trimmable cache layers)"
+        ),
     )
     serve_parser.add_argument(
         "--prefix-cache-size",

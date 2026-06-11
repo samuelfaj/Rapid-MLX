@@ -916,7 +916,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     last_tool_needs_more_work = _last_tool_result_needs_more_work(request.messages)
     retry_messages = list(messages)
     artifact_hint = _artifact_retry_hint(request.messages)
-    for retry_index in range(2):
+    for retry_index in range(2 if get_config().tool_retry else 0):
         validation_error = _tool_call_validation_error(tool_calls, request.tools)
         if (
             not request.tools
@@ -1198,7 +1198,7 @@ async def stream_chat_completion(
                             last_role,
                             (event.content or "")[:120],
                         )
-                    if tool_mode and (
+                    if cfg.tool_retry and tool_mode and (
                         _looks_like_invalid_tool_continuation(event.content)
                         or (
                             last_role == "tool"
@@ -1263,7 +1263,8 @@ async def stream_chat_completion(
                 elif event.type == "finish":
                     last_role = request_last_role
                     if (
-                        tool_mode
+                        cfg.tool_retry
+                        and tool_mode
                         and last_role == "tool"
                         and (
                             not event.content
@@ -1316,7 +1317,7 @@ async def stream_chat_completion(
                 invalid_tool_continuation = _looks_like_invalid_tool_continuation(
                     finalize_text
                 )
-                should_retry = (
+                should_retry = cfg.tool_retry and (
                     _looks_like_deferred_tool_use(finalize_text)
                     or _looks_like_incomplete_artifact_answer(finalize_text)
                     or last_role == "tool"
@@ -1457,15 +1458,16 @@ async def stream_chat_completion(
 
             for event in finalize_events:
                 if event.type == "content":
-                    if tool_mode and _looks_like_invalid_tool_continuation(
+                    suppress = cfg.tool_retry and tool_mode
+                    if suppress and _looks_like_invalid_tool_continuation(
                         event.content
                     ):
                         continue
-                    if tool_mode and _looks_like_incomplete_artifact_answer(
+                    if suppress and _looks_like_incomplete_artifact_answer(
                         event.content
                     ):
                         continue
-                    if tool_mode and (force_tool_work or last_tool_needs_more_work):
+                    if suppress and (force_tool_work or last_tool_needs_more_work):
                         continue
                     _sse = _fast_sse_chunk(event.content, "content")
                     if _sse:

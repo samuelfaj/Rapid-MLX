@@ -519,6 +519,9 @@ def serve_command(args):
     # Configure system prompt pinning
     server._pin_system_prompt = args.pin_system_prompt
 
+    # Configure server-side tool-retry generations
+    server._tool_retry = not getattr(args, "no_tool_retry", False)
+
     # Configure tool calling
     if args.enable_auto_tool_choice and args.tool_call_parser:
         server._enable_auto_tool_choice = True
@@ -1697,6 +1700,16 @@ Examples:
         "--disable-prefix-cache",
         action="store_true",
         help="Disable prefix caching",
+    )
+    serve_parser.add_argument(
+        "--no-tool-retry",
+        action="store_true",
+        help=(
+            "Disable server-side 'tool intent without tool call' retry "
+            "generations. Recommended for agent harnesses (pi, Claude Code) "
+            "that handle retries themselves -- the hidden extra generations "
+            "otherwise read as multi-second hangs"
+        ),
     )
     serve_parser.add_argument(
         "--prefix-cache-size",

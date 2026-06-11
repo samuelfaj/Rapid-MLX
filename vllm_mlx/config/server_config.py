@@ -71,6 +71,10 @@ class ServerConfig:
     no_thinking: bool = False
     pin_system_prompt: bool = False
     pinned_system_prompt_hash: str | None = None
+    # Server-side "tool intent without tool call" retry generations. Useful
+    # for thin clients, but agent harnesses (pi, Claude Code) do their own
+    # retrying -- for them the hidden extra generations just read as a hang.
+    tool_retry: bool = True
 
     # --- Multi-model ---
     model_registry: Any = None
